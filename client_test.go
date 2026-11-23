@@ -64,6 +64,80 @@ func TestClientAgainstLocalCore(t *testing.T) {
 	}
 }
 
+// TestFramedAttachAgainstLocalCore verifies HelloFramed, Subscribe, Templates,
+// and observe-mode AttachStream against the real local hc core.
+func TestFramedAttachAgainstLocalCore(t *testing.T) {
+	if _, err := exec.LookPath("hc"); err != nil {
+		t.Skip("hc is not on PATH")
+	}
+	rw, err := dialLocal()
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	c := NewClient(rw)
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	hello, err := c.HelloFramed(ctx)
+	if err != nil {
+		t.Fatalf("HelloFramed: %v", err)
+	}
+	if !hello.Framed || !c.IsFramed() {
+		t.Fatalf("expected framed mode, got %+v", hello)
+	}
+
+	sub, err := c.Subscribe(ctx)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	if _, err := c.Templates(ctx); err != nil {
+		t.Fatalf("Templates: %v", err)
+	}
+	var liveAddr string
+	for _, term := range sub.Terminals {
+		if !term.Finished() {
+			liveAddr = term.Address
+			break
+		}
+	}
+	if liveAddr == "" {
+		t.Skip("no live terminals on local core to attach")
+	}
+
+	stream, res, err := c.Attach(ctx, AttachParams{
+		Terminal:            liveAddr,
+		Cols:                60,
+		Rows:                24,
+		History:             20,
+		Observe:             true,
+		ResizeNotifications: true,
+	})
+	if err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	defer stream.Close()
+	if res.Channel == 0 {
+		t.Fatalf("expected nonzero attach channel")
+	}
+	buf := make([]byte, 4096)
+	readDone := make(chan int, 1)
+	go func() {
+		n, _ := stream.Read(buf)
+		readDone <- n
+	}()
+	select {
+	case n := <-readDone:
+		if n == 0 {
+			t.Error("expected initial paint bytes from attach")
+		}
+		t.Logf("attached ch=%d terminal=%s received %d initial VT bytes", res.Channel, sub.Terminals[0].Address, n)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for initial paint from live hc terminal.attach")
+	}
+}
+
 // TestFailureCarriesRemediation checks the rule the UI depends on: a failure
 // names what to do next, never only what went wrong.
 func TestFailureCarriesRemediation(t *testing.T) {
