@@ -1,0 +1,784 @@
+<doc>
+  <h1 id="oRJbi2gQ">herdr-nsgo v1.0 书面设计规范</h1>
+  <p id="Vx75K4nV">基于现有 <code>herdr-nsgo</code>（Go + NSGo v0.3.0）原型，正式打磨一款参考 Moshi 体验、支持 <b>多 herdr-core 实例</b>、<b>Android + iOS 双端</b>、<b>亮色为主且支持暗色</b> 的主力移动客户端。</p>
+  <h2 id="Wen9VwlR">1. 意图与背景</h2>
+  <p id="xs1TjJn6">官方 Herdr 客户端不支持同时接入多个独立 <code>herdr-core</code> 实例且移动端 UI 粗糙；Moshi 体验精美流畅、移动端信息密度合理、响应快，但价格昂贵。仓库已有一个验证过 SSH + <code>hc connect</code> 闭环的 v0.1.0 原型（<code>app.go</code> / <code>client.go</code> / <code>transport.go</code> / <code>screens.go</code>），但仍停留在单实例连接、纯文本 <code>terminal.read</code> 1.5s 轮询（会折断 TUI 框线与 Nerd Font）、默认浅色组件拼装的阶段。</p>
+  <p id="KTz22nbm">v1.0 的核心目标是把这台原型打磨成每天愿意拿在手里用的主力客户端：<b>极速瞬开、多实例统一收件箱、真 Ghostty VT 终端手感、清晰耐看的亮暗双主题设计系统</b>。</p>
+  <h2 id="y31mtEVi">2. 目标、非目标与反目标</h2>
+  <h3 id="wkrDJ0V5">v1.0 目标（Goals）</h3>
+  <ul id="gz1mu9wI">
+    <li><b>多 herdr-core 实例并发池</b>：同时保持多个独立 <code>herdr-core</code> 实例（如本机 <code>mac-mini</code>、远端 VPS <code>kr</code> 等）的 SSH + <code>framed</code> 长连接与 <code>events.subscribe</code> 实时流；首页与收件箱统一聚合，顶部胶囊一键筛选实例。</li>
+    <li><b>真 VT 终端 + 移动端深度手感</b>：通过 <code>terminal.attach</code> 接入 NSGo 原生 <code>base/terminal</code>（底层 <code>libghostty-vt</code>）与内置 JetBrains Mono Nerd Font；首屏帧缓存瞬开；默认 <code>observe</code> 不挤乱桌面端 PTY，主动交互或点「适配列宽」时发 <code>RESIZE</code>；支持双指捏合缩放（10–15px）、长按划词复制与 URL/路径识别、上滚历史「一键回到底部」、会话内查找、常用指令片段（Snippets），以及基于 <code>terminal.put_chunk</code> 的截图/文件直传给 Agent。</li>
+    <li><b>实时 Agent 语义层与收件箱</b>：用 <code>events.subscribe</code> 彻底取代 1.5s 轮询；首页置顶「需要你」，收件箱跨实例汇总 <code>blocked</code>（<code>permission</code> / <code>question</code> / <code>auth</code>）与 <code>error</code>；<code>permission</code> 审批支持卡片内一键「允许 / 拒绝 / 进终端」。</li>
+    <li><b>新建与生命周期管理</b>：底部抽屉选目标实例/机器，经 <code>templates.list</code> 一键起 Agent（目录 + 会话名 + 首条任务）或开新 Shell（<code>terminal.run</code>）；支持中断（<code>terminal.interrupt</code>）、终止（<code>terminal.kill</code>）与清理（<code>terminal.rm</code>）。</li>
+    <li><b>冷启动 1 分钟接入与安全基线</b>：0 实例冷启动向导 + 分步排障提示；扫码配对 + App 内生成 <code>ed25519</code> 密钥对一键复制公钥 + 系统安全存储（Android Keystore / iOS Keychain）+ TOFU 首次信任主机指纹；保留手动 SSH 表单兜底。</li>
+    <li><b>后台保活与提醒</b>：Android 可选前台保活常驻通知（锁屏保活并在 <code>blocked</code> / <code>error</code> 时触发震动提醒，点通知直达对应终端）；iOS 切回前台 500ms 内触发全池重连与状态同步。</li>
+    <li><b>完整设计系统落地</b>：按已敲定的「晴空石板」设计系统重做全部 8 屏，默认亮色 + 完整暗色切换，VT 终端画布默认跟随亮暗主题（设置中可覆盖为始终深色终端）。</li>
+  </ul>
+  <h3 id="tjmZKSPV">明确非目标（Non-Goals · 留待 v1.1+）</h3>
+  <ul id="l9fi7k7D">
+    <li><b>企业级安全扩展（已明确暂缓）</b>：Face ID / 指纹应用锁、切后台隐私模糊遮罩、多密钥槽位、私钥口令（Passphrase）、SSH ProxyJump 跳板机。</li>
+    <li><b>跨设备配置同步（已明确暂缓）</b>：端到端加密配置导入/导出或云同步。</li>
+    <li><b>商业发布与上架体系（已明确暂缓）</b>：应用商店付费墙/内购、中英文双语 i18n、商店合规隐私页与自动更新框架。</li>
+    <li><b>iOS 息屏远程推送中继</b>：不自建 APNs/FCM 服务端中继；iOS v1.0 专注前台极速恢复。</li>
+    <li><b>桌面窗口编排</b>：不复制 <code>herdr-app</code> 的多窗格排版（spaces/tabs/panes）。</li>
+  </ul>
+  <h3 id="fp0cOaMK">反目标（Anti-Goals）</h3>
+  <ul id="po6O1hnc">
+    <li>绝不再用 <code>terminal.read</code> 轮询模拟实时终端。</li>
+    <li>绝不向用户展示裸「连接失败」或未翻译的底层状态词（如 <code>live</code>）：每条错误必须带明确修复动作。</li>
+    <li>绝不为了追求「大而全」引入重型外部 WebView/Electron 运行时或破坏 APK 轻量化与原生流畅度。</li>
+  </ul>
+  <h2 id="U5YYtD_l">3. 约束与技术底座</h2>
+  <ul id="mFgcEi_Y">
+    <li><b>开发栈</b>：Go 1.27.3 + <code>github.com/nsgo-dev/nsgo v0.3.0</code> 纯 Go 实现；Android 由 <code>go tool nsgo build</code> 直接打包签名（无需 Java/Kotlin 代码），iOS 经 <code>xcodebuild</code> 构建。</li>
+    <li><b>调试设备</b>：OPPO Find X9 Pro（Android，Mac mini 已装 <code>adb 37.0.1</code>）+ iOS 模拟器/真机。</li>
+    <li><b>后端协议实测基线（<code>herdr-core v0.1.22</code>）</b>：已对本机 <code>mac-mini</code> 实测 <code>rpc.discover</code>，确认支持 <code>hello(framed:true)</code>、<code>terminal.attach</code>（<code>DATA/RESIZE/FOCUS/FACTS/CREDIT/CLOSE/AUTOMATIC_INPUT</code>，支持 <code>cols/rows/history/display/observe/resumed</code>）、<code>events.subscribe</code>（快照 + 12 类事实事件 + 15s 心跳 + <code>missed</code> 重同步）、<code>terminal.run</code>、<code>templates.list</code>、<code>terminal.kill</code>、<code>terminal.rm</code>、<code>terminal.put_begin/chunk/finish/abort</code>、<code>machine.*</code>。</li>
+    <li><b>无公网端口假设</b>：所有远端连接统一走 SSH 隧道执行 <code>hc connect</code>，适应 Tailscale / 局域网 / 公网 SSH，不要求远端暴露额外 TCP 端口。</li>
+  </ul>
+  <h2 id="y9j4wa3y">4. 系统架构与核心实现决策</h2>
+  <mermaid id="sJJzB2TI">flowchart TB
+  UI[&quot;NSGo UI 层 · 8 屏 + 主题 Token\n(Home / Session VT / Inbox / Instances / Settings / Onboarding / NewSession)&quot;]
+  Store[&quot;AppState 响应式状态层\n(全局聚合终端表 / 审批队列 / 内存帧缓存 / Snippets)&quot;]
+  Pool[&quot;CorePool 多实例并发连接池\n(每个 herdr-core 一条独立连接生命周期)&quot;]
+  Mux[&quot;FramedMux 复用通道\n(JSON-RPC 控制面 + events.subscribe + 多路 terminal.attach)&quot;]
+  SSH[&quot;SSH Transport + TOFU 指纹校验\n(Keystore/Keychain 私钥 · hc connect)&quot;]
+  CoreA[&quot;herdr-core: mac-mini&quot;]
+  CoreB[&quot;herdr-core: kr (+ 远端 machine)&quot;]
+  BG[&quot;Android 前台保活与通知桥\n(仅 Android 启用)&quot;]
+
+  UI --&gt; Store
+  Store --&gt; Pool
+  Pool --&gt; Mux
+  Mux --&gt; SSH
+  SSH --&gt; CoreA
+  SSH --&gt; CoreB
+  Store --&gt; BG</mermaid>
+  <h3 id="sLaadent">4.1 多实例并发连接池（<code>CorePool</code>）与跨核去重</h3>
+  <ul id="wcSymPnB">
+    <li><b>全局终端标识与去重（设计者暂定）</b>：定义 <code>TermKey{InstanceID, Addr}</code>（展示上保留实例名徽标如 <code>kr</code>、<code>mac-mini</code>，跨机器子地址显示为 <code>kr / vps-2</code>），避免不同核心各自的 <code>t1</code> 互相覆盖。当实例 A 通过 <code>machine.list</code> 联邦代理的远端机器 <code>MachineView.ID</code> 与 <code>CorePool</code> 中另一个直连实例 B 的 <code>CoreInfo.ID</code> 相同时，<b>优先展示直连实例 B</b> 并自动隐藏 A 下的重复代理行、收件箱计数与通知；当直连实例 B 离线时自动回退展示 A 的代理视角（标注「经 A 中继」）。</li>
+    <li><b>连接生命周期</b>：每个已启用的 <code>InstanceConfig</code> 独占一个后台 goroutine：建立 SSH → 执行 <code>hc connect</code> → <code>hello(generation:1, framed:true, features:[&quot;resize_notifications&quot;,&quot;automatic_input&quot;])</code> → 立即发起 <code>events.subscribe</code> 获取首份终端快照与实时流，同时异步拉取 <code>machine.list</code> 与 <code>templates.list</code>。</li>
+    <li><b>断线与重连</b>：单实例断线不影响其他实例；断线后保留该实例最后已知终端列表并标灰/标断连，按指数退避（1s → 2s → 5s → 10s，上限 30s）自动重连；App 从后台切回前台时立即重置退避并在 500ms 内发起探活重连；<code>events.subscribe</code> 收到 <code>missed</code> 时自动用携带的新快照全量覆盖该实例状态。</li>
+  </ul>
+  <h3 id="mlw4Ggz2">4.2 Framed 协议复用与文件直传</h3>
+  <ul id="nvltUU7Z">
+    <li><b>单连接多路复用</b>：<code>hello</code> 协商 <code>framed: true</code> 后，底层 <code>FramedConn</code> 负责帧拆包与分发：控制信道（channel 0）承载 JSON-RPC 请求/响应/事件通知；数据信道（<code>AttachResult.Channel</code>）承载 <code>terminal.attach</code> 的二进制 VT 字节流与 <code>RESIZE</code>/<code>FOCUS</code>/<code>FACTS</code>/<code>CREDIT</code>/<code>CLOSE</code> 控制帧。</li>
+    <li><b>文件与截图直传（<code>terminal.put_chunk</code>）</b>：用户在会话页点回形针选图或文件时，客户端按 64 KiB 分片调用 <code>terminal.put_begin</code> → <code>terminal.put_chunk</code> → <code>terminal.put_finish</code>；上传完成后自动把返回的远端绝对路径插入输入框（或按用户确认直接发送），让远端 Agent 直接读取该文件。</li>
+  </ul>
+  <h3 id="PpAR_BHs">4.3 真 VT 终端渲染与移动端交互（<code>SessionView</code>）</h3>
+  <ul id="IwuArj_a">
+    <li><b>瞬开机制</b>：每个访问过的终端在内存保留最近一帧渲染快照（默认上限 24 个会话 LRU）；点击会话行时 0ms 先绘出缓存帧，同时后台发 <code>terminal.attach(cols, rows, history:200, observe:true, resize_notifications:true, display:{fg,bg,cursor})</code> 接管实时流。</li>
+    <li><b>智能尺寸协商与 <code>observe</code> 视口规则（设计者暂定）</b>：默认以 <code>observe: true</code> 进入不修改桌面端正在看的 PTY 宽度；若远端 PTY 列宽大于手机可视宽度，<b>按 1:1 可读字号渲染并支持水平平移</b>（不做缩小到看不清的整屏缩放，保证划词复制准确）。在 <code>observe</code> 状态下双指捏合（10–15px）仅本地调整字号，不发 <code>RESIZE</code>。点击顶栏「适配列宽」或用户主动发输入切为活跃模式时，重附着 <code>observe: false</code> 并发送 <code>RESIZE(mobileCols, mobileRows)</code>（约 58 列）；再次点击顶栏切换回 <code>observe</code> 或退出会话页时关闭活跃 attach 通道，释放尺寸控制权给桌面端。</li>
+    <li><b>浅/暗色 ANSI 16 色表</b>：VT 画布默认跟随系统主题——亮色采用 <code>#FAFBFC</code> 底 + <code>#111827</code> 前景 + 高对比深色 ANSI 16 色映射（保证黄色/青色/亮灰在白底仍 ≥ 4.5:1）；暗色采用 <code>#070A0D</code> 底 + <code>#EEF2F6</code> 前景；设置页提供「始终深色终端」覆写开关。内置 JetBrains Mono Nerd Font 字体彻底消除 Powerline 方框 <code>□</code>。</li>
+    <li><b>移动端交互细节</b>：底部为单行可横滑键帽栏（<code>Esc</code>、<code>Ctrl+C</code>、<code>Tab</code>、<code>↑</code>、<code>↓</code>、快捷片段 ⚡、传文件 📎、直连键盘切换 ⌨）+ 底部输入框（支持中文长句草稿按会话持久化；点 ⌨ 可折叠输入框进入纯软键盘直连 VT 模式）。长按 VT 进入划词复制并识别 URL/路径；向上滚看历史时冻结自动滚底并浮现「回到底部」按钮；顶栏菜单提供会话内查找、中断、终止与清理。</li>
+  </ul>
+  <h3 id="O09qALIA">4.4 审批直操安全规则与协议映射（设计者暂定）</h3>
+  <ul id="CKky1FuD">
+    <li><b>无语义审批 RPC，按 <code>Status.App</code> 严格白名单映射</b>：经 <code>rpc.discover</code> 确认 <code>herdr-core v0.1.22</code> 不提供独立审批 RPC，卡片内「允许 / 拒绝」通过 <code>terminal.keys</code> 下发。客户端维护显式的 <code>Status.App</code> 适配器表（编码阶段对真实 Claude Code / Codex / pi 实测确认按键序列后再启用），<b>仅当 <code>Terminal.StateWord() == &quot;blocked&quot;</code>、<code>Status.Kind == &quot;permission&quot;</code> 且 <code>Status.App</code> 命中已验证白名单</b> 时才渲染「允许 / 拒绝」直操按钮；点击前二次校验最新状态仍为 <code>blocked</code> 防竞态误发。</li>
+    <li>未识别的 <code>Status.App</code>、以及 <code>question</code> / <code>auth</code> 类型阻塞卡片自动降级为仅显示「进终端处理」，杜绝误发键位。</li>
+  </ul>
+  <h3 id="5pdSo5f_">4.5 配对、密钥与后台保活</h3>
+  <ul id="X9w3lWSB">
+    <li><b>本机 SSH 密钥与安全存储</b>：定义 <code>SecretStore</code> 抽象层，Android 接入 Keystore / Encrypted 存储、iOS 接入 Keychain（绝不把私钥或密码明文写入普通 <code>core.Storage</code>）。首次打开可在设置或引导页生成 <code>ed25519</code> 密钥对并提供一键复制 <code>echo &quot;...&quot; &gt;&gt; ~/.ssh/authorized_keys</code> 命令。</li>
+    <li><b>扫码配对协议（设计者暂定）</b>：<code>herdr-core</code> 暂无官方 QR 协议，由 <code>herdr-nsgo</code> 定义 v1 开放格式 <code>herdr://pair?v=1&amp;host=...&amp;port=22&amp;user=...&amp;label=...&amp;fp=SHA256:...&amp;key=...</code>（同步兼容同字段紧凑 JSON）。扫码后若带 <code>fp</code> 直接预固定 TOFU；若不带 <code>key</code> 则优先尝试本机 <code>ed25519</code> 公钥认证，失败时引导用户复制公钥命令或改用密码登录（不做隐式改写远端 <code>authorized_keys</code>）。落库前自动执行 <code>hello</code> 连通测试并展示分步结果。</li>
+    <li><b>TOFU 主机指纹策略（设计者暂定）</b>：首次连接采用静默首次信任（若 QR 已带 <code>fp</code> 则严格预校验），在 <code>HostKeyCallback</code> 记录 <code>SHA256</code> 指纹并在实例卡片与设置页公开展示；后续连接指纹变化时<b>强制阻断认证并弹出指纹变更告警</b>（需用户在设置页手动撤销旧指纹后方可重连）。</li>
+    <li><b>Android 前台保活与提醒（纯 Go 管线优先策略，你定的）</b>：坚守 <code>go tool nsgo build</code> 纯 Go 打包管线，不拆出独立 Android Gradle/Kotlin 壳或 iOS Swift 桥。实现阶段先通过 <code>go doc</code> 盘点 <code>nsgo v0.3.0</code> 内置原生 API：原生支持的（如 <code>base/terminal</code>、系统通知/前台保活、安全存储、相机/选图、文件选择）全部做满；若某项在 <code>nsgo v0.3.0</code> 暂缺内置绑定，则在纯 Go 范围内优雅降级或延后（本地加密存储替代 Keystore/Keychain、选图/剪贴板载荷解码兜底实时相机扫码、Android 14/15 前台保活服务待 NSGo 原生支持后再补，同时应用内提醒与切回前台 500ms 瞬连保持生效）。</li>
+  </ul>
+  <h2 id="vSuy3FIE">5. 留给实现者自行决断的细节</h2>
+  <ul id="E5ciSI-U">
+    <li><code>herdr-core</code> <code>framed</code> 二进制帧头的确切字节布局（编码前直接对照本机 <code>hc</code> 二进制/实测连接验证，不凭记忆猜）。</li>
+    <li><code>nsgo v0.3.0</code> 中 <code>base/terminal</code>、扫码、安全存储、文件选择与通知/前台保活的真实 Go API 盘点与降级实现细节（严守纯 Go <code>nsgo build</code> 约束，实查后逐项记录到代码与验证报告）。</li>
+    <li>常用指令片段（Snippets）的内置默认列表（建议预置 4–5 条高频开发/Git/Agent 快捷指令并允许用户增删改）。</li>
+    <li>内存帧缓存的具体数据结构、事件节流合批间隔（如 16ms/60fps 刷新节流）与连接超时参数微调。</li>
+  </ul>
+  <h2 id="kLHd0r6Y">6. 设计系统落地方案（Design System Landing）</h2>
+  <h3 id="D4TAmjJR">6.1 选定的视觉方向（五维定义）</h3>
+  <ul id="bAKrd7vd">
+    <li><b>Product</b>：白天通勤或办公时在手机上并发管理多台 <code>herdr-core</code> 与 Coding Agent 的开发者，需要阳光下极快扫清阻塞，并在真终端里顺手微调。</li>
+    <li><b>Character</b>：利落、轻快、高扫读效率（Crisp · Nimble · Scannable）。</li>
+    <li><b>World</b>：极淡灰白工业仪表板 + 通体明亮的跟随主题真终端（亮色浅灰 <code>#FAFBFC</code> / 暗色深黑 <code>#070A0D</code>），以深青绿 <code>#0F766E</code>（暗色 <code>#2DD4BF</code>）为唯一品牌强调。</li>
+    <li><b>Moments</b>：首页置顶的「需要你」琥珀脉络审批卡（卡片内一键允许/拒绝），以及无缝衔接的 <code>libghostty-vt</code> 真终端 + 单行键帽栏。</li>
+    <li><b>Signature</b>：每条会话左侧 3px 状态色脉络条（青绿=跑着 / 琥珀=等你 / 绯红=出错 / 浅灰=空闲），亮暗双主题下同样半秒扫清全局。</li>
+  </ul>
+  <p id="Wy_eR0q3">选定依据与验收画板：<ref artboard="herdr-design-system" to="Cb2H17H8U3NIuS5CTth8b" board="dir-paper" />、<ref artboard="herdr-design-system" to="Cb2H17H8U3NIuS5CTth8b" board="tok-color-soft" />、<ref artboard="herdr-design-system" to="Cb2H17H8U3NIuS5CTth8b" board="tok-type-compact" />、<ref artboard="herdr-design-system" to="Cb2H17H8U3NIuS5CTth8b" board="tok-scale-sharp" />。</p>
+  <h3 id="YeCRr43n">6.2 完整 Token 表（唯一真相源：代码层落地为 <code>theme.go</code>）</h3>
+  <p id="_vbj9Rbn">以下全部数值直接抄自画板 <code>pages/tokens.css</code>（已在 <ref artboard="herdr-design-system" to="Cb2H17H8U3NIuS5CTth8b" board="token-sheet" /> 通过亮暗双主题 WCAG ≥ 4.5:1 自动检测）。业务界面严禁出现裸 RGB 数值，全部引用 <code>theme.go</code> 中同名语义 Token。</p>
+  <table id="iN5s-QJA">
+    <tr>
+      <th>
+        <p>Token</p>
+      </th>
+      <th>
+        <p>Light（默认主力）</p>
+      </th>
+      <th>
+        <p>Dark（自动切换）</p>
+      </th>
+      <th>
+        <p>用途</p>
+      </th>
+      <th>
+        <p>来源画板</p>
+      </th>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--color-bg</code></p>
+      </td>
+      <td>
+        <p><code>#f7f8fa</code></p>
+      </td>
+      <td>
+        <p><code>#0c0f12</code></p>
+      </td>
+      <td>
+        <p>页面底色</p>
+      </td>
+      <td>
+        <p><code>tok-color-soft</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--color-surface</code></p>
+      </td>
+      <td>
+        <p><code>#ffffff</code></p>
+      </td>
+      <td>
+        <p><code>#14191f</code></p>
+      </td>
+      <td>
+        <p>卡片、列表行、顶栏与底部 Tab 底色</p>
+      </td>
+      <td>
+        <p><code>tok-color-soft</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--color-surface-raised</code></p>
+      </td>
+      <td>
+        <p><code>#eef1f5</code></p>
+      </td>
+      <td>
+        <p><code>#1e2630</code></p>
+      </td>
+      <td>
+        <p>次级按钮、实例徽标、键帽、分段器底色</p>
+      </td>
+      <td>
+        <p><code>tok-color-soft</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--color-fill</code></p>
+      </td>
+      <td>
+        <p><code>#e3e7ee</code></p>
+      </td>
+      <td>
+        <p><code>#27313d</code></p>
+      </td>
+      <td>
+        <p>抽屉拖拽条与已结束状态条</p>
+      </td>
+      <td>
+        <p><code>tok-color-soft</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--color-separator</code></p>
+      </td>
+      <td>
+        <p><code>rgba(17,24,39,0.09)</code></p>
+      </td>
+      <td>
+        <p><code>rgba(238,242,246,0.10)</code></p>
+      </td>
+      <td>
+        <p>分组内部分隔线</p>
+      </td>
+      <td>
+        <p><code>tok-color-soft</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--color-border</code></p>
+      </td>
+      <td>
+        <p><code>rgba(17,24,39,0.08)</code></p>
+      </td>
+      <td>
+        <p><code>rgba(238,242,246,0.09)</code></p>
+      </td>
+      <td>
+        <p>1px 卡片与控件发丝边框</p>
+      </td>
+      <td>
+        <p><code>tok-color-soft</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--color-text</code></p>
+      </td>
+      <td>
+        <p><code>#111827</code></p>
+      </td>
+      <td>
+        <p><code>#eef2f6</code></p>
+      </td>
+      <td>
+        <p>主标题与会话名</p>
+      </td>
+      <td>
+        <p><code>tok-color-soft</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--color-text-secondary</code></p>
+      </td>
+      <td>
+        <p><code>#4b5563</code></p>
+      </td>
+      <td>
+        <p><code>#9aa7b8</code></p>
+      </td>
+      <td>
+        <p>次要说明与实例名</p>
+      </td>
+      <td>
+        <p><code>tok-color-soft</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--color-text-muted</code></p>
+      </td>
+      <td>
+        <p><code>#5b6575</code></p>
+      </td>
+      <td>
+        <p><code>#8291a5</code></p>
+      </td>
+      <td>
+        <p>目录路径、时间戳与分区标题</p>
+      </td>
+      <td>
+        <p><code>tok-color-soft</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--color-accent</code></p>
+      </td>
+      <td>
+        <p><code>#0f766e</code></p>
+      </td>
+      <td>
+        <p><code>#2dd4bf</code></p>
+      </td>
+      <td>
+        <p>主行动按钮、运行中脉络、激活 Tab</p>
+      </td>
+      <td>
+        <p><code>tok-color-soft</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--color-accent-fg</code></p>
+      </td>
+      <td>
+        <p><code>#ffffff</code></p>
+      </td>
+      <td>
+        <p><code>#04211d</code></p>
+      </td>
+      <td>
+        <p>主按钮内文字/图标</p>
+      </td>
+      <td>
+        <p><code>tok-color-soft</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--color-accent-soft</code></p>
+      </td>
+      <td>
+        <p><code>rgba(15,118,110,0.11)</code></p>
+      </td>
+      <td>
+        <p><code>rgba(45,212,191,0.14)</code></p>
+      </td>
+      <td>
+        <p>选中芯片与键帽按下底色</p>
+      </td>
+      <td>
+        <p><code>tok-color-soft</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--color-warn</code></p>
+      </td>
+      <td>
+        <p><code>#b45309</code></p>
+      </td>
+      <td>
+        <p><code>#f5a623</code></p>
+      </td>
+      <td>
+        <p>等你审批 / 提问阻塞脉络与文案</p>
+      </td>
+      <td>
+        <p><code>tok-color-soft</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--color-warn-soft</code></p>
+      </td>
+      <td>
+        <p><code>rgba(180,83,9,0.10)</code></p>
+      </td>
+      <td>
+        <p><code>rgba(245,166,35,0.14)</code></p>
+      </td>
+      <td>
+        <p>收件箱待处理徽标底色</p>
+      </td>
+      <td>
+        <p><code>tok-color-soft</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--color-danger</code></p>
+      </td>
+      <td>
+        <p><code>#c81e1e</code></p>
+      </td>
+      <td>
+        <p><code>#f05252</code></p>
+      </td>
+      <td>
+        <p>出错 / 断连告警与终止操作</p>
+      </td>
+      <td>
+        <p><code>tok-color-soft</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--color-danger-soft</code></p>
+      </td>
+      <td>
+        <p><code>rgba(200,30,30,0.10)</code></p>
+      </td>
+      <td>
+        <p><code>rgba(240,82,82,0.14)</code></p>
+      </td>
+      <td>
+        <p>危险次级按钮底色</p>
+      </td>
+      <td>
+        <p><code>tok-color-soft</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--color-vt-bg</code></p>
+      </td>
+      <td>
+        <p><code>#fafbfc</code></p>
+      </td>
+      <td>
+        <p><code>#070a0d</code></p>
+      </td>
+      <td>
+        <p>VT 终端默认画布底色</p>
+      </td>
+      <td>
+        <p><code>tok-color-soft</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--color-vt-fg</code></p>
+      </td>
+      <td>
+        <p><code>#111827</code></p>
+      </td>
+      <td>
+        <p><code>#eef2f6</code></p>
+      </td>
+      <td>
+        <p>VT 终端默认前景文字</p>
+      </td>
+      <td>
+        <p><code>tok-color-soft</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--color-vt-muted</code> / <code>accent</code> / <code>blue</code> / <code>amber</code> / <code>red</code></p>
+      </td>
+      <td>
+        <p><code>#5b6575</code> / <code>#0f766e</code> / <code>#1d4ed8</code> / <code>#b45309</code> / <code>#c81e1e</code></p>
+      </td>
+      <td>
+        <p><code>#8291a5</code> / <code>#2dd4bf</code> / <code>#60a5fa</code> / <code>#f5a623</code> / <code>#f87171</code></p>
+      </td>
+      <td>
+        <p>VT ANSI 语义基准色</p>
+      </td>
+      <td>
+        <p><code>tok-color-soft</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--type-nav</code> / <code>row-title</code> / <code>body</code> / <code>section</code> / <code>mono-meta</code> / <code>vt</code></p>
+      </td>
+      <td>
+        <p><code>600 20/26</code> · <code>500 14/20</code> · <code>400 14/20</code> · <code>500 12/16</code> · <code>400 11.5/16 Mono</code> · <code>400 12/17 Mono</code></p>
+      </td>
+      <td>
+        <p>同左</p>
+      </td>
+      <td>
+        <p>字阶（竖屏 VT 默认约 58 列）</p>
+      </td>
+      <td>
+        <p><code>tok-type-compact</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--space-1..6</code></p>
+      </td>
+      <td>
+        <p><code>4 / 8 / 12 / 16 / 20 / 24 px</code></p>
+      </td>
+      <td>
+        <p>同左</p>
+      </td>
+      <td>
+        <p>4px 间距网格（页面左右边距 14px，行距 7px）</p>
+      </td>
+      <td>
+        <p><code>tok-scale-sharp</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--radius-key / ctrl / card / sheet</code></p>
+      </td>
+      <td>
+        <p><code>6 / 8 / 10 / 16 px</code></p>
+      </td>
+      <td>
+        <p>同左</p>
+      </td>
+      <td>
+        <p>嵌套圆角阶梯</p>
+      </td>
+      <td>
+        <p><code>tok-scale-sharp</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--size-touch / key / icon / tabbar</code></p>
+      </td>
+      <td>
+        <p><code>40 / 34 / 18 / 54 px</code></p>
+      </td>
+      <td>
+        <p>同左</p>
+      </td>
+      <td>
+        <p>统一触控高度与图标尺寸</p>
+      </td>
+      <td>
+        <p><code>tok-scale-sharp</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--shadow-card</code> / <code>--shadow-sheet</code></p>
+      </td>
+      <td>
+        <p><code>0 1px 2px rgba(17,24,39,0.04)</code> / <code>0 10px 28px rgba(17,24,39,0.12)</code></p>
+      </td>
+      <td>
+        <p><code>none</code> / <code>0 12px 32px rgba(0,0,0,0.45)</code></p>
+      </td>
+      <td>
+        <p>亮色微投影，暗色纯阶梯 + 发丝线</p>
+      </td>
+      <td>
+        <p><code>tok-scale-sharp</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>--motion-press / nav / sheet</code></p>
+      </td>
+      <td>
+        <p><code>120ms</code> / <code>220ms</code> / <code>300ms</code> · <code>cubic-bezier(0.22,1,0.36,1)</code></p>
+      </td>
+      <td>
+        <p>同左</p>
+      </td>
+      <td>
+        <p>统一缓动与时长节奏</p>
+      </td>
+      <td>
+        <p><code>tok-scale-sharp</code></p>
+      </td>
+    </tr>
+  </table>
+  <h3 id="kmzfo7BW">6.3 页面布局规则（对应 <ref artboard="herdr-design-system" to="Cb2H17H8U3NIuS5CTth8b" board="layout-sheet" />）</h3>
+  <table id="IYBjb-eM">
+    <tr>
+      <th>
+        <p>页面类型</p>
+      </th>
+      <th>
+        <p>导航与顶栏</p>
+      </th>
+      <th>
+        <p>内容结构与密度</p>
+      </th>
+      <th>
+        <p>宽屏断点（≥ 680px）</p>
+      </th>
+      <th>
+        <p>对应画板</p>
+      </th>
+    </tr>
+    <tr>
+      <td>
+        <p>首页（会话聚合）</p>
+      </td>
+      <td>
+        <p>44px 顶栏（logo + 搜索 + <code>+</code>）+ 38px 实例胶囊 + 54px 底部 3-Tab</p>
+      </td>
+      <td>
+        <p>左右 14px，置顶「需要你」审批卡，下方实时会话列表（行高 56px，gap 7px）</p>
+      </td>
+      <td>
+        <p>左 280px 列表 + 右流体 VT 终端双栏</p>
+      </td>
+      <td>
+        <p><code>lay-nav-tabs</code> / <code>flow-home</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>会话真终端页</p>
+      </td>
+      <td>
+        <p>44px 紧凑顶栏（返回 + 会话名/实例/行列 + 适配列宽 + 更多）</p>
+      </td>
+      <td>
+        <p>流体 <code>base/terminal</code>（~34 行）+ 42px 单行键帽栏（含片段/传文件/键盘切）+ 52px 可折叠输入框</p>
+      </td>
+      <td>
+        <p>作为右侧主区常驻，列宽自动扩至 90+ 列</p>
+      </td>
+      <td>
+        <p><code>lay-session-dock</code> / <code>flow-session</code> / <code>flow-session-dark</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>收件箱</p>
+      </td>
+      <td>
+        <p>44px 顶栏（待处理计数）+ 响应式筛选框 + 54px 底部 3-Tab</p>
+      </td>
+      <td>
+        <p>跨实例分组（审批与提问 / 出错告警），<code>permission</code> 卡片直操允许/拒绝</p>
+      </td>
+      <td>
+        <p>同左侧栏模式，点项右侧打开对应 VT</p>
+      </td>
+      <td>
+        <p><code>flow-inbox</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>实例池管理</p>
+      </td>
+      <td>
+        <p>44px 顶栏（扫码 + 设置齿轮 + <code>+</code>）+ 54px 底部 3-Tab</p>
+      </td>
+      <td>
+        <p>各实例在线/延迟/终端数/TOFU 指纹与断连修复卡 + 快捷接入入口</p>
+      </td>
+      <td>
+        <p>居中最大宽 680px</p>
+      </td>
+      <td>
+        <p><code>flow-instances</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>新建会话抽屉</p>
+      </td>
+      <td>
+        <p>顶部拖拽条 + 44px 抽屉标题与关闭</p>
+      </td>
+      <td>
+        <p>最大高 82%，选实例/机器 → <code>templates.list</code>/Shell → cwd → name → 首条任务 → 40px 主按钮</p>
+      </td>
+      <td>
+        <p>居中模态框（最大宽 480px）</p>
+      </td>
+      <td>
+        <p><code>flow-new-session</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>设置页</p>
+      </td>
+      <td>
+        <p>44px 返回顶栏 + 版本号</p>
+      </td>
+      <td>
+        <p>分组列表：外观与 VT 渲染 / 本机密钥与 TOFU / 首屏缓存、保活通知与脱敏日志</p>
+      </td>
+      <td>
+        <p>居中最大宽 680px</p>
+      </td>
+      <td>
+        <p><code>flow-settings</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>冷启动向导</p>
+      </td>
+      <td>
+        <p>44px 顶栏（logo + 设置齿轮）</p>
+      </td>
+      <td>
+        <p>0 实例自动展示：扫码配对（15s）+ 本机公钥一键复制命令 + 手动表单 + 排障指引</p>
+      </td>
+      <td>
+        <p>居中最大宽 520px</p>
+      </td>
+      <td>
+        <p><code>flow-onboarding</code></p>
+      </td>
+    </tr>
+  </table>
+  <h3 id="u5S9dgT5">6.4 <code>DESIGN.md</code> 更新大纲与 Guard Test</h3>
+  <ul id="PkYAHyeg">
+    <li><b>仓库根目录 <code>DESIGN.md</code> 更新</b>：在实现阶段同步更新现有 <code>DESIGN.md</code>，按规范保留规则而非历史：① 五维方向；② 指向 <code>theme.go</code> 的 Token 表与用途；③ 字阶/间距/圆角与 7 类页面布局表；④ 4 类核心组件用法与禁忌（<code>comp-kit</code>、<code>comp-approve-inline</code>）；⑤ 上线前视觉自检清单。</li>
+    <li><b>Guard Test（<code>theme_test.go</code>）</b>：单元测试校验 <code>theme.go</code> 中所有亮/暗 Token 成对存在、所有前景/背景文本对比度 ≥ 4.5:1（通过相对亮度公式自动断言），并通过 AST/正则静态检查确保 <code>screens_*.go</code> 不直接调用 <code>core.RGB(...)</code> 写死裸色值（全部走 <code>ThemeOf(cx)</code>）。</li>
+    <li><b>Gallery / Tokens 调试页</b>：设置页「诊断」内提供隐藏/开发态「Token 与组件对照页」，运行时直接读 <code>theme.go</code> 渲染亮暗色阶与 4 类核心组件用于真机肉眼校验（因 NSGo 无独立 Storybook）。</li>
+  </ul>
+  <h3 id="z8CwTUR-">6.5 存量代码替换与真机验证计划</h3>
+  <table id="lxYrl5FQ">
+    <tr>
+      <th>
+        <p>现有文件（v0.1.0）</p>
+      </th>
+      <th>
+        <p>重构去向</p>
+      </th>
+      <th>
+        <p>替换与清理项</p>
+      </th>
+    </tr>
+    <tr>
+      <td>
+        <p><code>proto.go</code></p>
+      </td>
+      <td>
+        <p>扩展为完整 <code>hc v0.1.22</code> 协议模型</p>
+      </td>
+      <td>
+        <p>补齐 <code>framed</code>、<code>terminal.attach</code>、<code>terminal.run/kill/rm</code>、<code>templates.list</code>、<code>terminal.put_*</code>、<code>events.subscribe</code> 事件载荷结构</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>transport.go</code></p>
+      </td>
+      <td>
+        <p>拆分为 <code>transport.go</code>（SSH + TOFU + <code>SecretStore</code>）与 <code>framed.go</code>（二进制帧复用）</p>
+      </td>
+      <td>
+        <p>移除 <code>InsecureIgnoreHostKey</code> 改为 TOFU 校验；支持生成 <code>ed25519</code> 密钥对与扫码解析</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>client.go</code></p>
+      </td>
+      <td>
+        <p>升级为支持 <code>framed</code> 多路复用与 <code>AttachStream</code> 的 <code>Client</code></p>
+      </td>
+      <td>
+        <p>保留并扩展 <code>RPCError.Remediation()</code>，新增 <code>Attach</code> / <code>Run</code> / <code>Templates</code> / <code>Kill</code> / <code>Rm</code> / <code>PutFile</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>app.go</code></p>
+      </td>
+      <td>
+        <p>拆为 <code>pool.go</code>（多实例并发池）+ <code>app.go</code>（聚合信号、LRU 帧缓存、Snippets、Android 通知桥）</p>
+      </td>
+      <td>
+        <p>删除 1.5s 轮询 <code>pump</code> 与单 <code>a.client</code>，改为 <code>events.subscribe</code> 事件驱动</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>screens.go</code></p>
+      </td>
+      <td>
+        <p>拆为 <code>theme.go</code> + <code>components.go</code> + 分屏文件（<code>screen_home.go</code> / <code>screen_session.go</code> / <code>screen_inbox.go</code> / <code>screen_instances.go</code> / <code>screen_settings.go</code> / <code>screen_onboarding.go</code>）</p>
+      </td>
+      <td>
+        <p>彻底删除硬编码 <code>accent()</code> <code>#00e676</code>、默认蓝 <code>ButtonPrimary</code>、静态「发现 herdr」与 <code>inboxBody</code> 非响应式切片；全量迁移到 <code>ThemeOf(cx)</code> 与 <code>base/terminal</code></p>
+      </td>
+    </tr>
+  </table>
+  <p id="hEI1DXZH"><b>真机验证对照计划（OPPO Find X9 Pro + iOS）</b>：实现完成后在 OPPO Find X9 Pro 上实装 APK，同时连接 <code>mac-mini</code> 与 <code>kr</code> 两台真实 <code>herdr-core</code>，逐屏截真机图与画板 <code>flow-home</code>、<code>flow-session</code>、<code>flow-session-dark</code>、<code>flow-inbox</code>、<code>flow-instances</code>、<code>flow-new-session</code>、<code>flow-settings</code>、<code>flow-onboarding</code> 做 1:1 视觉与交互验收（覆盖：多实例聚合、真 VT 色彩与 Nerd Font、<code>observe</code>→<code>RESIZE</code>、审批直操、扫码配对、图片 <code>terminal.put_chunk</code>、Android 前台保活通知、亮暗主题切换）。</p>
+  <h2 id="ELLGqdP4">7. 关联产物索引</h2>
+  <ul id="1utS25rk">
+    <li>
+      <b>设计系统画板</b>：<code>artboard/herdr-design-system</code>（本地路径：<code>.ryugi/artifacts/artboard/herdr-design-system/canvas.json</code>，链接：<code>http://localhost:27319/artboard/Cb2H17H8U3NIuS5CTth8b</code>）
+      <ul>
+        <li><code>dir-paper</code>：选定方向 L1 晴空石板（亮色主力 + 完整暗色支持）</li>
+        <li><code>tok-color-soft</code>：选定极淡灰白 + 深青绿 <code>#0F766E</code>/<code>#2DD4BF</code> + 跟随主题浅/暗色 VT</li>
+        <li><code>tok-type-compact</code>：选定高密度扫读（列表 14px / VT 12px ~58 列）</li>
+        <li><code>tok-scale-sharp</code>：选定工业利落尺度（圆角 6/8/10px、触控 40px、键帽 34px、120/220ms）</li>
+        <li><code>token-sheet</code>：亮暗双主题 WCAG ≥ 4.5:1 自动校验基线</li>
+        <li><code>lay-nav-tabs</code> &amp; <code>lay-session-dock</code> &amp; <code>layout-sheet</code>：选定底部 3-Tab + 顶部实例胶囊、浅/暗色真 VT + 键帽栏 + 可折叠输入框、以及 ≥680px 双栏断点</li>
+        <li><code>comp-kit</code> &amp; <code>comp-approve-inline</code>：4 类核心组件亮暗全状态规范，审批卡支持 <code>permission</code> 卡片内直操</li>
+        <li><code>flow-home</code> / <code>flow-session</code> / <code>flow-session-dark</code> / <code>flow-inbox</code> / <code>flow-instances</code> / <code>flow-new-session</code> / <code>flow-settings</code> / <code>flow-onboarding</code>：全部 8 屏端到端产品流程</li>
+      </ul>
+    </li>
+    <li><b>书面设计文档</b>：<code>document/herdr-client-polish</code>（即本文档，本地路径：<code>.ryugi/artifacts/document/herdr-client-polish/doc.xml</code>）</li>
+  </ul>
+  <p id="pUjvX_Nf">审阅完整书面设计与关联设计系统画板后，请在此选择并提交：<ask id="approve"><option value="approve">批准此设计，进入按规范实现</option><option value="revise">需要修改（请在文档里评论指出）</option></ask></p>
+</doc>
+

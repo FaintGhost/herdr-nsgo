@@ -1,0 +1,10 @@
+name: herdr-nsgo
+id: dev.herdr.nsgo
+version: 0.1.0
+
+dev:
+  target: native
+
+build:
+  output: dist
+  targets: [all]
