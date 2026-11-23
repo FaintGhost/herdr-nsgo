@@ -696,8 +696,25 @@ func RenderSessionTerminal(
 	}
 
 	// Pure-Go VTScreen Canvas surface (Android arm64 + headless tests).
+	// Soft-wraps wide desktop lines cleanly to the phone viewport width so nothing is cut off
+	// on the right edge, even while staying in non-intrusive Observe mode!
 	padX := float32(8)
 	padY := float32(8)
+
+	wrapColsForViewport := func(fs float32) int {
+		st.mu.Lock()
+		vpW := st.viewportW
+		st.mu.Unlock()
+		if vpW <= 0 {
+			return 0
+		}
+		cellW := fs * 0.62
+		cols := int((vpW - padX*2) / cellW)
+		if cols < 24 {
+			cols = 24
+		}
+		return cols
+	}
 
 	return core.Scroll{
 		Ref:           &st.scrollRef,
@@ -713,9 +730,13 @@ func RenderSessionTerminal(
 		},
 		OnLayout: func(b core.Bounds) {
 			st.mu.Lock()
+			changed := st.viewportW != float32(b.Size.Width) || st.viewportH != float32(b.Size.Height)
 			st.viewportW = float32(b.Size.Width)
 			st.viewportH = float32(b.Size.Height)
 			st.mu.Unlock()
+			if changed {
+				st.bumpRevImmediate()
+			}
 		},
 		OnScroll: func(ev core.ScrollEvent) {
 			if ev.Stale || st.scrolledUp == nil {
@@ -783,58 +804,104 @@ func RenderSessionTerminal(
 					}
 				},
 			},
-			core.Scroll{
-				Horizontal: true,
-				NoShrink:   true,
-				TestID:     "vt-surface-hscroll",
+			core.Canvas{
+				TestID: "vt-canvas",
 				StyleFunc: func() core.Style {
-					return core.Style{Background: vtPalFn().Bg}
+					if st.rev != nil {
+						_ = st.rev.Get()
+					}
+					fs := getFontSize()
+					cellW := fs * 0.62
+					cellH := fs * 1.40
+					wrapCols := wrapColsForViewport(fs)
+					vlines := buildVisualLines(st.screen.AllLines(), wrapCols)
+					cols, _ := st.screen.Size()
+					if wrapCols > 0 {
+						cols = wrapCols
+					}
+					w := core.Points(padX*2 + float32(cols)*cellW)
+					h := core.Points(padY*2 + float32(len(vlines))*cellH)
+					if h < 220 {
+						h = 220
+					}
+					return core.Style{
+						Width:      core.Pt(w),
+						Height:     core.Pt(h),
+						Background: vtPalFn().Bg,
+					}
 				},
-				Children: []core.Node{
-					core.Canvas{
-						TestID: "vt-canvas",
-						StyleFunc: func() core.Style {
-							if st.rev != nil {
-								_ = st.rev.Get()
-							}
-							fs := getFontSize()
-							cellW := fs * 0.62
-							cellH := fs * 1.40
-							cols, _ := st.screen.Size()
-							totalLines := st.screen.TotalLines()
-							w := core.Points(padX*2 + float32(cols)*cellW)
-							h := core.Points(padY*2 + float32(totalLines)*cellH)
-							if h < 220 {
-								h = 220
-							}
-							return core.Style{
-								Width:      core.Pt(w),
-								Height:     core.Pt(h),
-								Background: vtPalFn().Bg,
-							}
-						},
-						Draw: func(d *core.Drawing, size core.Size) {
-							if st.rev != nil {
-								_ = st.rev.Get()
-							}
-							fs := getFontSize()
-							cellW := fs * 0.62
-							cellH := fs * 1.40
-							var query string
-							var activeMatch int
-							if st.searchQuery != nil {
-								query = st.searchQuery.Get()
-							}
-							if st.searchIdx != nil {
-								activeMatch = st.searchIdx.Get()
-							}
-							drawVTScreen(d, size, st.screen, palFn(), vtPalFn(), fs, cellW, cellH, padX, padY, query, activeMatch)
-						},
-					},
+				Draw: func(d *core.Drawing, size core.Size) {
+					if st.rev != nil {
+						_ = st.rev.Get()
+					}
+					fs := getFontSize()
+					cellW := fs * 0.62
+					cellH := fs * 1.40
+					var query string
+					var activeMatch int
+					if st.searchQuery != nil {
+						query = st.searchQuery.Get()
+					}
+					if st.searchIdx != nil {
+						activeMatch = st.searchIdx.Get()
+					}
+					drawVTScreen(d, size, st.screen, palFn(), vtPalFn(), fs, cellW, cellH, padX, padY, wrapColsForViewport(fs), query, activeMatch)
 				},
 			},
 		},
 	}
+}
+
+type vtVisualLine struct {
+	origLine int
+	colStart int
+	cells    []VTCell
+}
+
+// buildVisualLines soft-wraps logical terminal rows into viewport-width visual lines
+// without splitting wide 2-column CJK glyphs, trimming trailing empty cells on wrapped rows.
+func buildVisualLines(all [][]VTCell, wrapCols int) []vtVisualLine {
+	if wrapCols <= 0 {
+		out := make([]vtVisualLine, len(all))
+		for i, r := range all {
+			out[i] = vtVisualLine{origLine: i, colStart: 0, cells: r}
+		}
+		return out
+	}
+	out := make([]vtVisualLine, 0, len(all))
+	for i, row := range all {
+		// Find last non-blank cell so empty right padding does not spawn blank wrapped lines.
+		lastUsed := -1
+		for c := len(row) - 1; c >= 0; c-- {
+			cell := row[c]
+			if cell.Width == 0 || (cell.Rune != 0 && cell.Rune != ' ') || cell.Style.BG.Kind != VTColorDefault || cell.Style.Inverse {
+				lastUsed = c
+				break
+			}
+		}
+		if lastUsed < 0 || lastUsed < wrapCols {
+			end := len(row)
+			if end > wrapCols {
+				end = wrapCols
+			}
+			out = append(out, vtVisualLine{origLine: i, colStart: 0, cells: row[:end]})
+			continue
+		}
+		pos := 0
+		for pos <= lastUsed {
+			end := pos + wrapCols
+			if end > lastUsed+1 {
+				end = lastUsed + 1
+			}
+			// Never cut a wide 2-column character in half across wrap boundary.
+			if end < len(row) && row[end].Width == 0 && end > pos+1 {
+				end--
+			}
+			out = append(out, vtVisualLine{origLine: i, colStart: pos, cells: row[pos:end]})
+			pos = end
+		}
+	}
+	return out
 }
 
 func drawVTScreen(
@@ -844,6 +911,7 @@ func drawVTScreen(
 	pal Palette,
 	vtPal VTPalette,
 	fontSize, cellW, cellH, padX, padY float32,
+	wrapCols int,
 	searchQuery string,
 	activeMatch int,
 ) {
@@ -852,11 +920,13 @@ func drawVTScreen(
 	d.BeginPath().Rect(0, 0, float32(size.Width), float32(size.Height)).Fill()
 
 	all := screen.AllLines()
+	vlines := buildVisualLines(all, wrapCols)
 	sbLen := screen.ScrollbackLen()
 	if screen.InAltScreen() {
 		sbLen = 0
 	}
 	curCol, curRow, curVis := screen.Cursor()
+	curLine := sbLen + curRow
 
 	var matches []VTMatch
 	if strings.TrimSpace(searchQuery) != "" {
@@ -871,8 +941,9 @@ func drawVTScreen(
 		Size:   core.Points(fontSize),
 	}
 
-	for lineIdx, row := range all {
-		y := padY + float32(lineIdx)*cellH
+	for vIdx, vl := range vlines {
+		y := padY + float32(vIdx)*cellH
+		row := vl.cells
 
 		// Pass 1: cell background rectangles.
 		for col := 0; col < len(row); col++ {
@@ -893,23 +964,34 @@ func drawVTScreen(
 			}
 		}
 
-		// Search match highlights (high-contrast accent tint + solid active bar).
+		// Search match highlights overlapping this visual slice.
 		for mi, m := range matches {
-			if m.Line != lineIdx {
+			if m.Line != vl.origLine {
 				continue
+			}
+			mStart := m.Col - vl.colStart
+			mEnd := mStart + m.Length
+			if mEnd <= 0 || mStart >= len(row) {
+				continue
+			}
+			if mStart < 0 {
+				mStart = 0
+			}
+			if mEnd > len(row) {
+				mEnd = len(row)
 			}
 			hl := pal.AccentSoft
 			if mi == activeMatch {
 				hl = pal.Accent
 			}
 			d.SetFillColor(hl)
-			d.BeginPath().Rect(padX+float32(m.Col)*cellW, y, float32(m.Length)*cellW, cellH).Fill()
+			d.BeginPath().Rect(padX+float32(mStart)*cellW, y, float32(mEnd-mStart)*cellW, cellH).Fill()
 		}
 
 		// Cursor drawn BEFORE text (as underline bar so character underneath stays readable).
-		if curVis && lineIdx == sbLen+curRow {
+		if curVis && vl.origLine == curLine && curCol >= vl.colStart && curCol < vl.colStart+len(row) {
 			d.SetFillColor(vtPal.Cursor)
-			d.BeginPath().Rect(padX+float32(curCol)*cellW, y+cellH-2, cellW, 2).Fill()
+			d.BeginPath().Rect(padX+float32(curCol-vl.colStart)*cellW, y+cellH-2, cellW, 2).Fill()
 		}
 
 		// Pass 2: run-length batched ASCII/narrow runs; wide CJK/emoji drawn individually at exact col*cellW.

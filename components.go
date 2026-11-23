@@ -7,12 +7,70 @@ import (
 	"github.com/nsgo-dev/nsgo/core"
 )
 
-// AppName returns the detected agent/app name when reported in Status.
+// AppName returns the detected agent/harness name from Status.App or Foreground.Name.
 func (t Terminal) AppName() string {
-	if t.Status != nil {
+	if t.Status != nil && t.Status.App != "" {
 		return t.Status.App
 	}
+	if t.Foreground != nil && t.Foreground.Name != "" {
+		return t.Foreground.Name
+	}
 	return ""
+}
+
+// harnessVisual maps a detected agent/harness name to its vector icon and semantic tint role.
+func harnessVisual(pal Palette, app string) (*core.SVG, core.Color, core.Color) {
+	norm := strings.ToLower(strings.TrimSpace(app))
+	switch {
+	case strings.Contains(norm, "claude"):
+		return iconHarnessClaude, pal.Warn, pal.WarnSoft
+	case strings.Contains(norm, "codex"), strings.Contains(norm, "openai"):
+		return iconHarnessCodex, pal.Accent, pal.AccentSoft
+	case strings.Contains(norm, "antigravity"), strings.Contains(norm, "gemini"):
+		return iconHarnessGemini, pal.Accent, pal.AccentSoft
+	case norm == "pi" || norm == "omp" || strings.Contains(norm, "oh-my-pi"):
+		return iconHarnessPi, pal.Text, pal.SurfaceRaised
+	case strings.Contains(norm, "opencode"), strings.Contains(norm, "aider"), strings.Contains(norm, "cursor"):
+		return iconHarnessCode, pal.Accent, pal.AccentSoft
+	default:
+		return iconTerminal, pal.TextSecondary, pal.SurfaceRaised
+	}
+}
+
+// HarnessIconBadge renders a compact 26x26 rounded vector icon identifying the session's Harness/Agent.
+func HarnessIconBadge(cx *core.Scope, a *App, appFn func() string) core.Node {
+	return core.View{
+		StyleFunc: func() core.Style {
+			pal := a.paletteOf(cx)
+			_, _, bg := harnessVisual(pal, appFn())
+			return core.Style{
+				FlexShrink:     0,
+				Width:          core.Pt(26),
+				Height:         core.Pt(26),
+				CornerRadius:   Tokens.RadiusKey,
+				Background:     bg,
+				AlignItems:     core.AlignCenter,
+				JustifyContent: core.JustifyCenter,
+			}
+		},
+		Children: []core.Node{
+			core.Icon{
+				SVGFunc: func() *core.SVG {
+					svg, _, _ := harnessVisual(a.paletteOf(cx), appFn())
+					return svg
+				},
+				StyleFunc: func() core.Style {
+					pal := a.paletteOf(cx)
+					_, fg, _ := harnessVisual(pal, appFn())
+					return core.Style{
+						Width:  core.Pt(15),
+						Height: core.Pt(15),
+						Color:  fg,
+					}
+				},
+			},
+		},
+	}
 }
 
 // attentionWhy explains concisely why a terminal needs user attention.
@@ -392,7 +450,7 @@ func SessionRow(cx *core.Scope, a *App, itemFn func() AggregatedTerminal, select
 					Gap:        core.Points(4),
 				},
 				Children: []core.Node{
-					// Top row: Session name (1-line ellipsized) + StatusBadge (never collides)
+					// Top row: Harness icon + Session name (1-line ellipsized) + StatusBadge (never collides)
 					core.View{
 						Style: core.Style{
 							Direction:      core.Row,
@@ -401,6 +459,7 @@ func SessionRow(cx *core.Scope, a *App, itemFn func() AggregatedTerminal, select
 							Gap:            Tokens.Space2,
 						},
 						Children: []core.Node{
+							HarnessIconBadge(cx, a, func() string { return itemFn().Terminal.AppName() }),
 							core.Text{
 								MaxLines:    1,
 								ContentFunc: func() string { return itemFn().Terminal.Label() },
@@ -551,6 +610,7 @@ func InlineApprovalCard(cx *core.Scope, a *App, itemFn func() AggregatedTerminal
 							Gap:            Tokens.Space2,
 						},
 						Children: []core.Node{
+							HarnessIconBadge(cx, a, func() string { return itemFn().Terminal.AppName() }),
 							core.Text{
 								MaxLines: 1,
 								ContentFunc: func() string {
