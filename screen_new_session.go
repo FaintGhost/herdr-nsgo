@@ -120,6 +120,7 @@ func (u *uiController) newSessionSheet(cx *core.Scope) core.Node {
 				},
 				core.Scroll{
 					Horizontal:    true,
+					NoShrink:      true,
 					HideIndicator: true,
 					Children: []core.Node{
 						core.View{
@@ -209,6 +210,7 @@ func (u *uiController) newSessionSheet(cx *core.Scope) core.Node {
 				},
 				core.Scroll{
 					Horizontal:    true,
+					NoShrink:      true,
 					HideIndicator: true,
 					Children: []core.Node{
 						core.View{

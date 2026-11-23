@@ -11,6 +11,7 @@ import (
 // live search box, deduplicated multi-instance filter pills, "需要你" inline approvals, and sessions.
 func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 	a := u.app
+	showSearch := core.NewSignal(cx, false)
 
 	countForInstance := func(instID string) int {
 		n := 0
@@ -35,6 +36,9 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 		},
 		Children: []core.Node{
 			TopHeader(cx, a, func() string { return "herdr" }, nil, []core.Node{
+				IconButton(cx, a, "home-search-btn", "搜索会话", iconSearch, false, func() {
+					showSearch.Set(!showSearch.Get())
+				}),
 				IconButton(cx, a, "fab-new-session", "新建会话", iconPlus, true, func() {
 					u.showNewSession.Set(true)
 				}),
@@ -43,9 +47,10 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 				}),
 			}),
 			ToastBanner(cx, a),
-			// Top horizontal instance filter pills (deduplicated counts + reactive online dot)
+			// Top horizontal instance filter pills (NoShrink prevents vertical clipping!)
 			core.Scroll{
 				Horizontal:    true,
+				NoShrink:      true,
 				HideIndicator: true,
 				StyleFunc: func() core.Style {
 					pal := a.paletteOf(cx)
@@ -96,36 +101,41 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 					},
 				},
 			},
-			// Compact live search box
-			core.View{
-				StyleFunc: func() core.Style {
-					pal := a.paletteOf(cx)
-					return core.Style{
-						Background:  pal.Surface,
-						Padding:     core.Symmetric(Tokens.PagePadX, Tokens.Space2),
-						Borders:     core.Edges{Bottom: 1},
-						BorderColor: pal.Separator,
-					}
-				},
-				Children: []core.Node{
-					ui.Input{
-						TestID:      "home-search",
-						Placeholder: "搜索会话名、目录或地址…",
-						Value:       a.searchQuery.Get,
-						OnChange:    func(s string) { a.searchQuery.Set(s) },
+			// Collapsible live search box (keeps Home dense & matches flow-home artboard)
+			core.Show{
+				When: showSearch.Get,
+				Then: func(cx *core.Scope) core.Node {
+					return core.View{
 						StyleFunc: func() core.Style {
 							pal := a.paletteOf(cx)
 							return core.Style{
-								Width:        core.Pct(100),
-								MinHeight:    core.Pt(36),
-								Background:   pal.SurfaceRaised,
-								Color:        pal.Text,
-								CornerRadius: Tokens.RadiusCtrl,
-								BorderColor:  pal.Border,
-								BorderWidth:  1,
+								Background:  pal.Surface,
+								Padding:     core.Symmetric(Tokens.PagePadX, Tokens.Space2),
+								Borders:     core.Edges{Bottom: 1},
+								BorderColor: pal.Separator,
 							}
 						},
-					},
+						Children: []core.Node{
+							ui.Input{
+								TestID:      "home-search",
+								Placeholder: "搜索会话名、目录或地址…",
+								Value:       a.searchQuery.Get,
+								OnChange:    func(s string) { a.searchQuery.Set(s) },
+								StyleFunc: func() core.Style {
+									pal := a.paletteOf(cx)
+									return core.Style{
+										Width:        core.Pct(100),
+										MinHeight:    core.Pt(36),
+										Background:   pal.SurfaceRaised,
+										Color:        pal.Text,
+										CornerRadius: Tokens.RadiusCtrl,
+										BorderColor:  pal.Border,
+										BorderWidth:  1,
+									}
+								},
+							},
+						},
+					}
 				},
 			},
 			// Main scrollable list

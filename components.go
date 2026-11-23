@@ -714,6 +714,7 @@ func KeycapBar(cx *core.Scope, a *App, items []KeycapItem) core.Node {
 
 	return core.Scroll{
 		Horizontal:    true,
+		NoShrink:      true,
 		HideIndicator: true,
 		StyleFunc: func() core.Style {
 			pal := a.paletteOf(cx)
