@@ -303,21 +303,21 @@ func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 				return
 			}
 			st.Attach(stream, res.Terminal.Cols, res.Terminal.Rows)
-			// If no initial VT bytes arrive within 400ms (e.g., quiet relayed terminal), seed from terminal.read.
-			time.AfterFunc(400*time.Millisecond, func() {
+			// Only fall back to plain-text terminal.read if the ANSI attach stream produced zero bytes after 2.5s.
+			time.AfterFunc(2500*time.Millisecond, func() {
 				if u.attachGen.Load() != gen {
 					return
 				}
-				if strings.TrimSpace(st.Screen().VisibleText()) == "" {
+				if !st.HasReceivedBytes() {
 					rctx, rcancel := context.WithTimeout(context.Background(), 6*time.Second)
 					defer rcancel()
-					r, rerr := client.Read(rctx, key.Addr, 200)
-					if rerr == nil && r.Text != "" {
+					r, rerr := client.Read(rctx, key.Addr, 500)
+					if rerr == nil && r.Text != "" && !st.HasReceivedBytes() {
 						st.Feed([]byte(strings.ReplaceAll(r.Text, "\n", "\r\n")))
 						u.app.post(func() { st.ScrollToBottom() })
 					} else if rerr != nil {
 						st.SetDiag("已接入流，但读取初始快照失败：" + rerr.Error())
-					} else {
+					} else if !st.HasReceivedBytes() {
 						st.SetDiag("已接入流（当前屏幕无输出）")
 					}
 				} else {

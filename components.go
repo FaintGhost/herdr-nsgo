@@ -124,6 +124,10 @@ func stateColor(pal Palette, state string) (fg, soft core.Color, label string) {
 		return pal.Danger, pal.DangerSoft, "出错"
 	case "working":
 		return pal.Accent, pal.AccentSoft, "运行中"
+	case "done":
+		return pal.Accent, pal.AccentSoft, "已完成"
+	case "live":
+		return pal.TextSecondary, pal.SurfaceRaised, "在线"
 	case "idle":
 		return pal.TextSecondary, pal.SurfaceRaised, "空闲"
 	case "finished":
