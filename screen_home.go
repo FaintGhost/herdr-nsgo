@@ -4,12 +4,23 @@ import (
 	"fmt"
 
 	"github.com/nsgo-dev/nsgo/core"
+	"github.com/nsgo-dev/nsgo/ui"
 )
 
-// homeScreen renders the primary Home tab: top bar (Settings + New Session),
-// multi-instance filter pills, "需要你" inline approval cards, and active sessions list.
+// homeScreen renders the primary Home tab: crisp top bar with icon buttons,
+// live search box, deduplicated multi-instance filter pills, "需要你" inline approvals, and sessions.
 func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 	a := u.app
+
+	countForInstance := func(instID string) int {
+		n := 0
+		for _, it := range a.aggTerms.Get() {
+			if it.Key.InstanceID == instID {
+				n++
+			}
+		}
+		return n
+	}
 
 	return core.View{
 		TestID: "screen-home",
@@ -17,20 +28,22 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 			pal := a.paletteOf(cx)
 			return core.Style{
 				FlexGrow:   1,
+				FlexShrink: 1,
+				MinHeight:  core.Pt(0),
 				Background: pal.Bg,
 			}
 		},
 		Children: []core.Node{
-			TopHeader(cx, a, func() string { return "会话" }, nil, []core.Node{
-				ActionButton(cx, a, "fab-new-session", "+ 新建", ActionPrimary, func() {
+			TopHeader(cx, a, func() string { return "herdr" }, nil, []core.Node{
+				IconButton(cx, a, "fab-new-session", "新建会话", iconPlus, true, func() {
 					u.showNewSession.Set(true)
 				}),
-				ActionButton(cx, a, "home-settings-btn", "设置", ActionGhost, func() {
+				IconButton(cx, a, "home-settings-btn", "设置", iconSettings, false, func() {
 					u.subPage.Set("settings")
 				}),
 			}),
 			ToastBanner(cx, a),
-			// Top horizontal instance filter pills
+			// Top horizontal instance filter pills (deduplicated counts + reactive online dot)
 			core.Scroll{
 				Horizontal:    true,
 				HideIndicator: true,
@@ -62,13 +75,14 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 								func(s InstanceSnapshot) string { return s.InstanceID },
 								func(cx *core.Scope, item func() InstanceSnapshot, _ func() int) core.Node {
 									s0 := item()
-									online := s0.Online
 									return FilterPill(cx, a, "pill-inst-"+s0.InstanceID, func() string {
 										cur := item()
-										return fmt.Sprintf("%s (%d)", cur.InstanceName, len(cur.Terminals))
+										return fmt.Sprintf("%s (%d)", cur.InstanceName, countForInstance(cur.InstanceID))
 									}, func() bool {
 										return a.activeInstanceFilter.Get() == item().InstanceID
-									}, &online, func() {
+									}, func() bool {
+										return item().Online
+									}, func() {
 										id := item().InstanceID
 										if a.activeInstanceFilter.Get() == id {
 											a.activeInstanceFilter.Set("")
@@ -82,9 +96,41 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 					},
 				},
 			},
+			// Compact live search box
+			core.View{
+				StyleFunc: func() core.Style {
+					pal := a.paletteOf(cx)
+					return core.Style{
+						Background:  pal.Surface,
+						Padding:     core.Symmetric(Tokens.PagePadX, Tokens.Space2),
+						Borders:     core.Edges{Bottom: 1},
+						BorderColor: pal.Separator,
+					}
+				},
+				Children: []core.Node{
+					ui.Input{
+						TestID:      "home-search",
+						Placeholder: "搜索会话名、目录或地址…",
+						Value:       a.searchQuery.Get,
+						OnChange:    func(s string) { a.searchQuery.Set(s) },
+						StyleFunc: func() core.Style {
+							pal := a.paletteOf(cx)
+							return core.Style{
+								Width:        core.Pct(100),
+								MinHeight:    core.Pt(36),
+								Background:   pal.SurfaceRaised,
+								Color:        pal.Text,
+								CornerRadius: Tokens.RadiusCtrl,
+								BorderColor:  pal.Border,
+								BorderWidth:  1,
+							}
+						},
+					},
+				},
+			},
 			// Main scrollable list
 			core.Scroll{
-				Style: core.Style{FlexGrow: 1},
+				Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0)},
 				Children: []core.Node{
 					core.View{
 						Style: core.Style{
@@ -196,7 +242,7 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 										Then: func(cx *core.Scope) core.Node {
 											return EmptyStateCard(cx, a,
 												"当前筛选下没有会话",
-												"点击右上角「+ 新建」在已连上的实例里启动一个 Claude / Codex 或 Shell 终端。",
+												"点击右上角「+」在已连上的实例里启动一个 Claude / Codex 或 Shell 终端。",
 												"home-empty-new-btn", "新建会话", func() {
 													u.showNewSession.Set(true)
 												},

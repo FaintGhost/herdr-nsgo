@@ -6,6 +6,8 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/nsgo-dev/nsgo/base/terminal"
 	"github.com/nsgo-dev/nsgo/core"
@@ -21,14 +23,19 @@ type SessionTerminal struct {
 	key        TermKey
 	frameCache *FrameCache
 
-	mu        sync.Mutex
-	stream    *AttachStream
-	screen    *VTScreen
-	ghostty   *terminal.Terminal
-	ghosttyIO *sessionGhosttyBridge
-	observe   bool
-	closed    bool
-	rawRing   bytes.Buffer
+	observe atomic.Bool
+
+	mu           sync.Mutex
+	stream       *AttachStream
+	screen       *VTScreen
+	ghostty      *terminal.Terminal
+	ghosttyIO    *sessionGhosttyBridge
+	reattachFn   func(observe bool, cols, rows int)
+	pendingInput [][]byte
+	closed       bool
+	rawRing      bytes.Buffer
+	dirtyCache   bool
+	revScheduled atomic.Bool
 
 	// UI signals (updated via cx.Post when cx != nil, or directly in tests).
 	cx          *core.Scope
@@ -56,9 +63,9 @@ func NewSessionTerminal(cx *core.Scope, key TermKey, initialCols, initialRows in
 		key:        key,
 		frameCache: cache,
 		screen:     NewVTScreen(initialCols, initialRows),
-		observe:    observeDefault,
 		cx:         cx,
 	}
+	st.observe.Store(observeDefault)
 	if cx != nil {
 		st.rev = core.NewSignal[uint64](cx, 0)
 		st.observeSig = core.NewSignal[bool](cx, observeDefault)
@@ -95,8 +102,23 @@ func NewSessionTerminal(cx *core.Scope, key TermKey, initialCols, initialRows in
 		}
 	}
 
-	st.bumpRev()
+	st.bumpRevImmediate()
 	return st
+}
+
+// SetReattach registers a callback invoked when observe/active mode transitions require
+// re-attaching with the updated observe flag.
+func (st *SessionTerminal) SetReattach(fn func(observe bool, cols, rows int)) {
+	st.mu.Lock()
+	st.reattachFn = fn
+	st.mu.Unlock()
+}
+
+// Attached reports whether a live framed AttachStream is currently bound.
+func (st *SessionTerminal) Attached() bool {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.stream != nil
 }
 
 // Attach binds a live framed *AttachStream to this SessionTerminal and starts reading VT bytes.
@@ -111,13 +133,18 @@ func (st *SessionTerminal) Attach(stream *AttachStream, cols, rows int) {
 	}
 	prev := st.stream
 	st.stream = stream
+	gt := st.ghostty
 	if cols > 0 && rows > 0 {
 		st.screen.Resize(cols, rows)
-		if st.ghostty != nil {
-			st.ghostty.Resize(cols, rows)
-		}
 	}
+	queued := st.pendingInput
+	st.pendingInput = nil
 	st.mu.Unlock()
+
+	// Call Ghostty Resize outside st.mu to prevent ABBA/self-deadlock with bridge.Resize!
+	if gt != nil && cols > 0 && rows > 0 {
+		gt.Resize(cols, rows)
+	}
 
 	if prev != nil {
 		_ = prev.Close()
@@ -126,13 +153,19 @@ func (st *SessionTerminal) Attach(stream *AttachStream, cols, rows int) {
 		return
 	}
 
+	// Flush any input typed while transitioning from observe -> active attach.
+	for _, buf := range queued {
+		_, _ = stream.Write(buf)
+	}
+
 	stream.OnResize(func(c, r int) {
 		st.mu.Lock()
 		st.screen.Resize(c, r)
-		if st.ghostty != nil {
-			st.ghostty.Resize(c, r)
-		}
+		g := st.ghostty
 		st.mu.Unlock()
+		if g != nil {
+			g.Resize(c, r)
+		}
 		st.bumpRev()
 	})
 
@@ -154,7 +187,7 @@ func (st *SessionTerminal) readLoop(stream *AttachStream) {
 	}
 }
 
-// Feed writes VT bytes into both VTScreen and (if active) Ghostty, updating the LRU cache ring.
+// Feed writes VT bytes into both VTScreen and (if active) Ghostty, coalescing UI redraws & cache writes.
 func (st *SessionTerminal) Feed(data []byte) {
 	if len(data) == 0 {
 		return
@@ -166,19 +199,12 @@ func (st *SessionTerminal) Feed(data []byte) {
 	}
 	st.screen.Write(data)
 	st.appendRawLocked(data)
+	st.dirtyCache = true
 	gt := st.ghostty
-	cache := st.frameCache
-	var snapshot []byte
-	if cache != nil {
-		snapshot = append([]byte(nil), st.rawRing.Bytes()...)
-	}
 	st.mu.Unlock()
 
 	if gt != nil {
 		gt.Feed(data)
-	}
-	if cache != nil && len(snapshot) > 0 {
-		cache.Put(st.key, snapshot)
 	}
 	st.bumpRev()
 }
@@ -199,20 +225,20 @@ func (st *SessionTerminal) appendRawLocked(data []byte) {
 	st.rawRing.Write(data)
 }
 
-// Observe reports whether the session is currently in non-intrusive observe mode.
+// Observe reports whether the session is currently in non-intrusive observe mode (lock-free).
 func (st *SessionTerminal) Observe() bool {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	return st.observe
+	return st.observe.Load()
 }
 
 // SetObserve switches between observe mode (no PTY resize) and active fit-width mode.
-// When switching to active (observe=false), sends FrameResize to fit the current viewport.
+// When a reattach handler is wired, re-attaches cleanly with the updated observe flag;
+// otherwise falls back to sending RESIZE on the current stream.
 func (st *SessionTerminal) SetObserve(observe bool, fontSize float32) {
+	st.observe.Store(observe)
 	st.mu.Lock()
-	st.observe = observe
 	stream := st.stream
 	vpW, vpH := st.viewportW, st.viewportH
+	reattach := st.reattachFn
 	st.mu.Unlock()
 
 	st.post(func() {
@@ -221,25 +247,45 @@ func (st *SessionTerminal) SetObserve(observe bool, fontSize float32) {
 		}
 	})
 
+	cols, rows := fitGridForViewport(vpW, vpH, fontSize)
+	if reattach != nil {
+		if !observe {
+			st.resizeLocal(cols, rows)
+		}
+		reattach(observe, cols, rows)
+		return
+	}
 	if !observe {
-		cols, rows := fitGridForViewport(vpW, vpH, fontSize)
 		st.resizeRemote(stream, cols, rows)
 	}
 }
 
-// SendInput sends bytes to the remote PTY. If currently in observe mode, it first
-// promotes the session to active mode and resizes to the mobile viewport as specified.
+// SendInput sends bytes to the remote PTY. If currently in observe mode, promotes to active mode
+// (re-attaching when wired and queueing the input so no keystroke is lost).
 func (st *SessionTerminal) SendInput(data []byte, fontSize float32) error {
 	if len(data) == 0 {
 		return nil
 	}
+	wasObserve := st.observe.Swap(false)
+
 	st.mu.Lock()
-	wasObserve := st.observe
-	if wasObserve {
-		st.observe = false
-	}
 	stream := st.stream
 	vpW, vpH := st.viewportW, st.viewportH
+	reattach := st.reattachFn
+	if wasObserve && reattach != nil {
+		cp := append([]byte(nil), data...)
+		st.pendingInput = append(st.pendingInput, cp)
+		st.mu.Unlock()
+		st.post(func() {
+			if st.observeSig != nil {
+				st.observeSig.Set(false)
+			}
+		})
+		cols, rows := fitGridForViewport(vpW, vpH, fontSize)
+		st.resizeLocal(cols, rows)
+		reattach(false, cols, rows)
+		return nil
+	}
 	st.mu.Unlock()
 
 	if wasObserve {
@@ -259,6 +305,23 @@ func (st *SessionTerminal) SendInput(data []byte, fontSize float32) error {
 	return err
 }
 
+func (st *SessionTerminal) resizeLocal(cols, rows int) {
+	if cols < 20 {
+		cols = 58
+	}
+	if rows < 8 {
+		rows = 24
+	}
+	st.mu.Lock()
+	st.screen.Resize(cols, rows)
+	gt := st.ghostty
+	st.mu.Unlock()
+	if gt != nil {
+		gt.Resize(cols, rows)
+	}
+	st.bumpRevImmediate()
+}
+
 func (st *SessionTerminal) resizeRemote(stream *AttachStream, cols, rows int) {
 	if cols < 20 {
 		cols = 58
@@ -269,13 +332,7 @@ func (st *SessionTerminal) resizeRemote(stream *AttachStream, cols, rows int) {
 	if stream != nil {
 		_ = stream.Resize(cols, rows)
 	}
-	st.mu.Lock()
-	st.screen.Resize(cols, rows)
-	if st.ghostty != nil {
-		st.ghostty.Resize(cols, rows)
-	}
-	st.mu.Unlock()
-	st.bumpRev()
+	st.resizeLocal(cols, rows)
 }
 
 func fitGridForViewport(vpW, vpH, fontSize float32) (cols, rows int) {
@@ -321,7 +378,8 @@ func (st *SessionTerminal) SetSearch(q string) {
 			gt.Search(q)
 		}
 	}
-	st.bumpRev()
+	st.scrollToActiveMatch()
+	st.bumpRevImmediate()
 }
 
 // SearchMatches returns current search matches across scrollback + screen.
@@ -332,7 +390,7 @@ func (st *SessionTerminal) SearchMatches() []VTMatch {
 	return st.screen.Search(st.searchQuery.Get())
 }
 
-// NextSearchMatch cycles forward through search matches.
+// NextSearchMatch cycles forward through search matches and scrolls Canvas to the match.
 func (st *SessionTerminal) NextSearchMatch() {
 	m := st.SearchMatches()
 	if len(m) == 0 || st.searchIdx == nil {
@@ -342,10 +400,11 @@ func (st *SessionTerminal) NextSearchMatch() {
 	if gt := st.Ghostty(); gt != nil {
 		gt.SearchNext()
 	}
-	st.bumpRev()
+	st.scrollToActiveMatch()
+	st.bumpRevImmediate()
 }
 
-// PrevSearchMatch cycles backward through search matches.
+// PrevSearchMatch cycles backward through search matches and scrolls Canvas to the match.
 func (st *SessionTerminal) PrevSearchMatch() {
 	m := st.SearchMatches()
 	if len(m) == 0 || st.searchIdx == nil {
@@ -359,7 +418,24 @@ func (st *SessionTerminal) PrevSearchMatch() {
 	if gt := st.Ghostty(); gt != nil {
 		gt.SearchPrevious()
 	}
-	st.bumpRev()
+	st.scrollToActiveMatch()
+	st.bumpRevImmediate()
+}
+
+func (st *SessionTerminal) scrollToActiveMatch() {
+	m := st.SearchMatches()
+	if len(m) == 0 || st.searchIdx == nil {
+		return
+	}
+	idx := st.searchIdx.Get()
+	if idx < 0 || idx >= len(m) {
+		return
+	}
+	y := float32(m[idx].Line)*float32(Tokens.FontVTDefault)*1.40 - 40
+	if y < 0 {
+		y = 0
+	}
+	st.scrollRef.ScrollTo(core.Point{X: 0, Y: core.Points(y)}, true)
 }
 
 // ScrollToBottom scrolls the VT scroll view back to the newest line.
@@ -406,6 +482,32 @@ func (st *SessionTerminal) Close() {
 }
 
 func (st *SessionTerminal) bumpRev() {
+	if !st.revScheduled.CompareAndSwap(false, true) {
+		return
+	}
+	time.AfterFunc(20*time.Millisecond, func() {
+		st.revScheduled.Store(false)
+		st.flushCacheSnapshot()
+		st.bumpRevImmediate()
+	})
+}
+
+func (st *SessionTerminal) flushCacheSnapshot() {
+	st.mu.Lock()
+	if st.closed || !st.dirtyCache || st.frameCache == nil {
+		st.mu.Unlock()
+		return
+	}
+	st.dirtyCache = false
+	cache := st.frameCache
+	snapshot := append([]byte(nil), st.rawRing.Bytes()...)
+	st.mu.Unlock()
+	if len(snapshot) > 0 {
+		cache.Put(st.key, snapshot)
+	}
+}
+
+func (st *SessionTerminal) bumpRevImmediate() {
 	if st.rev == nil {
 		return
 	}
@@ -424,7 +526,7 @@ func (st *SessionTerminal) post(fn func()) {
 }
 
 // sessionGhosttyBridge connects base/terminal.Terminal input back to SessionTerminal.SendInput
-// while strictly blocking resize callbacks in observe mode.
+// while strictly blocking resize callbacks in observe mode (lock-free via atomic.Bool).
 type sessionGhosttyBridge struct {
 	st   *SessionTerminal
 	done chan struct{}
@@ -436,7 +538,6 @@ func newSessionGhosttyBridge(st *SessionTerminal) *sessionGhosttyBridge {
 }
 
 func (b *sessionGhosttyBridge) Read(p []byte) (int, error) {
-	// Output is pushed via ghostty.Feed(); block until closed.
 	<-b.done
 	return 0, io.EOF
 }
@@ -449,7 +550,7 @@ func (b *sessionGhosttyBridge) Write(p []byte) (int, error) {
 }
 
 func (b *sessionGhosttyBridge) Resize(cols, rows int) error {
-	// Strictly respect observe mode: never resize remote PTY while observing.
+	// Strictly respect observe mode without acquiring st.mu (prevents ABBA deadlock).
 	if b.st.Observe() {
 		return nil
 	}
@@ -467,44 +568,61 @@ func (b *sessionGhosttyBridge) Close() error {
 	return nil
 }
 
-// RenderSessionTerminal renders the VT terminal surface (native Ghostty on iOS/macOS/desktop,
+// RenderSessionTerminal renders the VT terminal surface reactively (native Ghostty on iOS/macOS/desktop,
 // high-speed pure-Go VTScreen + core.Canvas on Android and headless tests).
-func RenderSessionTerminal(cx *core.Scope, st *SessionTerminal, pal Palette, vtPal VTPalette, fontSize float32) core.Node {
-	if fontSize <= 0 {
-		fontSize = float32(Tokens.FontVTDefault)
+func RenderSessionTerminal(
+	cx *core.Scope,
+	st *SessionTerminal,
+	palFn func() Palette,
+	vtPalFn func() VTPalette,
+	fontSizeFn func() float32,
+) core.Node {
+	getFontSize := func() float32 {
+		fs := fontSizeFn()
+		if fs <= 0 {
+			return float32(Tokens.FontVTDefault)
+		}
+		return fs
 	}
+
 	if st == nil {
 		return core.View{
-			Style: core.Style{
-				FlexGrow:   1,
-				Background: vtPal.Bg,
-				Padding:    core.All(Tokens.Space3),
+			StyleFunc: func() core.Style {
+				return core.Style{
+					FlexGrow:   1,
+					Background: vtPalFn().Bg,
+					Padding:    core.All(Tokens.Space3),
+				}
 			},
 			Children: []core.Node{
 				core.Text{
 					Content: "正在连接终端会话…",
-					Style: core.Style{
-						Color:    vtPal.Muted,
-						FontSize: core.Points(fontSize),
+					StyleFunc: func() core.Style {
+						return core.Style{
+							Color:    vtPalFn().Muted,
+							FontSize: core.Points(getFontSize()),
+						}
 					},
 				},
 			},
 		}
 	}
 
-	// Native Ghostty surface on platforms that support it (iOS/macOS/Linux/Windows)
-	// when not overridden to canvas.
+	// Native Ghostty surface on platforms that support it (iOS/macOS/Linux/Windows).
 	if gt := st.Ghostty(); gt != nil {
 		lightTh, darkTh := GhosttyTerminalThemes()
+		vtPal := vtPalFn()
 		chosenLight, chosenDark := lightTh, darkTh
 		if vtPal.Bg == DarkVTPalette().Bg {
 			chosenLight = darkTh
 		}
 		return core.View{
 			TestID: "vt-surface",
-			Style: core.Style{
-				FlexGrow:   1,
-				Background: vtPal.Bg,
+			StyleFunc: func() core.Style {
+				return core.Style{
+					FlexGrow:   1,
+					Background: vtPalFn().Bg,
+				}
 			},
 			OnLayout: func(b core.Bounds) {
 				st.mu.Lock()
@@ -519,10 +637,10 @@ func RenderSessionTerminal(cx *core.Scope, st *SessionTerminal, pal Palette, vtP
 					DarkTheme: chosenDark,
 					NoKeyBar:  true,
 					Font: core.Font{
-						Family: "Menlo",
-						Size:   core.Points(fontSize),
+						Family: core.FontMonospace,
+						Size:   core.Points(getFontSize()),
 					},
-					Style: core.Style{FlexGrow: 1},
+					Style:  core.Style{FlexGrow: 1},
 					TestID: "vt-ghostty",
 				},
 			},
@@ -530,8 +648,6 @@ func RenderSessionTerminal(cx *core.Scope, st *SessionTerminal, pal Palette, vtP
 	}
 
 	// Pure-Go VTScreen Canvas surface (Android arm64 + headless tests).
-	cellW := fontSize * 0.62
-	cellH := fontSize * 1.40
 	padX := float32(8)
 	padY := float32(8)
 
@@ -541,9 +657,11 @@ func RenderSessionTerminal(cx *core.Scope, st *SessionTerminal, pal Palette, vtP
 		MinZoomScale:  0.7,
 		MaxZoomScale:  2.2,
 		HideIndicator: false,
-		Style: core.Style{
-			FlexGrow:   1,
-			Background: vtPal.Bg,
+		StyleFunc: func() core.Style {
+			return core.Style{
+				FlexGrow:   1,
+				Background: vtPalFn().Bg,
+			}
 		},
 		OnLayout: func(b core.Bounds) {
 			st.mu.Lock()
@@ -562,7 +680,9 @@ func RenderSessionTerminal(cx *core.Scope, st *SessionTerminal, pal Palette, vtP
 			core.Scroll{
 				Horizontal: true,
 				TestID:     "vt-surface-hscroll",
-				Style:      core.Style{Background: vtPal.Bg},
+				StyleFunc: func() core.Style {
+					return core.Style{Background: vtPalFn().Bg}
+				},
 				Children: []core.Node{
 					core.Canvas{
 						TestID: "vt-canvas",
@@ -570,23 +690,29 @@ func RenderSessionTerminal(cx *core.Scope, st *SessionTerminal, pal Palette, vtP
 							if st.rev != nil {
 								_ = st.rev.Get()
 							}
+							fs := getFontSize()
+							cellW := fs * 0.62
+							cellH := fs * 1.40
 							cols, _ := st.screen.Size()
-							lines := st.screen.AllLines()
+							totalLines := st.screen.TotalLines()
 							w := core.Points(padX*2 + float32(cols)*cellW)
-							h := core.Points(padY*2 + float32(len(lines))*cellH)
+							h := core.Points(padY*2 + float32(totalLines)*cellH)
 							if h < 220 {
 								h = 220
 							}
 							return core.Style{
 								Width:      core.Pt(w),
 								Height:     core.Pt(h),
-								Background: vtPal.Bg,
+								Background: vtPalFn().Bg,
 							}
 						},
 						Draw: func(d *core.Drawing, size core.Size) {
 							if st.rev != nil {
 								_ = st.rev.Get()
 							}
+							fs := getFontSize()
+							cellW := fs * 0.62
+							cellH := fs * 1.40
 							var query string
 							var activeMatch int
 							if st.searchQuery != nil {
@@ -595,7 +721,7 @@ func RenderSessionTerminal(cx *core.Scope, st *SessionTerminal, pal Palette, vtP
 							if st.searchIdx != nil {
 								activeMatch = st.searchIdx.Get()
 							}
-							drawVTScreen(d, size, st.screen, pal, vtPal, fontSize, cellW, cellH, padX, padY, query, activeMatch)
+							drawVTScreen(d, size, st.screen, palFn(), vtPalFn(), fs, cellW, cellH, padX, padY, query, activeMatch)
 						},
 					},
 				},
@@ -625,7 +751,6 @@ func drawVTScreen(
 	}
 	curCol, curRow, curVis := screen.Cursor()
 
-	// Build match highlight lookup per line if search is active.
 	var matches []VTMatch
 	if strings.TrimSpace(searchQuery) != "" {
 		matches = screen.Search(searchQuery)
@@ -642,20 +767,18 @@ func drawVTScreen(
 	for lineIdx, row := range all {
 		y := padY + float32(lineIdx)*cellH
 
-		// Pass 1: cell background rectangles (run-length batched for speed).
+		// Pass 1: cell background rectangles.
 		for col := 0; col < len(row); col++ {
 			cell := row[col]
 			if cell.Width == 0 {
 				continue
 			}
-			fgCol := cell.Style.FG.Resolve(vtPal, true)
 			bgCol := cell.Style.BG.Resolve(vtPal, false)
 			hasBG := cell.Style.BG.Kind != VTColorDefault
 			if cell.Style.Inverse {
-				fgCol, bgCol = bgCol, fgCol
+				bgCol = cell.Style.FG.Resolve(vtPal, true)
 				hasBG = true
 			}
-			_ = fgCol
 			if hasBG {
 				w := float32(cell.Width) * cellW
 				d.SetFillColor(bgCol)
@@ -663,20 +786,26 @@ func drawVTScreen(
 			}
 		}
 
-		// Search match highlights on this line.
+		// Search match highlights (high-contrast accent tint + solid active bar).
 		for mi, m := range matches {
 			if m.Line != lineIdx {
 				continue
 			}
-			hl := pal.WarnSoft
+			hl := pal.AccentSoft
 			if mi == activeMatch {
-				hl = pal.Warn
+				hl = pal.Accent
 			}
 			d.SetFillColor(hl)
 			d.BeginPath().Rect(padX+float32(m.Col)*cellW, y, float32(m.Length)*cellW, cellH).Fill()
 		}
 
-		// Pass 2: run-length batched text runs sharing identical style.
+		// Cursor drawn BEFORE text (as underline bar so character underneath stays readable).
+		if curVis && lineIdx == sbLen+curRow {
+			d.SetFillColor(vtPal.Cursor)
+			d.BeginPath().Rect(padX+float32(curCol)*cellW, y+cellH-2, cellW, 2).Fill()
+		}
+
+		// Pass 2: run-length batched ASCII/narrow runs; wide CJK/emoji drawn individually at exact col*cellW.
 		col := 0
 		for col < len(row) {
 			cell := row[col]
@@ -687,21 +816,26 @@ func drawVTScreen(
 			startCol := col
 			runStyle := cell.Style
 			var buf strings.Builder
-			for col < len(row) {
-				c := row[col]
-				if c.Width == 0 {
+			if cell.Width == 2 {
+				buf.WriteRune(cell.Rune)
+				col += 2
+			} else {
+				for col < len(row) {
+					c := row[col]
+					if c.Width == 0 {
+						col++
+						continue
+					}
+					if c.Width == 2 || c.Style != runStyle {
+						break
+					}
+					if c.Rune == 0 {
+						buf.WriteByte(' ')
+					} else {
+						buf.WriteRune(c.Rune)
+					}
 					col++
-					continue
 				}
-				if c.Style != runStyle {
-					break
-				}
-				if c.Rune == 0 {
-					buf.WriteByte(' ')
-				} else {
-					buf.WriteRune(c.Rune)
-				}
-				col++
 			}
 
 			fgCol := runStyle.FG.Resolve(vtPal, true)
@@ -726,12 +860,6 @@ func drawVTScreen(
 				d.SetFillColor(fgCol)
 				d.BeginPath().Rect(padX+float32(startCol)*cellW, y+cellH-2, float32(col-startCol)*cellW, 1).Fill()
 			}
-		}
-
-		// Cursor block on the active screen line.
-		if curVis && lineIdx == sbLen+curRow {
-			d.SetFillColor(vtPal.Cursor)
-			d.BeginPath().Rect(padX+float32(curCol)*cellW, y, cellW, cellH).Fill()
 		}
 	}
 }

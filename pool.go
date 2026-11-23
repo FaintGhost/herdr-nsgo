@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -67,8 +68,30 @@ func AggregateTerminals(snaps []InstanceSnapshot) []AggregatedTerminal {
 		}
 	}
 
+	// Track which peer CoreIDs actually have active relayed terminals on any online core.
+	relayedActiveCoreIDs := make(map[string]bool)
+	for _, s := range snaps {
+		if !s.Online {
+			continue
+		}
+		machineIDByName := make(map[string]string, len(s.Machines))
+		for _, m := range s.Machines {
+			if m.Name != "" && m.ID != "" {
+				machineIDByName[m.Name] = m.ID
+			}
+		}
+		for _, t := range s.Terminals {
+			if prefix, _, hasSlash := strings.Cut(t.Address, "/"); hasSlash {
+				if peerCoreID, ok := machineIDByName[prefix]; ok && peerCoreID != "" {
+					relayedActiveCoreIDs[peerCoreID] = true
+				}
+			}
+		}
+	}
+
 	var out []AggregatedTerminal
 	seen := make(map[string]bool)
+	seenRelayPeer := make(map[string]bool)
 
 	for _, s := range snaps {
 		machineIDByName := make(map[string]string, len(s.Machines))
@@ -81,40 +104,31 @@ func AggregateTerminals(snaps []InstanceSnapshot) []AggregatedTerminal {
 		for _, t := range s.Terminals {
 			relayed := false
 			relayVia := ""
-			if prefix, _, hasSlash := strings.Cut(t.Address, "/"); hasSlash {
+			peerCoreID := ""
+			if prefix, subAddr, hasSlash := strings.Cut(t.Address, "/"); hasSlash {
 				relayed = true
 				relayVia = s.InstanceName
-				// If this federated peer core is already directly connected & online, suppress duplicate!
-				if peerCoreID, ok := machineIDByName[prefix]; ok && onlineDirectCoreIDs[peerCoreID] {
-					continue
+				if pid, ok := machineIDByName[prefix]; ok && pid != "" {
+					peerCoreID = pid
+					// If this federated peer core is already directly connected & online, suppress duplicate!
+					if onlineDirectCoreIDs[peerCoreID] {
+						continue
+					}
+					// If another online core already relayed this same (peerCoreID, subAddr), deduplicate!
+					relayDedupeKey := peerCoreID + "::" + subAddr
+					if seenRelayPeer[relayDedupeKey] {
+						continue
+					}
+					seenRelayPeer[relayDedupeKey] = true
 				}
 			}
-			// If this instance is offline, skip its stale entries if another online core already shows them
-			// via direct or relay; otherwise keep stale entries visible while reconnecting.
 			key := TermKey{InstanceID: s.InstanceID, Addr: t.Address}
 			if seen[key.String()] {
 				continue
 			}
-			// Also suppress stale offline direct core's terminal when an online relay has it.
-			if !s.Online && s.CoreID != "" {
-				hasOnlineRelay := false
-				for _, other := range snaps {
-					if !other.Online || other.InstanceID == s.InstanceID {
-						continue
-					}
-					for _, m := range other.Machines {
-						if m.ID == s.CoreID {
-							hasOnlineRelay = true
-							break
-						}
-					}
-					if hasOnlineRelay {
-						break
-					}
-				}
-				if hasOnlineRelay {
-					continue
-				}
+			// Suppress stale offline direct core's terminal ONLY if an online relay actually carries terminals for it.
+			if !s.Online && s.CoreID != "" && relayedActiveCoreIDs[s.CoreID] {
+				continue
 			}
 
 			seen[key.String()] = true
@@ -142,6 +156,57 @@ func AggregateTerminals(snaps []InstanceSnapshot) []AggregatedTerminal {
 		return out[i].Key.String() < out[j].Key.String()
 	})
 	return out
+}
+
+// alertTracker computes deduplicated NeedsYou notification diffs over AggregateTerminals snapshots.
+// First sight of an instance/terminal seeds silently so reconnecting doesn't spam stale alerts.
+type alertTracker struct {
+	mu     sync.Mutex
+	seeded bool
+	seen   map[string]string // canonical terminal identity -> last status signature
+}
+
+func newAlertTracker() *alertTracker {
+	return &alertTracker{seen: make(map[string]string)}
+}
+
+func (tr *alertTracker) diff(snaps []InstanceSnapshot, agg []AggregatedTerminal) []AggregatedTerminal {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+
+	active := make(map[string]bool, len(agg))
+	var alerts []AggregatedTerminal
+	for _, it := range agg {
+		id := it.Key.String()
+		if it.CoreID != "" && !it.Relayed {
+			id = it.CoreID + "::" + it.Key.Addr
+		}
+		active[id] = true
+		if it.Terminal.NeedsYou() {
+			msg := ""
+			kind := ""
+			if it.Terminal.Status != nil {
+				msg = it.Terminal.Status.Msg
+				kind = it.Terminal.Status.Kind
+			}
+			sig := fmt.Sprintf("%s:%s:%s", it.Terminal.StateWord(), kind, msg)
+			if tr.seen[id] != sig {
+				tr.seen[id] = sig
+				if tr.seeded {
+					alerts = append(alerts, it)
+				}
+			}
+		} else {
+			delete(tr.seen, id)
+		}
+	}
+	for id := range tr.seen {
+		if !active[id] {
+			delete(tr.seen, id)
+		}
+	}
+	tr.seeded = true
+	return alerts
 }
 
 func termSortRank(t Terminal) int {
@@ -250,10 +315,12 @@ type CorePool struct {
 }
 
 type coreWorker struct {
-	pool   *CorePool
-	host   Host
-	cancel context.CancelFunc
-	wakeCh chan struct{}
+	pool         *CorePool
+	host         Host
+	cancel       context.CancelFunc
+	wakeCh       chan struct{}
+	resyncCh     chan struct{}
+	resetBackoff atomic.Bool
 
 	mu          sync.Mutex
 	client      *Client
@@ -325,6 +392,7 @@ func (p *CorePool) SetHosts(hosts []Host) {
 				host:      h,
 				cancel:    cancel,
 				wakeCh:    make(chan struct{}, 1),
+				resyncCh:  make(chan struct{}, 1),
 				state:     stateDialing,
 				terminals: make(map[string]Terminal),
 				notified:  make(map[string]string),
@@ -346,10 +414,11 @@ func (p *CorePool) SetHosts(hosts []Host) {
 }
 
 func hostChanged(a, b Host) bool {
-	return a.Target != b.Target || a.User != b.User || a.Password != b.Password || a.Key != b.Key || a.PinnedFP != b.PinnedFP || a.Label != b.Label
+	return a.Target != b.Target || a.User != b.User || a.Password != b.Password || a.Key != b.Key || a.PinnedFP != b.PinnedFP || a.Label != b.Label || a.UseLocalKey != b.UseLocalKey || a.CredRev != b.CredRev
 }
 
-// WakeAll immediately resets backoff and reconnects any offline workers (e.g. foreground resume).
+// WakeAll immediately resets backoff, wakes offline workers, and 500ms-pings online workers
+// so half-open mobile TCP sockets after sleep or Wi-Fi↔5G handoff reconnect cleanly.
 func (p *CorePool) WakeAll() {
 	p.mu.Lock()
 	workers := make([]*coreWorker, 0, len(p.workers))
@@ -358,9 +427,20 @@ func (p *CorePool) WakeAll() {
 	}
 	p.mu.Unlock()
 	for _, w := range workers {
+		w.resetBackoff.Store(true)
 		select {
 		case w.wakeCh <- struct{}{}:
 		default:
+		}
+		w.mu.Lock()
+		c := w.client
+		w.mu.Unlock()
+		if c != nil {
+			go func(client *Client) {
+				if !client.Ping(500 * time.Millisecond) {
+					_ = client.Close()
+				}
+			}(c)
 		}
 	}
 }
@@ -543,6 +623,11 @@ func (w *coreWorker) run(ctx context.Context) {
 			continue
 		}
 
+		// Fetch initial machines (short 3s budget) before first emit so cross-core dedup has MachineView.ID immediately.
+		mctx, mcancel := context.WithTimeout(ctx, 3*time.Second)
+		initMachines, _ := c.Machines(mctx)
+		mcancel()
+
 		// Connected & subscribed!
 		attempt = 0
 		w.mu.Lock()
@@ -553,19 +638,39 @@ func (w *coreWorker) run(ctx context.Context) {
 		w.latencyMS = latency
 		w.state = stateOnline
 		w.problem = ""
+		if initMachines != nil {
+			w.machines = initMachines
+		}
 		w.replaceTerminalsLocked(sub.Terminals)
 		w.mu.Unlock()
 		w.pool.emitChange()
 
-		// Fetch machines & templates asynchronously without blocking UI snapshot.
+		// Fetch templates (and retry machines if initial call timed out) asynchronously.
 		go w.loadMetadata(ctx, c)
+
+		// Dedicated per-connection async resync loop so Client.readLoop NEVER blocks on RPCs.
+		connCtx, connCancel := context.WithCancel(ctx)
+		go func(cctx context.Context, client *Client) {
+			for {
+				select {
+				case <-cctx.Done():
+					return
+				case <-client.Closed():
+					return
+				case <-w.resyncCh:
+					w.resync(cctx, client)
+				}
+			}
+		}(connCtx, c)
 
 		// Wait until connection drops or context canceled.
 		select {
 		case <-ctx.Done():
+			connCancel()
 			_ = c.Close()
 			return
 		case <-c.Closed():
+			connCancel()
 			w.mu.Lock()
 			if w.client == c {
 				w.client = nil
@@ -606,12 +711,16 @@ func (w *coreWorker) setState(st, problem string) {
 }
 
 func (w *coreWorker) sleepOrWake(ctx context.Context, d time.Duration) bool {
+	if w.resetBackoff.Swap(false) {
+		return ctx.Err() == nil
+	}
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
 	case <-ctx.Done():
 		return false
 	case <-w.wakeCh:
+		w.resetBackoff.Store(false)
 		return true
 	case <-t.C:
 		return true
@@ -627,9 +736,14 @@ func (w *coreWorker) replaceTerminalsLocked(list []Terminal) {
 	}
 }
 
-func (w *coreWorker) applyEvent(ctx context.Context, c *Client, ev Event) {
-	var alertTerm *AggregatedTerminal
+func (w *coreWorker) triggerResync() {
+	select {
+	case w.resyncCh <- struct{}{}:
+	default:
+	}
+}
 
+func (w *coreWorker) applyEvent(ctx context.Context, c *Client, ev Event) {
 	w.mu.Lock()
 	switch ev.Type {
 	case "created":
@@ -641,7 +755,7 @@ func (w *coreWorker) applyEvent(ctx context.Context, c *Client, ev Event) {
 			w.terminals[t.Address] = t
 		} else {
 			w.mu.Unlock()
-			w.resync(ctx, c)
+			w.triggerResync()
 			return
 		}
 	case "removed":
@@ -661,28 +775,10 @@ func (w *coreWorker) applyEvent(ctx context.Context, c *Client, ev Event) {
 				t.Status = &st
 				t.State = st.State
 				w.terminals[ev.Terminal] = t
-				if t.NeedsYou() {
-					sig := fmt.Sprintf("%s:%s:%s", st.State, st.Kind, st.Msg)
-					if w.notified[ev.Terminal] != sig {
-						w.notified[ev.Terminal] = sig
-						name := w.host.Label
-						if name == "" {
-							name = w.coreName
-						}
-						alertTerm = &AggregatedTerminal{
-							Key:          TermKey{InstanceID: w.host.EffectiveID(), Addr: t.Address},
-							InstanceName: name,
-							CoreID:       w.coreID,
-							Terminal:     t,
-						}
-					}
-				} else {
-					delete(w.notified, ev.Terminal)
-				}
 			}
 		} else {
 			w.mu.Unlock()
-			w.resync(ctx, c)
+			w.triggerResync()
 			return
 		}
 	case "title":
@@ -695,10 +791,9 @@ func (w *coreWorker) applyEvent(ctx context.Context, c *Client, ev Event) {
 		}
 	case "finished", "lost", "restarted", "missed":
 		w.mu.Unlock()
-		w.resync(ctx, c)
+		w.triggerResync()
 		return
 	default:
-		// turn, size, keep, labels, doc: refresh specific terminal if present
 		if ev.Terminal != "" {
 			w.mu.Unlock()
 			go w.refreshOne(ctx, c, ev.Terminal)
@@ -708,14 +803,6 @@ func (w *coreWorker) applyEvent(ctx context.Context, c *Client, ev Event) {
 	w.mu.Unlock()
 
 	w.pool.emitChange()
-	if alertTerm != nil {
-		w.pool.mu.Lock()
-		fn := w.pool.onNeedsYou
-		w.pool.mu.Unlock()
-		if fn != nil {
-			fn(*alertTerm)
-		}
-	}
 }
 
 func (w *coreWorker) refreshOne(ctx context.Context, c *Client, addr string) {

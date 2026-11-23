@@ -247,6 +247,16 @@ func (s *VTScreen) ScrollbackLen() int {
 	return len(s.scrollback)
 }
 
+// TotalLines returns the number of renderable lines without cloning any cells.
+func (s *VTScreen) TotalLines() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.inAlt {
+		return len(s.grid)
+	}
+	return len(s.scrollback) + len(s.grid)
+}
+
 // Rows returns a deep copy of the currently visible rows.
 func (s *VTScreen) Rows() [][]VTCell {
 	s.mu.RLock()
@@ -498,7 +508,7 @@ func (s *VTScreen) feedByte(b byte) {
 	case vtStateSkipSTEsc:
 		if b == '\\' {
 			s.state = vtStateGround
-		} else {
+		} else if b != 0x1b {
 			s.state = vtStateSkipST
 		}
 	}
@@ -699,6 +709,10 @@ func (s *VTScreen) handleOSC() {
 					s.oscLinkSeen[uri] = struct{}{}
 					s.oscLinks = append(s.oscLinks, uri)
 					if len(s.oscLinks) > 200 {
+						evicted := s.oscLinks[:len(s.oscLinks)-200]
+						for _, old := range evicted {
+							delete(s.oscLinkSeen, old)
+						}
 						s.oscLinks = s.oscLinks[len(s.oscLinks)-200:]
 					}
 				}
@@ -953,16 +967,67 @@ func (s *VTScreen) applySGR(raw string) {
 		s.style = VTStyle{}
 		return
 	}
-	// Normalize sub-parameter colons (e.g. 38:2::R:G:B or 38:5:N) into tokens.
-	normalized := strings.ReplaceAll(raw, ":", ";")
-	params := parseCSIParams(normalized)
-	if len(params) == 0 {
+	parts := strings.Split(raw, ";")
+	if len(parts) == 0 {
 		s.style = VTStyle{}
 		return
 	}
 
-	for i := 0; i < len(params); i++ {
-		p := params[i]
+	parseInt := func(tok string) int {
+		if tok == "" {
+			return 0
+		}
+		v, err := strconv.Atoi(tok)
+		if err != nil {
+			return 0
+		}
+		return v
+	}
+
+	for i := 0; i < len(parts); i++ {
+		tok := parts[i]
+		// Handle ITU T.416 colon sub-parameters directly: 38:5:N, 38:2:cs:R:G:B, 38:2:R:G:B
+		if strings.Contains(tok, ":") {
+			sub := strings.Split(tok, ":")
+			code := parseInt(sub[0])
+			if (code == 38 || code == 48) && len(sub) >= 3 {
+				isFG := code == 38
+				mode := parseInt(sub[1])
+				if mode == 5 {
+					col := VTColor{Kind: VTColor256, Index: uint8(clampInt(parseInt(sub[2]), 0, 255))}
+					if isFG {
+						s.style.FG = col
+					} else {
+						s.style.BG = col
+					}
+					continue
+				}
+				if mode == 2 {
+					// 38:2:colorspace:R:G:B (len >= 6) vs 38:2:R:G:B (len == 5)
+					off := 2
+					if len(sub) >= 6 {
+						off = 3
+					}
+					if off+2 < len(sub) {
+						col := VTColor{
+							Kind: VTColorRGB,
+							R:    uint8(clampInt(parseInt(sub[off]), 0, 255)),
+							G:    uint8(clampInt(parseInt(sub[off+1]), 0, 255)),
+							B:    uint8(clampInt(parseInt(sub[off+2]), 0, 255)),
+						}
+						if isFG {
+							s.style.FG = col
+						} else {
+							s.style.BG = col
+						}
+					}
+					continue
+				}
+			}
+			continue
+		}
+
+		p := parseInt(tok)
 		switch {
 		case p == 0:
 			s.style = VTStyle{}
@@ -1003,12 +1068,12 @@ func (s *VTScreen) applySGR(raw string) {
 			s.style.BG = VTColor{Kind: VTColorANSI, Index: uint8(p - 100 + 8)}
 		case p == 38 || p == 48:
 			isFG := p == 38
-			if i+1 >= len(params) {
+			if i+1 >= len(parts) {
 				continue
 			}
-			mode := params[i+1]
-			if mode == 5 && i+2 < len(params) {
-				idx := clampInt(params[i+2], 0, 255)
+			mode := parseInt(parts[i+1])
+			if mode == 5 && i+2 < len(parts) {
+				idx := clampInt(parseInt(parts[i+2]), 0, 255)
 				col := VTColor{Kind: VTColor256, Index: uint8(idx)}
 				if isFG {
 					s.style.FG = col
@@ -1016,10 +1081,10 @@ func (s *VTScreen) applySGR(raw string) {
 					s.style.BG = col
 				}
 				i += 2
-			} else if mode == 2 && i+4 < len(params) {
-				r := uint8(clampInt(params[i+2], 0, 255))
-				g := uint8(clampInt(params[i+3], 0, 255))
-				b := uint8(clampInt(params[i+4], 0, 255))
+			} else if mode == 2 && i+4 < len(parts) {
+				r := uint8(clampInt(parseInt(parts[i+2]), 0, 255))
+				g := uint8(clampInt(parseInt(parts[i+3]), 0, 255))
+				b := uint8(clampInt(parseInt(parts[i+4]), 0, 255))
 				col := VTColor{Kind: VTColorRGB, R: r, G: g, B: b}
 				if isFG {
 					s.style.FG = col

@@ -369,6 +369,9 @@ func (c *Client) Call(ctx context.Context, method string, params, out any) error
 		c.mu.Unlock()
 		return ctx.Err()
 	case <-c.closed:
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
 		return errors.New("connection closed")
 	}
 }
@@ -500,13 +503,13 @@ func (c *Client) Attach(ctx context.Context, p AttachParams) (*AttachStream, Att
 	}
 	stream := newAttachStream(c, res.Channel)
 	c.mu.Lock()
-	c.streams[res.Channel] = stream
 	early := c.earlyFrames[res.Channel]
 	delete(c.earlyFrames, res.Channel)
-	c.mu.Unlock()
 	for _, f := range early {
 		stream.deliver(f.kind, f.body)
 	}
+	c.streams[res.Channel] = stream
+	c.mu.Unlock()
 	return stream, res, nil
 }
 
@@ -609,7 +612,9 @@ func (c *Client) PutFile(ctx context.Context, addr, name string, data []byte) (P
 			"offset":   offset,
 			"data":     base64.StdEncoding.EncodeToString(data[offset:end]),
 		}, nil); err != nil {
-			_ = c.Call(context.Background(), "terminal.put_abort", map[string]any{"transfer": transfer}, nil)
+			abortCtx, abortCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = c.Call(abortCtx, "terminal.put_abort", map[string]any{"transfer": transfer}, nil)
+			abortCancel()
 			return PutResult{}, err
 		}
 	}
@@ -621,10 +626,15 @@ func (c *Client) PutFile(ctx context.Context, addr, name string, data []byte) (P
 	return res, nil
 }
 
-// Ping reports whether the core answers within d.
+// Ping reports whether the core answers within d (an RPCError still proves the link is alive).
 func (c *Client) Ping(d time.Duration) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), d)
 	defer cancel()
 	var out map[string]any
-	return c.Call(ctx, "server.status", nil, &out) == nil
+	err := c.Call(ctx, "server.status", nil, &out)
+	if err == nil {
+		return true
+	}
+	var re *RPCError
+	return errors.As(err, &re)
 }

@@ -21,22 +21,24 @@ func (u *uiController) instancesScreen(cx *core.Scope) core.Node {
 			pal := a.paletteOf(cx)
 			return core.Style{
 				FlexGrow:   1,
+				FlexShrink: 1,
+				MinHeight:  core.Pt(0),
 				Background: pal.Bg,
 			}
 		},
 		Children: []core.Node{
 			TopHeader(cx, a, func() string { return "实例" }, nil, []core.Node{
-				ActionButton(cx, a, "instances-qr-btn", "扫码配对", ActionPrimary, func() {
+				IconButton(cx, a, "instances-qr-btn", "扫码配对", iconQR, true, func() {
 					u.openQRPairing(cx)
 				}),
-				ActionButton(cx, a, "instances-add-btn", "+ 手动", ActionSecondary, func() {
+				IconButton(cx, a, "instances-add-btn", "手动添加实例", iconPlus, false, func() {
 					u.editingHost.Set(Host{UseLocalKey: true})
 					u.showAddInstance.Set(true)
 				}),
 			}),
 			ToastBanner(cx, a),
 			core.Scroll{
-				Style: core.Style{FlexGrow: 1},
+				Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0)},
 				Children: []core.Node{
 					core.View{
 						Style: core.Style{
@@ -375,7 +377,8 @@ func (u *uiController) addInstanceModal(cx *core.Scope) core.Node {
 				},
 			},
 		},
-		field("form-password", "SSH 密码（可选，存入系统加密钥匙串）", "留空则使用密钥认证", password.Get, password.Set, true),
+		field("form-password", "SSH 密码（可选，存入系统加密钥匙串）", "留空则仅使用密钥认证", password.Get, password.Set, true),
+		field("form-privkey", "自定义 OpenSSH 私钥（可选，留空用本机密钥）", "-----BEGIN OPENSSH PRIVATE KEY-----", privKey.Get, privKey.Set, false),
 		field("form-fp", "预置主机指纹（可选，TOFU 强校验）", "SHA256:...", pinnedFP.Get, pinnedFP.Set, false),
 		core.Show{
 			When: func() bool { return testStatus.Get() != "" },
@@ -466,8 +469,15 @@ func (u *uiController) qrPairingModal(cx *core.Scope) core.Node {
 			errMsg.Set(err.Error())
 			return
 		}
+		id := p.Label
+		for _, existing := range a.Hosts() {
+			if existing.EffectiveID() == id && existing.Target != p.Target() {
+				id = p.Target()
+				break
+			}
+		}
 		h := Host{
-			ID:          p.Label,
+			ID:          id,
 			Label:       p.Label,
 			Target:      p.Target(),
 			User:        p.User,

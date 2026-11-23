@@ -52,24 +52,29 @@ func ParsePairingPayload(raw string) (PairingPayload, error) {
 		if err := json.Unmarshal([]byte(raw), &p); err != nil {
 			return PairingPayload{}, fmt.Errorf("配对 JSON 格式错误：%w", err)
 		}
+		if p.Port < 0 || p.Port > 65535 {
+			return PairingPayload{}, errors.New("配对端口无效")
+		}
 	} else {
 		u, err := url.Parse(raw)
 		if err != nil || u.Scheme != "herdr" || u.Host != "pair" {
 			return PairingPayload{}, errors.New("不支持的配对二维码格式（应为 herdr://pair?... 或 JSON）")
 		}
 		q := u.Query()
-		p.Host = strings.TrimSpace(q.Get("host"))
-		p.User = strings.TrimSpace(q.Get("user"))
-		p.Label = strings.TrimSpace(q.Get("label"))
-		p.Fingerprint = strings.TrimSpace(q.Get("fp"))
-		p.Key = strings.TrimSpace(q.Get("key"))
+		p.Host = q.Get("host")
+		p.User = q.Get("user")
+		p.Label = q.Get("label")
+		p.Fingerprint = q.Get("fp")
+		p.Key = q.Get("key")
 		p.Password = q.Get("password")
-		if v := q.Get("v"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil {
-				p.Version = n
+		if v := strings.TrimSpace(q.Get("v")); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return PairingPayload{}, errors.New("配对版本号无效")
 			}
+			p.Version = n
 		}
-		if portStr := q.Get("port"); portStr != "" {
+		if portStr := strings.TrimSpace(q.Get("port")); portStr != "" {
 			port, err := strconv.Atoi(portStr)
 			if err != nil || port <= 0 || port > 65535 {
 				return PairingPayload{}, errors.New("配对端口无效")
@@ -78,11 +83,34 @@ func ParsePairingPayload(raw string) (PairingPayload, error) {
 		}
 	}
 
+	// Reject embedded control characters (e.g. %0a, %0d, NUL) BEFORE trimming.
+	if hasControlChar(p.Host) || hasControlChar(p.User) || hasControlChar(p.Fingerprint) {
+		return PairingPayload{}, errors.New("配对内容包含非法控制字符")
+	}
+
+	p.Host = strings.TrimSpace(p.Host)
+	p.User = strings.TrimSpace(p.User)
+	p.Label = strings.TrimSpace(p.Label)
+	p.Fingerprint = strings.TrimSpace(p.Fingerprint)
+	p.Key = strings.TrimSpace(p.Key)
+
 	if p.Version == 0 {
 		p.Version = 1
 	}
+	if p.Version != 1 {
+		return PairingPayload{}, fmt.Errorf("不支持的配对协议版本 v=%d", p.Version)
+	}
 	if p.Host == "" {
 		return PairingPayload{}, errors.New("配对内容缺少主机地址 host")
+	}
+	if !isSafeHostOrUser(p.Host) {
+		return PairingPayload{}, errors.New("配对主机地址包含非法字符")
+	}
+	if p.User != "" && !isSafeHostOrUser(p.User) {
+		return PairingPayload{}, errors.New("配对用户名包含非法字符")
+	}
+	if p.Fingerprint != "" && !strings.HasPrefix(p.Fingerprint, "SHA256:") {
+		return PairingPayload{}, errors.New("主机指纹格式无效（应以 SHA256: 开头）")
 	}
 	if p.Port == 0 {
 		p.Port = 22
@@ -91,6 +119,24 @@ func ParsePairingPayload(raw string) (PairingPayload, error) {
 		p.Label = p.Host
 	}
 	return p, nil
+}
+
+func hasControlChar(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+func isSafeHostOrUser(s string) bool {
+	for _, r := range s {
+		if r <= 0x20 || r == 0x7f || r == '/' || r == '@' || r == '\\' {
+			return false
+		}
+	}
+	return true
 }
 
 // GenerateED25519Key creates a fresh OpenSSH ed25519 keypair for passwordless auth.
@@ -185,6 +231,21 @@ func (s *TOFUStore) OnChange(fn func()) {
 	s.mu.Lock()
 	s.onEdit = fn
 	s.mu.Unlock()
+}
+
+// CloneTemporary returns an in-memory copy of all pinned records whose Pin/Revoke calls
+// do not mutate persistent storage (used by TestConnection before the user saves).
+func (s *TOFUStore) CloneTemporary() *TOFUStore {
+	cp := NewMemoryTOFUStore()
+	if s == nil {
+		return cp
+	}
+	s.mu.Lock()
+	for k, v := range s.records {
+		cp.records[k] = v
+	}
+	s.mu.Unlock()
+	return cp
 }
 
 // Get returns the pinned record for hostID, if present.

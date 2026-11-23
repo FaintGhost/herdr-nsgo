@@ -69,7 +69,7 @@ func stateColor(pal Palette, state string) (fg, soft core.Color, label string) {
 	case "idle":
 		return pal.TextSecondary, pal.SurfaceRaised, "空闲"
 	case "finished":
-		return pal.TextMuted, pal.Fill, "已结束"
+		return pal.TextSecondary, pal.Fill, "已结束"
 	default:
 		return pal.TextSecondary, pal.SurfaceRaised, state
 	}
@@ -82,6 +82,7 @@ func StatusBadge(cx *core.Scope, a *App, stateFn func() string) core.Node {
 			pal := a.paletteOf(cx)
 			_, soft, _ := stateColor(pal, stateFn())
 			return core.Style{
+				FlexShrink:   0,
 				Background:   soft,
 				CornerRadius: Tokens.RadiusKey,
 				Padding:      core.Symmetric(Tokens.Space2, core.Points(3)),
@@ -109,7 +110,7 @@ func StatusBadge(cx *core.Scope, a *App, stateFn func() string) core.Node {
 	}
 }
 
-// ActionButton renders a design-system button (primary, secondary, danger, ghost) with 40px touch target.
+// ActionVariant controls visual emphasis of ActionButton.
 type ActionVariant uint8
 
 const (
@@ -119,10 +120,12 @@ const (
 	ActionGhost
 )
 
+// ActionButton renders a Crisp Slate button with 40px touch target and FlexShrink: 0.
 func ActionButton(cx *core.Scope, a *App, testID, text string, variant ActionVariant, onPress func()) core.Node {
 	return ActionButtonFunc(cx, a, testID, func() string { return text }, variant, onPress)
 }
 
+// ActionButtonFunc renders a reactive-label ActionButton.
 func ActionButtonFunc(cx *core.Scope, a *App, testID string, textFn func() string, variant ActionVariant, onPress func()) core.Node {
 	return core.View{
 		TestID:  testID,
@@ -152,8 +155,9 @@ func ActionButtonFunc(cx *core.Scope, a *App, testID string, textFn func() strin
 				bw = 1
 			}
 			return core.Style{
+				FlexShrink:     0,
 				MinHeight:      core.Pt(Tokens.SizeTouch),
-				Padding:        core.Symmetric(Tokens.Space3, Tokens.Space2),
+				Padding:        core.Symmetric(core.Points(14), Tokens.Space2),
 				CornerRadius:   Tokens.RadiusCtrl,
 				Background:     bg,
 				BorderWidth:    bw,
@@ -185,8 +189,61 @@ func ActionButtonFunc(cx *core.Scope, a *App, testID string, textFn func() strin
 	}
 }
 
-// FilterPill renders a selectable horizontal filter chip with optional live dot and count.
-func FilterPill(cx *core.Scope, a *App, testID string, labelFn func() string, activeFn func() bool, onlineDot *bool, onPress func()) core.Node {
+// IconButton renders a crisp 36x36 vector icon button (for TopHeader and Composer docks).
+func IconButton(cx *core.Scope, a *App, testID, label string, svg *core.SVG, primary bool, onPress func()) core.Node {
+	return core.View{
+		TestID: testID,
+		Role:   core.RoleButton,
+		Label:  label,
+		OnPress: func(core.PressEvent) {
+			if onPress != nil {
+				onPress()
+			}
+		},
+		StyleFunc: func() core.Style {
+			pal := a.paletteOf(cx)
+			bg := pal.SurfaceRaised
+			bc := pal.Border
+			bw := core.Points(1)
+			if primary {
+				bg = pal.Accent
+				bc = pal.Accent
+				bw = 0
+			}
+			return core.Style{
+				FlexShrink:     0,
+				Width:          core.Pt(36),
+				Height:         core.Pt(36),
+				CornerRadius:   Tokens.RadiusCtrl,
+				Background:     bg,
+				BorderWidth:    bw,
+				BorderColor:    bc,
+				AlignItems:     core.AlignCenter,
+				JustifyContent: core.JustifyCenter,
+			}
+		},
+		Children: []core.Node{
+			core.Icon{
+				SVG: svg,
+				StyleFunc: func() core.Style {
+					pal := a.paletteOf(cx)
+					fg := pal.Text
+					if primary {
+						fg = pal.AccentFg
+					}
+					return core.Style{
+						Width:  core.Pt(Tokens.SizeIcon),
+						Height: core.Pt(Tokens.SizeIcon),
+						Color:  fg,
+					}
+				},
+			},
+		},
+	}
+}
+
+// FilterPill renders a selectable horizontal filter chip with optional reactive online dot.
+func FilterPill(cx *core.Scope, a *App, testID string, labelFn func() string, activeFn func() bool, onlineFn func() bool, onPress func()) core.Node {
 	return core.View{
 		TestID:  testID,
 		Role:    core.RoleButton,
@@ -205,11 +262,12 @@ func FilterPill(cx *core.Scope, a *App, testID string, labelFn func() string, ac
 				bc = pal.Accent
 			}
 			return core.Style{
+				FlexShrink:     0,
 				Direction:      core.Row,
 				AlignItems:     core.AlignCenter,
-				Gap:            Tokens.Space1,
-				MinHeight:      core.Pt(34),
-				Padding:        core.Symmetric(Tokens.Space3, core.Points(6)),
+				Gap:            core.Points(6),
+				MinHeight:      core.Pt(32),
+				Padding:        core.Symmetric(Tokens.Space3, core.Points(5)),
 				CornerRadius:   Tokens.RadiusCtrl,
 				Background:     bg,
 				BorderWidth:    1,
@@ -218,13 +276,12 @@ func FilterPill(cx *core.Scope, a *App, testID string, labelFn func() string, ac
 		},
 		Children: func() []core.Node {
 			var kids []core.Node
-			if onlineDot != nil {
-				dotOnline := *onlineDot
+			if onlineFn != nil {
 				kids = append(kids, core.View{
 					StyleFunc: func() core.Style {
 						pal := a.paletteOf(cx)
 						c := pal.TextMuted
-						if dotOnline {
+						if onlineFn() {
 							c = pal.Accent
 						}
 						return core.Style{
@@ -256,7 +313,7 @@ func FilterPill(cx *core.Scope, a *App, testID string, labelFn func() string, ac
 	}
 }
 
-// SectionHeader renders a 12px uppercase/muted section label with optional right action.
+// SectionHeader renders a 12px muted section label with optional right action.
 func SectionHeader(cx *core.Scope, a *App, titleFn func() string, right core.Node) core.Node {
 	kids := []core.Node{
 		core.Text{
@@ -299,14 +356,12 @@ func SessionRow(cx *core.Scope, a *App, itemFn func() AggregatedTerminal, select
 		},
 		StyleFunc: func() core.Style {
 			pal := a.paletteOf(cx)
-			it := itemFn()
 			bg := pal.Surface
 			bc := pal.Border
 			if selectedFn != nil && selectedFn() {
 				bg = pal.AccentSoft
 				bc = pal.Accent
 			}
-			_ = it
 			return core.Style{
 				Direction:    core.Row,
 				Background:   bg,
@@ -330,9 +385,10 @@ func SessionRow(cx *core.Scope, a *App, itemFn func() AggregatedTerminal, select
 			},
 			core.View{
 				Style: core.Style{
-					FlexGrow: 1,
-					Padding:  core.Symmetric(Tokens.Space3, core.Points(10)),
-					Gap:      core.Points(4),
+					FlexGrow:   1,
+					FlexShrink: 1,
+					Padding:    core.Symmetric(Tokens.Space3, core.Points(11)),
+					Gap:        core.Points(4),
 				},
 				Children: []core.Node{
 					// Top row: Session name + instance chip + state badge
@@ -367,6 +423,7 @@ func SessionRow(cx *core.Scope, a *App, itemFn func() AggregatedTerminal, select
 										StyleFunc: func() core.Style {
 											pal := a.paletteOf(cx)
 											return core.Style{
+												FlexShrink:   0,
 												Background:   pal.SurfaceRaised,
 												CornerRadius: Tokens.RadiusKey,
 												Padding:      core.Symmetric(core.Points(6), core.Points(2)),
@@ -411,7 +468,7 @@ func SessionRow(cx *core.Scope, a *App, itemFn func() AggregatedTerminal, select
 							}
 						},
 					},
-					// Third line: Mono metadata (cwd + addr + app)
+					// Third line: Mono metadata (addr · app · cwd)
 					core.Text{
 						ContentFunc: func() string {
 							it := itemFn()
@@ -440,7 +497,7 @@ func SessionRow(cx *core.Scope, a *App, itemFn func() AggregatedTerminal, select
 }
 
 // InlineApprovalCard renders a "需要你" attention card with one-tap Allow/Deny buttons ONLY
-// for whitelisted (Status.App + blocked + permission) terminals; other waiting items get "进入终端".
+// for whitelisted (Status.App + blocked + permission) terminals; other waiting items get "进入终端处理".
 func InlineApprovalCard(cx *core.Scope, a *App, itemFn func() AggregatedTerminal, onOpen func(TermKey)) core.Node {
 	initial := itemFn()
 	keyStr := initial.Key.String()
@@ -475,7 +532,6 @@ func InlineApprovalCard(cx *core.Scope, a *App, itemFn func() AggregatedTerminal
 					Gap:      Tokens.Space2,
 				},
 				Children: []core.Node{
-					// Header row: label + instance + why badge
 					core.View{
 						Style: core.Style{
 							Direction:      core.Row,
@@ -503,6 +559,7 @@ func InlineApprovalCard(cx *core.Scope, a *App, itemFn func() AggregatedTerminal
 									pal := a.paletteOf(cx)
 									_, soft, _ := stateColor(pal, itemFn().Terminal.StateWord())
 									return core.Style{
+										FlexShrink:   0,
 										Background:   soft,
 										CornerRadius: Tokens.RadiusKey,
 										Padding:      core.Symmetric(Tokens.Space2, core.Points(3)),
@@ -525,7 +582,6 @@ func InlineApprovalCard(cx *core.Scope, a *App, itemFn func() AggregatedTerminal
 							},
 						},
 					},
-					// Prompt / error message
 					core.Text{
 						ContentFunc: func() string {
 							it := itemFn()
@@ -539,7 +595,6 @@ func InlineApprovalCard(cx *core.Scope, a *App, itemFn func() AggregatedTerminal
 							}
 						},
 					},
-					// Action buttons row
 					core.Show{
 						When: func() bool { return CanInlineApprove(itemFn().Terminal) },
 						Then: func(cx *core.Scope) core.Node {
@@ -622,8 +677,9 @@ func KeycapBar(cx *core.Scope, a *App, items []KeycapItem) core.Node {
 					bc = pal.Danger
 				}
 				return core.Style{
+					FlexShrink:     0,
 					MinHeight:      core.Pt(Tokens.SizeKey),
-					MinWidth:       core.Pt(42),
+					MinWidth:       core.Pt(40),
 					Padding:        core.Symmetric(core.Points(10), core.Points(6)),
 					CornerRadius:   Tokens.RadiusKey,
 					Background:     bg,
@@ -680,7 +736,7 @@ func KeycapBar(cx *core.Scope, a *App, items []KeycapItem) core.Node {
 	}
 }
 
-// TopHeader renders a crisp 44px top bar with title, optional leading button, and trailing actions.
+// TopHeader renders a crisp 44px top bar with safe-area top padding so mobile status bars never overlap it.
 func TopHeader(cx *core.Scope, a *App, titleFn func() string, left core.Node, right []core.Node) core.Node {
 	var leftChildren []core.Node
 	if left != nil {
@@ -702,33 +758,42 @@ func TopHeader(cx *core.Scope, a *App, titleFn func() string, left core.Node, ri
 		StyleFunc: func() core.Style {
 			pal := a.paletteOf(cx)
 			return core.Style{
-				Direction:      core.Row,
-				AlignItems:     core.AlignCenter,
-				JustifyContent: core.JustifySpaceBetween,
-				MinHeight:      core.Pt(Tokens.SizeTopbar),
-				Padding:        core.Symmetric(Tokens.PagePadX, Tokens.Space2),
-				Background:     pal.Surface,
-				Borders:        core.Edges{Bottom: 1},
-				BorderColor:    pal.Separator,
+				Background:  pal.Surface,
+				Borders:     core.Edges{Bottom: 1},
+				BorderColor: pal.Separator,
+				PaddingEnv:  core.EnvEdges{Top: core.EnvSafeArea},
 			}
 		},
 		Children: []core.Node{
 			core.View{
 				Style: core.Style{
-					Direction:  core.Row,
-					AlignItems: core.AlignCenter,
-					Gap:        Tokens.Space2,
-					FlexShrink: 1,
+					Direction:      core.Row,
+					AlignItems:     core.AlignCenter,
+					JustifyContent: core.JustifySpaceBetween,
+					MinHeight:      core.Pt(Tokens.SizeTopbar),
+					Padding:        core.Symmetric(Tokens.PagePadX, core.Points(6)),
+					Gap:            Tokens.Space2,
 				},
-				Children: leftChildren,
-			},
-			core.View{
-				Style: core.Style{
-					Direction:  core.Row,
-					AlignItems: core.AlignCenter,
-					Gap:        Tokens.Space2,
+				Children: []core.Node{
+					core.View{
+						Style: core.Style{
+							Direction:  core.Row,
+							AlignItems: core.AlignCenter,
+							Gap:        Tokens.Space2,
+							FlexShrink: 1,
+						},
+						Children: leftChildren,
+					},
+					core.View{
+						Style: core.Style{
+							Direction:  core.Row,
+							AlignItems: core.AlignCenter,
+							Gap:        Tokens.Space2,
+							FlexShrink: 0,
+						},
+						Children: right,
+					},
 				},
-				Children: right,
 			},
 		},
 	}
@@ -778,7 +843,7 @@ func EmptyStateCard(cx *core.Scope, a *App, title, body, ctaTestID, ctaLabel str
 	}
 }
 
-// SheetModal renders a centered/bottom sheet overlay with backdrop and handle.
+// SheetModal renders a keyboard- and safe-area-aware bottom sheet overlay.
 func SheetModal(cx *core.Scope, a *App, testID, title, closeTestID string, onClose func(), body []core.Node) core.Node {
 	return core.View{
 		TestID: testID,
@@ -794,6 +859,7 @@ func SheetModal(cx *core.Scope, a *App, testID, title, closeTestID string, onClo
 				JustifyContent: core.JustifyEnd,
 				AlignItems:     core.AlignCenter,
 				Padding:        core.All(Tokens.Space3),
+				PaddingEnv:     core.EnvEdges{Top: core.EnvSafeArea, Bottom: core.EnvKeyboard},
 			}
 		},
 		Children: []core.Node{
@@ -803,17 +869,17 @@ func SheetModal(cx *core.Scope, a *App, testID, title, closeTestID string, onClo
 					return core.Style{
 						Width:        core.Pct(100),
 						MaxWidth:     core.Pt(560),
-						MaxHeight:    core.Pct(88),
+						MaxHeight:    core.Pct(86),
 						Background:   pal.Surface,
 						CornerRadius: Tokens.RadiusSheet,
 						BorderWidth:  1,
 						BorderColor:  pal.Border,
 						Padding:      core.All(Tokens.Space4),
+						PaddingEnv:   core.EnvEdges{Bottom: core.EnvSafeArea},
 						Gap:          Tokens.Space3,
 					}
 				},
 				Children: []core.Node{
-					// Drag handle pill
 					core.View{
 						Style: core.Style{AlignItems: core.AlignCenter},
 						Children: []core.Node{
@@ -830,7 +896,6 @@ func SheetModal(cx *core.Scope, a *App, testID, title, closeTestID string, onClo
 							},
 						},
 					},
-					// Header
 					core.View{
 						Style: core.Style{
 							Direction:      core.Row,
@@ -867,7 +932,7 @@ func SheetModal(cx *core.Scope, a *App, testID, title, closeTestID string, onClo
 	}
 }
 
-// ToastBanner shows transient user feedback at the top/bottom without blocking gestures.
+// ToastBanner shows transient user feedback cleanly.
 func ToastBanner(cx *core.Scope, a *App) core.Node {
 	return core.Show{
 		When: func() bool { return strings.TrimSpace(a.toastMsg.Get()) != "" },
@@ -894,8 +959,9 @@ func ToastBanner(cx *core.Scope, a *App) core.Node {
 						StyleFunc: func() core.Style {
 							pal := a.paletteOf(cx)
 							return core.Style{
-								Color:    pal.Text,
-								FontSize: Tokens.FontCaption,
+								Color:      pal.Text,
+								FontSize:   Tokens.FontCaption,
+								FlexShrink: 1,
 							}
 						},
 					},
@@ -904,7 +970,7 @@ func ToastBanner(cx *core.Scope, a *App) core.Node {
 						OnPress: func(core.PressEvent) {
 							a.toastMsg.Set("")
 						},
-						Style: core.Style{Padding: core.Symmetric(Tokens.Space2, core.Points(2))},
+						Style: core.Style{FlexShrink: 0, Padding: core.Symmetric(Tokens.Space2, core.Points(2))},
 						Children: []core.Node{
 							core.Text{
 								Content: "知道了",
@@ -925,9 +991,9 @@ func ToastBanner(cx *core.Scope, a *App) core.Node {
 	}
 }
 
-// TabBar renders the 54px bottom 3-Tab navigation bar (会话 / 待办 / 实例).
+// TabBar renders the 54px safe-area-aware bottom 3-Tab navigation bar with crisp vector icons.
 func TabBar(cx *core.Scope, a *App, activeTab *core.Signal[string]) core.Node {
-	tabItem := func(id, testID, label string, badgeFn func() int) core.Node {
+	tabItem := func(id, testID, label string, svg *core.SVG, badgeFn func() int) core.Node {
 		return core.View{
 			TestID: testID,
 			Role:   core.RoleButton,
@@ -939,30 +1005,25 @@ func TabBar(cx *core.Scope, a *App, activeTab *core.Signal[string]) core.Node {
 				MinHeight:      core.Pt(Tokens.SizeTabBar),
 				AlignItems:     core.AlignCenter,
 				JustifyContent: core.JustifyCenter,
-				Gap:            core.Points(2),
+				Gap:            core.Points(3),
+				Padding:        core.Symmetric(core.Points(4), core.Points(6)),
 			},
 			Children: []core.Node{
 				core.View{
-					Style: core.Style{
-						Direction:  core.Row,
-						AlignItems: core.AlignCenter,
-						Gap:        Tokens.Space1,
-					},
+					Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: core.Points(4)},
 					Children: []core.Node{
-						core.Text{
-							Content: label,
+						core.Icon{
+							SVG: svg,
 							StyleFunc: func() core.Style {
 								pal := a.paletteOf(cx)
 								fg := pal.TextMuted
-								w := core.FontWeightNormal
 								if activeTab.Get() == id {
 									fg = pal.Accent
-									w = core.FontWeightSemibold
 								}
 								return core.Style{
-									Color:      fg,
-									FontSize:   Tokens.FontCaption,
-									FontWeight: w,
+									Width:  core.Pt(20),
+									Height: core.Pt(20),
+									Color:  fg,
 								}
 							},
 						},
@@ -996,18 +1057,20 @@ func TabBar(cx *core.Scope, a *App, activeTab *core.Signal[string]) core.Node {
 						},
 					},
 				},
-				// Active underline indicator
-				core.View{
+				core.Text{
+					Content: label,
 					StyleFunc: func() core.Style {
 						pal := a.paletteOf(cx)
-						if activeTab.Get() != id {
-							return core.Style{Height: core.Pt(2), Width: core.Pt(24)}
+						fg := pal.TextMuted
+						w := core.FontWeightNormal
+						if activeTab.Get() == id {
+							fg = pal.Accent
+							w = core.FontWeightSemibold
 						}
 						return core.Style{
-							Height:       core.Pt(2),
-							Width:        core.Pt(24),
-							CornerRadius: 1,
-							Background:   pal.Accent,
+							Color:      fg,
+							FontSize:   core.Points(11),
+							FontWeight: w,
 						}
 					},
 				},
@@ -1024,11 +1087,12 @@ func TabBar(cx *core.Scope, a *App, activeTab *core.Signal[string]) core.Node {
 				Background:  pal.Surface,
 				Borders:     core.Edges{Top: 1},
 				BorderColor: pal.Separator,
+				PaddingEnv:  core.EnvEdges{Bottom: core.EnvSafeArea},
 			}
 		},
 		Children: []core.Node{
-			tabItem("home", "tab-home", "会话", nil),
-			tabItem("inbox", "tab-inbox", "待办", func() int {
+			tabItem("home", "tab-home", "会话", iconTerminal, nil),
+			tabItem("inbox", "tab-inbox", "待办", iconInbox, func() int {
 				n := 0
 				for _, t := range a.aggTerms.Get() {
 					if t.Terminal.NeedsYou() {
@@ -1037,7 +1101,7 @@ func TabBar(cx *core.Scope, a *App, activeTab *core.Signal[string]) core.Node {
 				}
 				return n
 			}),
-			tabItem("instances", "tab-instances", "实例", nil),
+			tabItem("instances", "tab-instances", "实例", iconServer, nil),
 		},
 	}
 }

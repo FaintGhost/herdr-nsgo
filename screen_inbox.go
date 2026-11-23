@@ -18,6 +18,8 @@ func (u *uiController) inboxScreen(cx *core.Scope) core.Node {
 			pal := a.paletteOf(cx)
 			return core.Style{
 				FlexGrow:   1,
+				FlexShrink: 1,
+				MinHeight:  core.Pt(0),
 				Background: pal.Bg,
 			}
 		},
@@ -25,7 +27,7 @@ func (u *uiController) inboxScreen(cx *core.Scope) core.Node {
 			TopHeader(cx, a, func() string {
 				return fmt.Sprintf("待办 · %d", len(a.AggregatedAttention()))
 			}, nil, []core.Node{
-				ActionButton(cx, a, "inbox-refresh-btn", "刷新", ActionGhost, func() {
+				IconButton(cx, a, "inbox-refresh-btn", "刷新", iconRefresh, false, func() {
 					a.Reconnect()
 				}),
 			}),
@@ -63,7 +65,7 @@ func (u *uiController) inboxScreen(cx *core.Scope) core.Node {
 				},
 			},
 			core.Scroll{
-				Style: core.Style{FlexGrow: 1},
+				Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0)},
 				Children: []core.Node{
 					core.View{
 						Style: core.Style{

@@ -108,8 +108,8 @@ func LightPalette() Palette {
 		Accent:        core.RGB(0x0f766e),
 		AccentFg:      core.RGB(0xffffff),
 		AccentSoft:    core.RGBA(0x0f766e, 0.11),
-		Warn:          core.RGB(0xb45309),
-		WarnSoft:      core.RGBA(0xb45309, 0.10),
+		Warn:          core.RGB(0x9a4106),
+		WarnSoft:      core.RGBA(0x9a4106, 0.10),
 		Danger:        core.RGB(0xc81e1e),
 		DangerSoft:    core.RGBA(0xc81e1e, 0.10),
 		Overlay:       core.RGBA(0x111827, 0.36),
@@ -127,15 +127,15 @@ func DarkPalette() Palette {
 		Separator:     core.RGBA(0xeef2f6, 0.10),
 		Border:        core.RGBA(0xeef2f6, 0.09),
 		Text:          core.RGB(0xeef2f6),
-		TextSecondary: core.RGB(0x9aa7b8),
-		TextMuted:     core.RGB(0x8291a5),
+		TextSecondary: core.RGB(0xa8b5c6),
+		TextMuted:     core.RGB(0x91a0b4),
 		Accent:        core.RGB(0x2dd4bf),
 		AccentFg:      core.RGB(0x04211d),
 		AccentSoft:    core.RGBA(0x2dd4bf, 0.14),
 		Warn:          core.RGB(0xf5a623),
 		WarnSoft:      core.RGBA(0xf5a623, 0.14),
-		Danger:        core.RGB(0xf05252),
-		DangerSoft:    core.RGBA(0xf05252, 0.14),
+		Danger:        core.RGB(0xf87171),
+		DangerSoft:    core.RGBA(0xf87171, 0.14),
 		Overlay:       core.RGBA(0x000000, 0.56),
 	}
 }
@@ -302,6 +302,19 @@ func ApplyAppearance(cx *core.Scope, mode ThemeMode) {
 	default:
 		cx.SetAppearance(core.AppearanceSystem)
 	}
+}
+
+// Composite alpha-blends fg over an opaque background color bg.
+func Composite(fg, bg core.Color) core.Color {
+	fu := uint32(fg)
+	bu := uint32(bg)
+	a := float64(fu&0xff) / 255.0
+	fr, fgC, fb := float64((fu>>24)&0xff), float64((fu>>16)&0xff), float64((fu>>8)&0xff)
+	br, bgC, bb := float64((bu>>24)&0xff), float64((bu>>16)&0xff), float64((bu>>8)&0xff)
+	r := uint32(math.Round(fr*a + br*(1-a)))
+	g := uint32(math.Round(fgC*a + bgC*(1-a)))
+	b := uint32(math.Round(fb*a + bb*(1-a)))
+	return core.RGB((r << 16) | (g << 8) | b)
 }
 
 // ContrastRatio computes WCAG 2.1 contrast ratio between opaque colors fg and bg.

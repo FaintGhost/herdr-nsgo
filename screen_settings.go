@@ -76,12 +76,14 @@ func (u *uiController) settingsScreen(cx *core.Scope) core.Node {
 			pal := a.paletteOf(cx)
 			return core.Style{
 				FlexGrow:   1,
+				FlexShrink: 1,
+				MinHeight:  core.Pt(0),
 				Background: pal.Bg,
 			}
 		},
 		Children: []core.Node{
 			TopHeader(cx, a, func() string { return "设置" },
-				ActionButton(cx, a, "settings-back-btn", "返回", ActionGhost, func() {
+				IconButton(cx, a, "settings-back-btn", "返回", iconBack, false, func() {
 					u.subPage.Set("")
 				}),
 				nil,
@@ -92,9 +94,18 @@ func (u *uiController) settingsScreen(cx *core.Scope) core.Node {
 				Children: []core.Node{
 					core.View{
 						Style: core.Style{
-							Padding: core.All(Tokens.PagePadX),
-							Gap:     Tokens.Space4,
+							Width:      core.Pct(100),
+							AlignItems: core.AlignCenter,
+							PaddingEnv: core.EnvEdges{Bottom: core.EnvSafeArea},
 						},
+						Children: []core.Node{
+							core.View{
+								Style: core.Style{
+									Width:    core.Pct(100),
+									MaxWidth: core.Pt(680),
+									Padding:  core.All(Tokens.PagePadX),
+									Gap:      Tokens.Space4,
+								},
 						Children: []core.Node{
 							// 1. Appearance
 							SectionHeader(cx, a, func() string { return "外观与主题" }, nil),
@@ -302,6 +313,51 @@ func (u *uiController) settingsScreen(cx *core.Scope) core.Node {
 									newSnipText.Set("")
 									a.notifyToast("已添加常用短语")
 								}),
+								core.Each(
+									func() []Snippet { return a.snippets.Get() },
+									func(s Snippet) string { return s.ID },
+									func(cx *core.Scope, item func() Snippet, _ func() int) core.Node {
+										sn0 := item()
+										return core.View{
+											StyleFunc: func() core.Style {
+												pal := a.paletteOf(cx)
+												return core.Style{
+													Direction:      core.Row,
+													AlignItems:     core.AlignCenter,
+													JustifyContent: core.JustifySpaceBetween,
+													Gap:            Tokens.Space2,
+													Padding:        core.All(Tokens.Space2),
+													Background:     pal.SurfaceRaised,
+													CornerRadius:   Tokens.RadiusCtrl,
+												}
+											},
+											Children: []core.Node{
+												core.View{
+													Style: core.Style{FlexGrow: 1, FlexShrink: 1, Gap: core.Points(2)},
+													Children: []core.Node{
+														core.Text{
+															ContentFunc: func() string { return item().Label },
+															StyleFunc: func() core.Style {
+																pal := a.paletteOf(cx)
+																return core.Style{Color: pal.Text, FontSize: Tokens.FontCaption, FontWeight: core.FontWeightSemibold}
+															},
+														},
+														core.Text{
+															ContentFunc: func() string { return item().Text },
+															StyleFunc: func() core.Style {
+																pal := a.paletteOf(cx)
+																return core.Style{Color: pal.TextMuted, FontSize: Tokens.FontMonoMeta, FontFamily: core.FontMonospace}
+															},
+														},
+													},
+												},
+												ActionButton(cx, a, "snippet-del-"+sn0.ID, "删除", ActionDanger, func() {
+													a.DeleteSnippet(item().ID)
+												}),
+											},
+										}
+									},
+								),
 							),
 
 							// 5. About & Runtime Design Tokens Gallery
@@ -318,6 +374,8 @@ func (u *uiController) settingsScreen(cx *core.Scope) core.Node {
 									u.subPage.Set("tokens")
 								}),
 							),
+						},
+					},
 						},
 					},
 				},
@@ -390,6 +448,8 @@ func (u *uiController) tokensGalleryScreen(cx *core.Scope) core.Node {
 			pal := a.paletteOf(cx)
 			return core.Style{
 				FlexGrow:   1,
+				FlexShrink: 1,
+				MinHeight:  core.Pt(0),
 				Background: pal.Bg,
 			}
 		},

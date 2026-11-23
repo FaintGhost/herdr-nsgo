@@ -267,6 +267,8 @@ type Host struct {
 	UseLocalKey bool `json:"use_local_key,omitempty"`
 	// Enabled controls whether CorePool keeps this instance connected.
 	Enabled *bool `json:"enabled,omitempty"`
+	// CredRev is bumped on credential edits so CorePool restarts the worker.
+	CredRev int64 `json:"cred_rev,omitempty"`
 }
 
 // IsEnabled reports whether this host should participate in CorePool.

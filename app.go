@@ -107,6 +107,7 @@ type App struct {
 
 	mu       sync.Mutex
 	hosts    []Host
+	alerts   *alertTracker
 	onNotify func(TermKey)
 }
 
@@ -118,6 +119,7 @@ func NewApp(cx *core.Scope) *App {
 		secrets:              NewSecretStore(cx),
 		tofu:                 NewStorageTOFUStore(cx),
 		cache:                NewFrameCache(24),
+		alerts:               newAlertTracker(),
 		instances:            core.NewSignalFunc(cx, []InstanceSnapshot(nil), nil),
 		aggTerms:             core.NewSignalFunc(cx, []AggregatedTerminal(nil), nil),
 		activeInstanceFilter: core.NewSignal(cx, ""),
@@ -203,37 +205,37 @@ func (a *App) post(fn func()) {
 }
 
 func (a *App) syncPoolToSignals() {
-	snaps := a.pool.Snapshots()
-	agg := AggregateTerminals(snaps)
+	a.post(func() {
+		snaps := a.pool.Snapshots()
+		agg := AggregateTerminals(snaps)
 
-	var flatTerms []Terminal
-	var flatMachines []MachineView
-	connState := stateOff
-	problem := ""
-	coreName := ""
-	for _, s := range snaps {
-		flatMachines = append(flatMachines, s.Machines...)
-		if s.Online {
-			connState = stateOnline
-			if coreName == "" {
-				coreName = s.InstanceName
-			}
-		} else if connState != stateOnline {
-			if s.State == stateDialing {
-				connState = stateDialing
-			} else if s.State == stateFailed {
-				connState = stateFailed
-				if problem == "" {
-					problem = s.Problem
+		var flatTerms []Terminal
+		var flatMachines []MachineView
+		connState := stateOff
+		problem := ""
+		coreName := ""
+		for _, s := range snaps {
+			flatMachines = append(flatMachines, s.Machines...)
+			if s.Online {
+				connState = stateOnline
+				if coreName == "" {
+					coreName = s.InstanceName
+				}
+			} else if connState != stateOnline {
+				if s.State == stateDialing {
+					connState = stateDialing
+				} else if s.State == stateFailed {
+					connState = stateFailed
+					if problem == "" {
+						problem = s.Problem
+					}
 				}
 			}
 		}
-	}
-	for _, item := range agg {
-		flatTerms = append(flatTerms, item.Terminal)
-	}
+		for _, item := range agg {
+			flatTerms = append(flatTerms, item.Terminal)
+		}
 
-	a.post(func() {
 		a.instances.Set(snaps)
 		a.aggTerms.Set(agg)
 		a.terms.Set(flatTerms)
@@ -241,6 +243,11 @@ func (a *App) syncPoolToSignals() {
 		a.conn.Set(connState)
 		a.problem.Set(problem)
 		a.coreName.Set(coreName)
+
+		// Compute deduplicated notifications strictly on the UI thread.
+		for _, alert := range a.alerts.diff(snaps, agg) {
+			a.dispatchAlertNotification(alert)
+		}
 	})
 }
 
@@ -338,21 +345,30 @@ func (a *App) loadHosts() []Host {
 		if json.Unmarshal([]byte(raw), &legacy) != nil {
 			return nil
 		}
+		migratedOK := true
 		for i := range legacy {
 			if legacy[i].ID == "" {
 				legacy[i].ID = legacy[i].EffectiveID()
 			}
 			if legacy[i].Password != "" {
-				_ = a.secrets.Set(secretPassAccount(legacy[i].ID), legacy[i].Password)
-				legacy[i].Password = ""
+				if err := a.secrets.Set(secretPassAccount(legacy[i].ID), legacy[i].Password); err != nil {
+					migratedOK = false
+				} else {
+					legacy[i].Password = ""
+				}
 			}
 			if legacy[i].Key != "" {
-				_ = a.secrets.Set(secretKeyAccount(legacy[i].ID), legacy[i].Key)
-				legacy[i].Key = ""
+				if err := a.secrets.Set(secretKeyAccount(legacy[i].ID), legacy[i].Key); err != nil {
+					migratedOK = false
+				} else {
+					legacy[i].Key = ""
+				}
 			}
 		}
 		a.persistHosts(legacy)
-		a.cx.Storage().RemoveItem(legacyHostsKey)
+		if migratedOK {
+			a.cx.Storage().RemoveItem(legacyHostsKey)
+		}
 		return legacy
 	}
 	var out []Host
@@ -401,6 +417,7 @@ func (a *App) SaveHost(h Host) {
 	meta := h
 	meta.Password = ""
 	meta.Key = ""
+	meta.CredRev = time.Now().UnixNano()
 
 	a.mu.Lock()
 	kept := make([]Host, 0, len(a.hosts)+1)
@@ -460,11 +477,11 @@ func (a *App) Host() Host {
 	return a.hosts[0]
 }
 
-// TestConnection dials h once, verifies hello + TOFU, and returns core info + latency.
+// TestConnection dials h once, verifies hello + TOFU (without mutating persistent TOFU store), and returns core info + latency.
 func (a *App) TestConnection(ctx context.Context, h Host) (HelloResult, int64, error) {
 	start := time.Now()
 	resolved := a.resolveCredentials(h)
-	rw, err := DialWithTOFU(resolved, a.tofu)
+	rw, err := DialWithTOFU(resolved, a.tofu.CloneTemporary())
 	if err != nil {
 		return HelloResult{}, 0, err
 	}
@@ -567,7 +584,17 @@ func (a *App) Terminal(addr string) (Terminal, bool) {
 
 func (a *App) clientForKey(key TermKey) *Client {
 	if key.InstanceID != "" {
-		return a.pool.ClientFor(key.InstanceID)
+		if c := a.pool.ClientFor(key.InstanceID); c != nil {
+			return c
+		}
+		// Direct core offline: try falling back to an active online relay carrying this terminal.
+		for _, it := range a.aggTerms.Get() {
+			if it.Relayed && strings.HasSuffix(it.Key.Addr, "/"+key.Addr) {
+				if c := a.pool.ClientFor(it.Key.InstanceID); c != nil {
+					return c
+				}
+			}
+		}
 	}
 	for _, s := range a.instances.Get() {
 		if s.Online {

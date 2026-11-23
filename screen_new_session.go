@@ -10,7 +10,7 @@ import (
 )
 
 // newSessionSheet renders the New Session bottom sheet: select target online instance,
-// choose a template from templates.list (or Shell), set cwd / name / first prompt, and run.
+// optional federated machine (p.On), template from templates.list (or Shell), cwd/name/prompt, and run.
 func (u *uiController) newSessionSheet(cx *core.Scope) core.Node {
 	a := u.app
 	snaps := a.instances.Get()
@@ -28,6 +28,7 @@ func (u *uiController) newSessionSheet(cx *core.Scope) core.Node {
 	}
 
 	selectedInst := core.NewSignal(cx, defaultInst)
+	selectedMachine := core.NewSignal(cx, "") // "" = local on target instance
 	selectedTpl := core.NewSignal(cx, "shell")
 	cwd := core.NewSignal(cx, "")
 	name := core.NewSignal(cx, "")
@@ -35,19 +36,36 @@ func (u *uiController) newSessionSheet(cx *core.Scope) core.Node {
 	errMsg := core.NewSignal(cx, "")
 	submitting := core.NewSignal(cx, false)
 
-	// Pick first template if available on default instance.
-	for _, s := range snaps {
-		if s.InstanceID == defaultInst && len(s.Templates) > 0 {
-			selectedTpl.Set(s.Templates[0].Name)
-			break
+	syncDefaultTemplate := func(instID string) {
+		for _, s := range a.instances.Get() {
+			if s.InstanceID == instID {
+				if len(s.Templates) > 0 {
+					selectedTpl.Set(s.Templates[0].Name)
+				} else {
+					selectedTpl.Set("shell")
+				}
+				return
+			}
 		}
+		selectedTpl.Set("shell")
 	}
+	syncDefaultTemplate(defaultInst)
 
 	currentTemplates := func() []Template {
 		id := selectedInst.Get()
 		for _, s := range a.instances.Get() {
 			if s.InstanceID == id {
 				return s.Templates
+			}
+		}
+		return nil
+	}
+
+	currentMachines := func() []MachineView {
+		id := selectedInst.Get()
+		for _, s := range a.instances.Get() {
+			if s.InstanceID == id {
+				return s.Machines
 			}
 		}
 		return nil
@@ -112,13 +130,17 @@ func (u *uiController) newSessionSheet(cx *core.Scope) core.Node {
 									func(s InstanceSnapshot) string { return s.InstanceID },
 									func(cx *core.Scope, item func() InstanceSnapshot, _ func() int) core.Node {
 										s0 := item()
-										online := s0.Online
 										return FilterPill(cx, a, "new-inst-"+s0.InstanceID, func() string {
 											return item().InstanceName
 										}, func() bool {
 											return selectedInst.Get() == item().InstanceID
-										}, &online, func() {
-											selectedInst.Set(item().InstanceID)
+										}, func() bool {
+											return item().Online
+										}, func() {
+											id := item().InstanceID
+											selectedInst.Set(id)
+											selectedMachine.Set("")
+											syncDefaultTemplate(id)
 										})
 									},
 								),
@@ -126,6 +148,52 @@ func (u *uiController) newSessionSheet(cx *core.Scope) core.Node {
 						},
 					},
 				},
+			},
+		},
+		// Optional federated remote machine selector (when instance has Machines)
+		core.Show{
+			When: func() bool { return len(currentMachines()) > 0 },
+			Then: func(cx *core.Scope) core.Node {
+				return core.View{
+					Style: core.Style{Gap: Tokens.Space1},
+					Children: []core.Node{
+						core.Text{
+							Content: "运行机器（可选联邦节点）",
+							StyleFunc: func() core.Style {
+								pal := a.paletteOf(cx)
+								return core.Style{Color: pal.TextSecondary, FontSize: Tokens.FontCaption, FontWeight: core.FontWeightSemibold}
+							},
+						},
+						core.Scroll{
+							Horizontal:    true,
+							HideIndicator: true,
+							Children: []core.Node{
+								core.View{
+									Style: core.Style{Direction: core.Row, Gap: Tokens.Space2},
+									Children: []core.Node{
+										FilterPill(cx, a, "new-machine-local", func() string { return "本机" }, func() bool {
+											return selectedMachine.Get() == ""
+										}, nil, func() { selectedMachine.Set("") }),
+										core.Each(
+											currentMachines,
+											func(m MachineView) string { return m.Name },
+											func(cx *core.Scope, item func() MachineView, _ func() int) core.Node {
+												m0 := item()
+												return FilterPill(cx, a, "new-machine-"+m0.Name, func() string {
+													return item().Name
+												}, func() bool {
+													return selectedMachine.Get() == item().Name
+												}, nil, func() {
+													selectedMachine.Set(item().Name)
+												})
+											},
+										),
+									},
+								},
+							},
+						},
+					},
+				}
 			},
 		},
 		// Template / Shell chips
@@ -200,6 +268,7 @@ func (u *uiController) newSessionSheet(cx *core.Scope) core.Node {
 			p := RunParams{
 				Cwd:  strings.TrimSpace(cwd.Get()),
 				Name: strings.TrimSpace(name.Get()),
+				On:   selectedMachine.Get(),
 			}
 			if tpl := selectedTpl.Get(); tpl != "" && tpl != "shell" {
 				p.Argv = []string{tpl}

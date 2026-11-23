@@ -87,24 +87,35 @@ func withPort(target string) string {
 	return net.JoinHostPort(strings.Trim(target, "[]"), "22")
 }
 
-// authFor prefers the saved key, then the password.
+// authFor returns all available SSH auth methods (public key first, then password fallback).
+// Returning both ensures that when useLocalKey is enabled alongside a user-entered password,
+// ssh.Dial tries the key and transparently falls back to password if the key isn't authorized yet.
 func authFor(h Host) ([]ssh.AuthMethod, error) {
+	var methods []ssh.AuthMethod
 	if key := strings.TrimSpace(h.Key); key != "" {
 		signer, err := ssh.ParsePrivateKey([]byte(normalizeKey(key)))
 		if err != nil {
-			return nil, fmt.Errorf("私钥读不了（%v）。重新粘贴完整密钥，或改用密码。", err)
+			if h.Password == "" || !h.UseLocalKey {
+				return nil, fmt.Errorf("私钥读不了（%v）。重新粘贴完整密钥，或改用密码。", err)
+			}
+		} else {
+			methods = append(methods, ssh.PublicKeys(signer))
 		}
-		return []ssh.AuthMethod{ssh.PublicKeys(signer)}, nil
 	}
 	if h.Password != "" {
-		return []ssh.AuthMethod{ssh.Password(h.Password)}, nil
+		methods = append(methods, ssh.Password(h.Password))
 	}
-	return nil, errors.New("没有凭据：填密码，或使用本机 SSH 密钥 / 粘贴 OpenSSH 私钥")
+	if len(methods) == 0 {
+		return nil, errors.New("没有凭据：填密码，或使用本机 SSH 密钥 / 粘贴 OpenSSH 私钥")
+	}
+	return methods, nil
 }
 
 // normalizeKey rebuilds a key whose newlines a paste or a form dropped:
 // a bare base64 body gets its header, footer and 70-column lines back.
 func normalizeKey(key string) string {
+	key = strings.ReplaceAll(key, "\r\n", "\n")
+	key = strings.ReplaceAll(key, "\r", "\n")
 	if strings.Contains(key, "-----BEGIN") {
 		lines := strings.Split(key, "\n")
 		for i, l := range lines {

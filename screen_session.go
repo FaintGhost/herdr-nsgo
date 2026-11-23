@@ -10,9 +10,9 @@ import (
 )
 
 // sessionScreen renders the real VT Session view:
-// 44px compact header (back, title+status, observe/fit toggle, search, tools),
-// collapsible search bar, real VT canvas/Ghostty surface + scroll-to-bottom FAB,
-// single-row 34px KeycapBar, and collapsible Composer with image/file upload & Snippets.
+// safe-area 44px compact header (back, title, observe/fit pill, search icon, tools icon),
+// collapsible search bar, reactive VT surface keyed by activeSession + scroll-to-bottom FAB,
+// and keyboard-aware bottom dock (single-row 34px KeycapBar with ⌨ toggle + Composer).
 func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 	a := u.app
 	showSearch := core.NewSignal(cx, false)
@@ -30,7 +30,7 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 
 	sendKeyOrBytes := func(logicalKey string, rawBytes []byte) {
 		st := curST()
-		if st != nil && st.stream != nil {
+		if st != nil && st.Attached() {
 			_ = st.SendInput(rawBytes, a.vtFontSize.Get())
 			return
 		}
@@ -44,7 +44,7 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 			return
 		}
 		st := curST()
-		if st != nil && st.stream != nil {
+		if st != nil && st.Attached() {
 			if err := st.SendInput([]byte(text+"\r"), a.vtFontSize.Get()); err == nil {
 				a.SetCompose(k.String(), "")
 				return
@@ -54,8 +54,8 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 	}
 
 	keycaps := []KeycapItem{
-		{TestID: "keycap-esc", Label: "Esc", OnPress: func() { sendKeyOrBytes("Escape", []byte{0x1b}) }},
-		{TestID: "keycap-tab", Label: "Tab", OnPress: func() { sendKeyOrBytes("Tab", []byte{'\t'}) }},
+		{TestID: "keycap-esc", Label: "Esc", OnPress: func() { sendKeyOrBytes("esc", []byte{0x1b}) }},
+		{TestID: "keycap-tab", Label: "Tab", OnPress: func() { sendKeyOrBytes("tab", []byte{'\t'}) }},
 		{
 			TestID: "keycap-ctrl",
 			Label:  "Ctrl",
@@ -64,19 +64,27 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 				ctrlLatched.Set(!ctrlLatched.Get())
 			},
 		},
-		{TestID: "keycap-up", Label: "↑", OnPress: func() { sendKeyOrBytes("Up", []byte("\x1b[A")) }},
-		{TestID: "keycap-down", Label: "↓", OnPress: func() { sendKeyOrBytes("Down", []byte("\x1b[B")) }},
-		{TestID: "keycap-left", Label: "←", OnPress: func() { sendKeyOrBytes("Left", []byte("\x1b[D")) }},
-		{TestID: "keycap-right", Label: "→", OnPress: func() { sendKeyOrBytes("Right", []byte("\x1b[C")) }},
-		{TestID: "keycap-enter", Label: "↵", OnPress: func() { sendKeyOrBytes("Enter", []byte{'\r'}) }},
-		{TestID: "keycap-ctrlc", Label: "^C", Danger: true, OnPress: func() { sendKeyOrBytes("C-c", []byte{0x03}) }},
-		{TestID: "keycap-ctrld", Label: "^D", OnPress: func() { sendKeyOrBytes("C-d", []byte{0x04}) }},
-		{TestID: "keycap-ctrll", Label: "^L", OnPress: func() { sendKeyOrBytes("C-l", []byte{0x0c}) }},
+		{TestID: "keycap-up", Label: "↑", OnPress: func() { sendKeyOrBytes("up", []byte("\x1b[A")) }},
+		{TestID: "keycap-down", Label: "↓", OnPress: func() { sendKeyOrBytes("down", []byte("\x1b[B")) }},
+		{TestID: "keycap-left", Label: "←", OnPress: func() { sendKeyOrBytes("left", []byte("\x1b[D")) }},
+		{TestID: "keycap-right", Label: "→", OnPress: func() { sendKeyOrBytes("right", []byte("\x1b[C")) }},
+		{TestID: "keycap-enter", Label: "↵", OnPress: func() { sendKeyOrBytes("enter", []byte{'\r'}) }},
+		{TestID: "keycap-ctrlc", Label: "^C", Danger: true, OnPress: func() { sendKeyOrBytes("ctrl+c", []byte{0x03}) }},
+		{TestID: "keycap-ctrld", Label: "^D", OnPress: func() { sendKeyOrBytes("ctrl+d", []byte{0x04}) }},
+		{TestID: "keycap-ctrll", Label: "^L", OnPress: func() { sendKeyOrBytes("ctrl+l", []byte{0x0c}) }},
+		{
+			TestID: "keycap-composer",
+			Label:  "⌨",
+			Active: composerExpanded.Get,
+			OnPress: func() {
+				composerExpanded.Set(!composerExpanded.Get())
+			},
+		},
 	}
 
 	var leftBtn core.Node
 	if showBack {
-		leftBtn = ActionButton(cx, a, "session-back-btn", "返回", ActionGhost, func() {
+		leftBtn = IconButton(cx, a, "session-back-btn", "返回", iconBack, false, func() {
 			u.closeSession()
 		})
 	}
@@ -87,23 +95,26 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 			pal := a.paletteOf(cx)
 			return core.Style{
 				FlexGrow:   1,
+				FlexShrink: 1,
+				MinHeight:  core.Pt(0),
 				Background: pal.Bg,
 			}
 		},
 		Children: []core.Node{
-			// 44px compact session top bar
+			// 44px compact session top bar with safe-area top inset
 			TopHeader(cx, a, func() string {
-				it := curTerm()
-				return fmt.Sprintf("%s", it.Terminal.Label())
+				return curTerm().Terminal.Label()
 			}, leftBtn, []core.Node{
-				// Observe vs Fit-Width toggle
-				ActionButtonFunc(cx, a, "session-fit-toggle", func() string {
+				FilterPill(cx, a, "session-fit-toggle", func() string {
 					st := curST()
 					if st == nil || (st.observeSig != nil && st.observeSig.Get()) || (st.observeSig == nil && st.Observe()) {
-						return "观察中 · 适配列宽"
+						return "观察中"
 					}
 					return "已适配"
-				}, ActionSecondary, func() {
+				}, func() bool {
+					st := curST()
+					return st != nil && !st.Observe()
+				}, nil, func() {
 					st := curST()
 					if st == nil {
 						return
@@ -116,10 +127,10 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 						a.notifyToast("已适配手机列宽（发送 RESIZE）")
 					}
 				}),
-				ActionButton(cx, a, "session-search-btn", "搜", ActionGhost, func() {
+				IconButton(cx, a, "session-search-btn", "搜索", iconSearch, false, func() {
 					showSearch.Set(!showSearch.Get())
 				}),
-				ActionButton(cx, a, "session-tools-btn", "更多", ActionGhost, func() {
+				IconButton(cx, a, "session-tools-btn", "更多工具", iconMore, false, func() {
 					showTools.Set(true)
 				}),
 			}),
@@ -210,17 +221,39 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 					}
 				},
 			},
-			// VT Canvas / Ghostty viewport + scroll-to-bottom FAB
+			// VT Canvas / Ghostty viewport keyed by activeTerm pointer so direct session switches remount cleanly
 			core.View{
-				Style: core.Style{FlexGrow: 1, Position: core.Relative},
+				Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0), Position: core.Relative, Overflow: core.Hidden},
 				Children: []core.Node{
-					core.Show{
-						When: func() bool { return curST() != nil },
-						Then: func(cx *core.Scope) core.Node {
-							return RenderSessionTerminal(cx, curST(), a.paletteOf(cx), a.vtPaletteOf(cx), a.vtFontSize.Get())
+					core.Each(
+						func() []*SessionTerminal {
+							st := curST()
+							if st == nil {
+								return nil
+							}
+							return []*SessionTerminal{st}
 						},
-						Else: func(cx *core.Scope) core.Node {
-							return RenderSessionTerminal(cx, nil, a.paletteOf(cx), a.vtPaletteOf(cx), a.vtFontSize.Get())
+						func(st *SessionTerminal) *SessionTerminal { return st },
+						func(cx *core.Scope, item func() *SessionTerminal, _ func() int) core.Node {
+							return RenderSessionTerminal(
+								cx,
+								item(),
+								func() Palette { return a.paletteOf(cx) },
+								func() VTPalette { return a.vtPaletteOf(cx) },
+								a.vtFontSize.Get,
+							)
+						},
+					),
+					core.Show{
+						When: func() bool { return curST() == nil },
+						Then: func(cx *core.Scope) core.Node {
+							return RenderSessionTerminal(
+								cx,
+								nil,
+								func() Palette { return a.paletteOf(cx) },
+								func() VTPalette { return a.vtPaletteOf(cx) },
+								a.vtFontSize.Get,
+							)
 						},
 					},
 					// Scroll-to-bottom FAB
@@ -248,82 +281,93 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 					},
 				},
 			},
-			// Single-row 34px Keycap dock
-			KeycapBar(cx, a, keycaps),
-			// Collapsible Composer dock
-			core.Show{
-				When: composerExpanded.Get,
-				Then: func(cx *core.Scope) core.Node {
-					return core.View{
-						StyleFunc: func() core.Style {
-							pal := a.paletteOf(cx)
-							return core.Style{
-								Direction:   core.Row,
-								AlignItems:  core.AlignCenter,
-								Gap:         Tokens.Space2,
-								Padding:     core.Symmetric(Tokens.Space3, Tokens.Space2),
-								Background:  pal.Surface,
-								Borders:     core.Edges{Top: 1},
-								BorderColor: pal.Separator,
-							}
-						},
-						Children: []core.Node{
-							ActionButton(cx, a, "session-upload-btn", "传图", ActionSecondary, func() {
-								if cx == nil {
-									return
-								}
-								cx.PickImages(core.PickOptions{Limit: 1}, func(files []core.PickedFile) {
-									if len(files) == 0 {
-										return
+			// Keyboard- & SafeArea-aware bottom dock (KeycapBar + collapsible Composer)
+			core.View{
+				StyleFunc: func() core.Style {
+					pal := a.paletteOf(cx)
+					return core.Style{
+						Background: pal.Surface,
+						PaddingEnv: core.EnvEdges{Bottom: core.EnvKeyboard},
+					}
+				},
+				Children: []core.Node{
+					KeycapBar(cx, a, keycaps),
+					core.Show{
+						When: composerExpanded.Get,
+						Then: func(cx *core.Scope) core.Node {
+							return core.View{
+								StyleFunc: func() core.Style {
+									pal := a.paletteOf(cx)
+									return core.Style{
+										Direction:   core.Row,
+										AlignItems:  core.AlignCenter,
+										Gap:         Tokens.Space2,
+										Padding:     core.Symmetric(Tokens.Space3, Tokens.Space2),
+										PaddingEnv:  core.EnvEdges{Bottom: core.EnvSafeArea},
+										Background:  pal.Surface,
+										Borders:     core.Edges{Top: 1},
+										BorderColor: pal.Separator,
 									}
-									f := files[0]
-									a.UploadFileTo(curKey(), f.Name, f.Data)
-								})
-							}),
-							ActionButton(cx, a, "session-snippets-btn", "短语", ActionSecondary, func() {
-								showSnippets.Set(true)
-							}),
-							core.View{
-								Style: core.Style{FlexGrow: 1},
+								},
 								Children: []core.Node{
-									ui.Input{
-										TestID:      "session-composer",
-										Placeholder: "发消息或指令…",
-										Value: func() string {
-											return a.Compose(curKey().String())
-										},
-										OnChange: func(txt string) {
-											if ctrlLatched.Get() && len(txt) == 1 {
-												ch := strings.ToLower(txt)[0]
-												if ch >= 'a' && ch <= 'z' {
-													ctrlLatched.Set(false)
-													sendKeyOrBytes("C-"+string(ch), []byte{ch - 'a' + 1})
-													return
-												}
+									IconButton(cx, a, "session-upload-btn", "上传图片", iconImage, false, func() {
+										if cx == nil {
+											return
+										}
+										cx.PickImages(core.PickOptions{Limit: 1}, func(files []core.PickedFile) {
+											if len(files) == 0 {
+												return
 											}
-											a.SetCompose(curKey().String(), txt)
-										},
-										OnSubmit: func(string) {
-											sendComposerText()
-										},
-										StyleFunc: func() core.Style {
-											pal := a.paletteOf(cx)
-											return core.Style{
-												Width:        core.Pct(100),
-												MinHeight:    core.Pt(Tokens.SizeTouch),
-												Background:   pal.SurfaceRaised,
-												Color:        pal.Text,
-												CornerRadius: Tokens.RadiusCtrl,
-												BorderColor:  pal.Border,
-												BorderWidth:  1,
-											}
+											f := files[0]
+											a.UploadFileTo(curKey(), f.Name, f.Data)
+										})
+									}),
+									IconButton(cx, a, "session-snippets-btn", "常用短语", iconSnippets, false, func() {
+										showSnippets.Set(true)
+									}),
+									core.View{
+										Style: core.Style{FlexGrow: 1},
+										Children: []core.Node{
+											ui.Input{
+												TestID:      "session-composer",
+												Placeholder: "发消息或指令…",
+												Value: func() string {
+													return a.Compose(curKey().String())
+												},
+												OnChange: func(txt string) {
+													if ctrlLatched.Get() && len(txt) == 1 {
+														ch := strings.ToLower(txt)[0]
+														if ch >= 'a' && ch <= 'z' {
+															ctrlLatched.Set(false)
+															sendKeyOrBytes("ctrl+"+string(ch), []byte{ch - 'a' + 1})
+															return
+														}
+													}
+													a.SetCompose(curKey().String(), txt)
+												},
+												OnSubmit: func(string) {
+													sendComposerText()
+												},
+												StyleFunc: func() core.Style {
+													pal := a.paletteOf(cx)
+													return core.Style{
+														Width:        core.Pct(100),
+														MinHeight:    core.Pt(Tokens.SizeTouch),
+														Background:   pal.SurfaceRaised,
+														Color:        pal.Text,
+														CornerRadius: Tokens.RadiusCtrl,
+														BorderColor:  pal.Border,
+														BorderWidth:  1,
+													}
+												},
+											},
 										},
 									},
+									IconButton(cx, a, "session-send-btn", "发送", iconSend, true, sendComposerText),
 								},
-							},
-							ActionButton(cx, a, "session-send-btn", "发送", ActionPrimary, sendComposerText),
+							}
 						},
-					}
+					},
 				},
 			},
 			// Snippets bottom sheet

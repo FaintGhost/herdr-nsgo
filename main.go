@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	"github.com/nsgo-dev/nsgo"
@@ -24,6 +25,7 @@ type uiController struct {
 	showAddInstance *core.Signal[bool]
 	showQRModal     *core.Signal[bool]
 	editingHost     *core.Signal[Host]
+	attachGen       atomic.Uint64
 }
 
 // Root is the NSGo entry point.
@@ -45,9 +47,12 @@ func RootWithApp(cx *core.Scope, app *App) core.Node {
 		editingHost:     core.NewSignal(cx, Host{UseLocalKey: true}),
 	}
 
-	// Open session directly when user taps a system notification.
+	// Open session directly when user taps a system notification (closing any open sheets).
 	app.OnNotificationOpen(func(k TermKey) {
 		app.post(func() {
+			u.showNewSession.Set(false)
+			u.showAddInstance.Set(false)
+			u.showQRModal.Set(false)
 			u.subPage.Set("")
 			u.openSession(cx, k)
 		})
@@ -105,10 +110,10 @@ func RootWithApp(cx *core.Scope, app *App) core.Node {
 	// Render the primary 3-Tab navigation column (used full-screen on phone, or as left sidebar on >=680px).
 	tabShell := func(cx *core.Scope) core.Node {
 		return core.View{
-			Style: core.Style{FlexGrow: 1, Width: core.Pct(100), Height: core.Pct(100)},
+			Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0), Width: core.Pct(100), Height: core.Pct(100)},
 			Children: []core.Node{
 				core.View{
-					Style: core.Style{FlexGrow: 1},
+					Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0), Overflow: core.Hidden},
 					Children: []core.Node{
 						core.Show{
 							When: func() bool { return u.activeTab.Get() == "inbox" },
@@ -247,41 +252,53 @@ func (u *uiController) openSession(cx *core.Scope, key TermKey) {
 	if u.app.frameCacheOn.Get() {
 		cache = u.app.cache
 	}
-	// Disable native Ghostty in simulated/headless tests so Canvas renders cleanly in nsgotest.
 	enableGhostty := cx != nil && !cx.Env().Simulated()
-	st := NewSessionTerminal(cx, key, 100, 32, u.app.observeDefault.Get(), cache, enableGhostty)
-	u.activeTerm.Set(st)
-
-	client := u.app.clientForKey(key)
-	if client == nil {
-		return
-	}
 	observe := u.app.observeDefault.Get()
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
-		defer cancel()
-		stream, res, err := client.Attach(ctx, AttachParams{
-			Terminal:            key.Addr,
-			Observe:             observe,
-			ResizeNotifications: true,
-			Cols:                100,
-			Rows:                32,
-		})
-		if err != nil {
-			u.app.notifyToast("无法接入终端流：" + explain(err))
+	st := NewSessionTerminal(cx, key, 100, 32, observe, cache, enableGhostty)
+
+	attachWithMode := func(obs bool, cols, rows int) {
+		gen := u.attachGen.Add(1)
+		client := u.app.clientForKey(key)
+		if client == nil {
 			return
 		}
-		// Ensure this session is still the active one before binding.
-		if u.activeTerm.Get() != st {
-			_ = stream.Close()
-			return
+		if cols <= 0 {
+			cols = 100
 		}
-		st.Attach(stream, res.Terminal.Cols, res.Terminal.Rows)
-	}()
+		if rows <= 0 {
+			rows = 32
+		}
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+			defer cancel()
+			stream, res, err := client.Attach(ctx, AttachParams{
+				Terminal:            key.Addr,
+				Observe:             obs,
+				ResizeNotifications: true,
+				Cols:                cols,
+				Rows:                rows,
+			})
+			if err != nil {
+				u.app.notifyToast("无法接入终端流：" + explain(err))
+				return
+			}
+			// Atomic token check (safe off UI thread): drop stream if user switched away.
+			if u.attachGen.Load() != gen {
+				_ = stream.Close()
+				return
+			}
+			st.Attach(stream, res.Terminal.Cols, res.Terminal.Rows)
+		}()
+	}
+
+	st.SetReattach(attachWithMode)
+	u.activeTerm.Set(st)
+	attachWithMode(observe, 100, 32)
 }
 
 // closeSession releases the active VT attach stream and updates the LRU cache.
 func (u *uiController) closeSession() {
+	u.attachGen.Add(1)
 	if prev := u.activeTerm.Get(); prev != nil {
 		prev.Close()
 		u.activeTerm.Set(nil)
