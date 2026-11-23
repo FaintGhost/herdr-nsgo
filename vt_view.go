@@ -870,16 +870,17 @@ func buildVisualLines(all [][]VTCell, wrapCols int) []vtVisualLine {
 	}
 	out := make([]vtVisualLine, 0, len(all))
 	for i, row := range all {
-		// Find last non-blank cell so empty right padding does not spawn blank wrapped lines.
-		lastUsed := -1
+		// Find last cell with an actual visible non-space character so trailing background-padded
+		// spaces from wide desktop TUIs (e.g. 140-col Claude Code bars) never wrap into empty bars.
+		lastText := -1
 		for c := len(row) - 1; c >= 0; c-- {
 			cell := row[c]
-			if cell.Width == 0 || (cell.Rune != 0 && cell.Rune != ' ') || cell.Style.BG.Kind != VTColorDefault || cell.Style.Inverse {
-				lastUsed = c
+			if cell.Width == 0 || (cell.Rune != 0 && cell.Rune != ' ') {
+				lastText = c
 				break
 			}
 		}
-		if lastUsed < 0 || lastUsed < wrapCols {
+		if lastText < 0 || lastText < wrapCols {
 			end := len(row)
 			if end > wrapCols {
 				end = wrapCols
@@ -888,15 +889,15 @@ func buildVisualLines(all [][]VTCell, wrapCols int) []vtVisualLine {
 			continue
 		}
 		// Keep pure horizontal divider lines (e.g. 140-col '───' rules) as a single clean viewport-width line.
-		if isDividerRow(row[:lastUsed+1]) {
+		if isDividerRow(row[:lastText+1]) {
 			out = append(out, vtVisualLine{origLine: i, colStart: 0, cells: row[:wrapCols]})
 			continue
 		}
 		pos := 0
-		for pos <= lastUsed {
+		for pos <= lastText {
 			end := pos + wrapCols
-			if end > lastUsed+1 {
-				end = lastUsed + 1
+			if end > lastText+1 {
+				end = lastText + 1
 			}
 			// Never cut a wide 2-column character in half across wrap boundary.
 			if end < len(row) && row[end].Width == 0 && end > pos+1 {
