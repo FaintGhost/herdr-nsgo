@@ -1,94 +1,70 @@
-# 设计说明：从 Moshi 抄了什么，为什么
+# herdr-nsgo Design System (`Crisp Slate`)
 
-依据是 `../oppo/moshi_extract/MOSHI-DESIGN.md`（Moshi 4.5.1 的真机 + 反编译分析）。
-原则：**抄信息架构，不抄体量**。Moshi 有 3282 条文案、22 个品牌图标墙、17 项功能清单；这里只留必要的那几条。
+Rules for building and extending UI in `herdr-nsgo`. Every screen and component reads tokens exclusively from [`theme.go`](theme.go); raw `core.RGB(...)` / `core.RGBA(...)` literals outside `theme.go` are blocked by `TestNoRawColorsInScreens`.
 
-## 一、抄的五条
+## 1. Visual Direction
 
-### 1. 空状态 = 说明 + 唯一下一步
+- **Aesthetic**: Crisp Slate — light-first, hairline-framed, high-density developer utility inspired by Moshi's information architecture and native mobile polish, paired with an Obsidian dark mode.
+- **Hierarchy**: Flat surfaces separated by 1px subtle borders and 3px left semantic status rails; no heavy drop shadows, no neon gradients, no marketing bloat.
+- **Density**: Compact mobile ergonomics (~58 monospace VT columns in portrait at 12px) with 40px minimum touch targets and 34px single-row keycaps.
+- **Color Discipline**: One brand accent (Teal `#0F766E` light / `#2DD4BF` dark) for active tabs, running sessions, and primary actions; Amber (`warn`) solely for attention/blocking; Crimson (`danger`) solely for errors and destructive actions.
+- **Terminal Truth**: Real VT terminal output (`terminal.attach`) stays visually distinct on a dedicated VT canvas (`#FAFBFC` light / `#070A0D` dark, with an "Always Dark VT" override in Settings).
 
-Moshi：空收件箱先摆图标墙，再一句 "Pair it once, and … sessions show up here."，最后一个绿色主 CTA。
+## 2. Design Tokens (`theme.go`)
 
-这里：`emptyCard()`（`screens.go`）三件套——标题说清"这里将有什么"，正文说"连上之后你会看到什么"，一个主按钮。
+Source of truth: [`theme.go`](theme.go) (`LightPalette()`, `DarkPalette()`, `LightVTPalette()`, `DarkVTPalette()`, `Tokens`, `TokenCatalog()`). All foreground/background pairs are verified WCAG AA (`>= 4.5:1`) by `TestPaletteWCAGContrast`.
 
-```
-还没有活跃会话
-连上之后，这里会列出每个终端：状态、目录、最后一句输出。
-[ 添加机器 ]
-```
+| Group | Token | Light | Dark | Role |
+|---|---|---|---|---|
+| Surface | `--color-bg` (`pal.Bg`) | `#F7F8FA` | `#0C0F12` | Page background |
+| Surface | `--color-surface` (`pal.Surface`) | `#FFFFFF` | `#14191F` | Cards, bars, sheets |
+| Surface | `--color-surface-raised` (`pal.SurfaceRaised`) | `#EEF1F5` | `#1E2630` | Inputs, secondary buttons, pills, keycaps |
+| Surface | `--color-fill` (`pal.Fill`) | `#E3E7EE` | `#27313D` | Sheet handle, finished badge fill |
+| Surface | `--color-separator` (`pal.Separator`) | `rgba(17,24,39,0.09)` | `rgba(238,242,246,0.10)` | Header/tab dividers |
+| Surface | `--color-border` (`pal.Border`) | `rgba(17,24,39,0.08)` | `rgba(238,242,246,0.09)` | 1px card & control borders |
+| Text | `--color-text` (`pal.Text`) | `#111827` | `#EEF2F6` | Titles & session names |
+| Text | `--color-text-secondary` (`pal.TextSecondary`) | `#4B5563` | `#9AA7B8` | Status summaries & instance labels |
+| Text | `--color-text-muted` (`pal.TextMuted`) | `#5B6575` | `#8291A5` | Paths, addresses, section headers |
+| Accent | `--color-accent` (`pal.Accent`) | `#0F766E` | `#2DD4BF` | Primary CTA, active tab, working state |
+| Accent | `--color-accent-fg` (`pal.AccentFg`) | `#FFFFFF` | `#04211D` | Foreground on primary CTA |
+| Accent | `--color-accent-soft` (`pal.AccentSoft`) | `rgba(15,118,110,0.11)` | `rgba(45,212,191,0.14)` | Selected pill & highlight fill |
+| Status | `--color-warn` / `warn-soft` | `#B45309` / 10% | `#F5A623` / 14% | Blocked (`permission`, `question`, `auth`) |
+| Status | `--color-danger` / `danger-soft` | `#C81E1E` / 10% | `#F05252` / 14% | Errors, disconnect alerts, Kill/Deny |
+| VT | `--color-vt-bg` / `--color-vt-fg` | `#FAFBFC` / `#111827` | `#070A0D` / `#EEF2F6` | Terminal canvas default bg/fg |
+| Scale | Spacing (`Tokens.Space1..6`) | `4 / 8 / 12 / 16 / 20 / 24px` | same | 4px spacing grid (`PagePadX: 14`, `RowGap: 7`) |
+| Scale | Radii (`Tokens.Radius*`) | `6 / 8 / 10 / 16px` | same | Keycap / Control / Card / Sheet |
+| Scale | Sizes (`Tokens.Size*`) | `40 / 34 / 18 / 44 / 54px` | same | Touch / Keycap / Icon / Topbar / TabBar |
+| Type | Font scale (`Tokens.Font*`) | `20 / 14 / 14 / 12 / 12 / 11.5 / 12px` | same | Nav / Row / Body / Caption / Section / Mono / VT |
 
-测试锁住了这条：`TestHomeEmptyStateIsAnInstruction` 断言空态文案和按钮都在，并且按下之后确实到了添加页。
+## 3. Layout & Responsive Rules
 
-### 2. 选项标注成本
+- **Cold-start Gate**: When zero instances are configured, render `screen_onboarding.go` directly (QR pairing + Manual SSH + 1-tap `authorized_keys` command + troubleshooting checklist).
+- **Phone (`width < 680px`)**: Persistent 54px bottom 3-Tab bar (`会话` / `待办` / `实例`) + 44px top header. Opening a session pushes a full-screen VT Session view (`screen_session.go`); Settings & Tokens push over the stack.
+- **Tablet & Desktop (`width >= 680px`, `Tokens.WideBreakpoint`)**: Split-pane layout (`id:split-pane-layout`) with a fixed `280px` (`Tokens.SidebarWidth`) left 3-Tab sidebar and live VT Session view on the right.
+- **Session Viewport Discipline**: Entering a session defaults to `observe: true` (never resizes the remote desktop PTY). Horizontal scroll + pinch zoom stay local; tapping `适配列宽` or sending input promotes to active mode and sends `RESIZE` (~58 cols on phone). Closing releases the attach channel and writes the latest raw VT ring to the 24-session LRU cache.
 
-Moshi：`最快 · 约1分钟` vs `熟悉 SSH · 约3分钟 · 需要主机名 + 密钥`。
+## 4. Core Components & Don'ts (`components.go`)
 
-这里：`optionCard()`。添加机器页两条路各带成本行：
+1. **`SessionRow`**: 3px left semantic rail + session title + monospace instance pill (tagged `中继` when relayed) + `StatusBadge` + single-line semantic status + monospace `addr · app · cwd`.
+2. **`InlineApprovalCard`**: Used exclusively for `NeedsYou()` items (`blocked` / `error`). Renders one-tap `允许` / `拒绝` buttons **only** when `CanInlineApprove(term)` passes (whitelisted `Status.App` + `state == blocked` + `kind == permission`); all other items (`question`, `auth`, `error`, unknown apps) render `进入终端处理`.
+3. **`KeycapBar`**: Single-row horizontally scrollable 34px keycaps (`Esc`, `Tab`, `Ctrl`, arrows, `↵`, `^C`, `^D`, `^L`) docked immediately above the collapsible Composer.
+4. **`SheetModal` / `EmptyStateCard` / `FilterPill`**: 16px top-radius modal sheets with 36x4px handle; empty states always state what will appear + a single clear next action.
 
-- `推荐 · 约1分钟` — SSH 连接
-- `只用于桌面端 · 需要本机装 herdr-core` — 本机调试
+**Don'ts**:
+- Never hardcode `core.RGB(...)` / `core.RGBA(...)` in any `screen_*.go` or `components.go`.
+- Never fire inline approval keys without re-verifying live `terminal.get` state (`App.InlineApprove`).
+- Never send a `RESIZE` frame when opening a session in `observe` mode.
+- Never show bare `"error"` strings; every RPC or transport error passes through `RPCError.Remediation()` or `explain(err)`.
 
-不问"你要哪种"，直接说每种要付多少。
+## 5. Platform & Degradation Rules
 
-### 3. 状态机优先于输出流
+- **Pure Go Packaging**: Built via `go tool nsgo build` for Android (`android_arm64`) and iOS (`ios_arm64`) without custom Java/Kotlin/Gradle ejection.
+- **VT Engine**: Uses NSGo `base/terminal` (`libghostty-vt`) on iOS/macOS/Linux/Windows; automatically falls back to pure-Go `VTScreen` + `core.Canvas` on Android (`android_arm64`, where NSGo v0.3.0 has no bundled Ghostty shared library) and headless tests.
+- **Secrets & Camera**: Uses NSGo `cx.Secrets()` (Android Keystore / iOS Keychain) with encrypted AES-256-GCM fallback; QR pairing supports live `cx.ScanCode` with manual URI/JSON paste fallback.
 
-Moshi：agent 有 task/plan/question/等审批/等输入 五种显式状态，推送挂在状态上。
+## 6. Pre-Ship Verification Checklist
 
-关键发现：**herdr-core 的协议层已经有这个状态机**，不用客户端自己造——
-`terminal.list` 的每条记录带 `state`，`terminal.get` 带 `status{state,kind,msg,title,progress}`，
-`state` 的取值就是 `idle | working | done | blocked | error`，`kind` 是 `permission | question | auth`。
-
-所以这里只做一层映射（`screens.go` 的 `stateWord` / `stateColor` / `attentionWhy`）：
-
-| herdr | 界面 |
-|---|---|
-| working | 跑着（绿点） |
-| blocked + permission | 等你 · 等审批（黄点） |
-| blocked + question | 等你 · 等你回答 |
-| blocked + auth | 等你 · 等你登录 |
-| idle / done / error | 空闲 / 结束 / 出错 |
-
-### 4. 收件箱是独立一等界面
-
-Moshi：独立入口，只列需要你决策的。
-
-这里：`Attention()`（`app.go`）的整条定义就是 `NeedsYou()`——`blocked` 或 `error`。
-首页顶部优先显示"需要你 · N"，收件箱页是同一份数据的完整列表 + 筛选。
-
-不是"通知聚合"，是**筛选视图**：没有状态，就没有收件箱。
-
-### 5. 错误即修复指令
-
-Moshi：`Install mosh and ensure mosh-server resolves in non-interactive shells.`、`Saved. Restart moshi-hook to apply.`
-
-这里两层：
-
-- 协议失败：`RPCError.Remediation()` 按 `data.kind` 给出下一步（`not_found` / `machine_unknown` / `finished` / `blocked` / `unavailable` / `config` / `needs_target` …）。
-- 连接失败：`explain()` 把 DNS / 拒绝连接 / 认证失败 / 没有 hc / 远端跑不起 `hc connect` / 超时分开说，不合成为一句"连接失败"。
-
-`TestFailureCarriesRemediation` 断言每种 kind 都给得出修复动作；`TestExplainKeepsObservedFailure` 断言三种连接失败没有被压平成同一句话。
-
-## 二、刻意没抄的
-
-| Moshi 的做法 | 这里为什么不做 |
-|---|---|
-| 22 个 agent 品牌图标墙 | 需要打包几十个商标资源；换成一句说明同样说清"将来会有什么" |
-| 17 项可试用功能清单 | 能力面只有 4 个，做成 4 条静态说明即可，等能力变多再升级成可试用 |
-| 手势矩阵 / 可编程工具栏 / D-Pad | 先把"能发一句话、能按 Enter/Esc/Ctrl+C"做对；手势是第二阶段 |
-| 推送 / Live Activities / 多设备 / Pro | 与"只支持 herdr-core、不做太复杂"直接冲突 |
-| 主题扫码导入、字体连字开关 | 个性化，不是可用性 |
-
-## 三、和官方 hc CLI 的差别
-
-`hc` 把复杂度给调用方：30+ 命令、350 行 `--skill` 手册、`wait` 只能"等到它停止工作"。
-这个客户端只暴露四件事：看列表、看一屏、发一句、按一下；其余全部收起。
-
-如果要把这些改动回灌到 herdr-core（见 `MOSHI-DESIGN.md` §5 的 P0），这里是同一套结论的客户端侧验证：
-**`wait` 的结构化原因、失败带 remediation、inbox 是个筛选视图** —— 这三条在移动端都能直接落地，说明它们在 CLI 上也成立。
-
-## 四、下一步（按收益排序）
-
-1. **真机验证**：现在只有 headless 测试和 APK，没在手机上跑过。
-2. **`terminal.attach`**：接真正的 VT 流（`base/terminal` 组件已具备），把"聊天视图"升级成"真终端"。
-3. **扫码配对**：替代手填 SSH 密码，也是 Moshi 最好用的那个入口。
-4. **密钥认证 + 主机密钥固定**：现在密码明文存本地、主机密钥不校验。
+- [ ] `go test -race ./...` passes with zero race warnings (includes `TestPaletteWCAGContrast` and `TestNoRawColorsInScreens`).
+- [ ] All 8 screens verified via headless `nsgotest` (`ui_test.go`) in both portrait (`390x844`) and split-pane (`960x720`).
+- [ ] `go tool nsgo build -target android_arm64` produces a clean APK in `dist/`.
+- [ ] Runtime Design Tokens gallery (`设置 → 查看设计系统 Tokens 图鉴`) reflects current `theme.go` values.

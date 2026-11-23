@@ -1,78 +1,45 @@
 # herdr-nsgo
 
-herdr-core 的移动客户端，用 [NSGo](https://github.com/nsgo-dev/nsgo)（Go 原生 UI）写。只做一件事：**把 herdr 的终端当成聊天来看**——列表、一屏文字、一个输入框、一排按键，外加一个只装「等你的人」的收件箱。
+跨平台（Android / iOS / macOS / Linux / Windows）第三方 [`herdr-core`](https://github.com/herdr-dev/herdr) 客户端，使用纯 Go + [NSGo](https://github.com/nsgo-dev/nsgo) 原生 UI 构建。
 
-设计思路来自分析第三方客户端 Moshi（见 `DESIGN.md`），但只抄信息架构，不抄它的体量：APK **6.3 MB**，Moshi 是 122 MB。
+参考 Moshi 的高效信息架构与交互打磨，围绕 `herdr-core v0.1.22` 协议原生能力打造：支持**多实例并发直连、真实 VT 终端流、Agent 语义审批卡片、TOFU 主机指纹校验与扫码配对**。
 
-## 现在能做什么
+## 核心能力（v1.0）
 
-| 能力 | 状态 | 证据 |
-|---|---|---|
-| 说 hc 的 JSON-RPC 协议（hello / list / read / send / keys / interrupt / wait / subscribe） | 通了 | `client_test.go` 对本机真实核心跑：42 终端 / 4 机器 / 一次读出 2063 字节 |
-| SSH 到远端跑 `hc connect`（不用开端口） | 通了 | `transport.go` |
-| 首页 / 会话 / 收件箱 / 添加机器 四屏 | 通了 | `ui_test.go` headless 逐屏断言 |
-| 构建 Android APK | 出了 | `dist/releases/herdr-nsgo-0.1.0-android-arm64.apk` (6.4 MB) |
-| 在真机上连真机核 | **通了** | PLG110 上装好后经 Tailscale+SSH 连到 `kr`（arm-chuncheon）：24 个终端、2 台机器、2 条「需要你」 |
-| 真机发文本 | **通了** | 手机上发 `echo hello-from-nsgo`，kr 的终端执行并回显，App 同步显示（`docs/screens/05-sent.png`）|
+- **多实例并发连接池 (`CorePool`)**：同时管理多台独立的 `herdr-core` SSH 连接，使用 9 字节小端 `framed` 二进制多路复用与 `events.subscribe` 实时推送（告别轮询）。按 `CoreInfo.ID` / `MachineView.ID` 自动跨核去重，直连优先，直连断线时自动回退至其他在线核的联邦中继。
+- **真实 VT 终端 + `observe` 无扰观察模式**：通过 `terminal.attach` 承载完整 ANSI 16/256/Truecolor、框线、宽字符与 Alt-Screen。iOS / 桌面端使用 `base/terminal`（Ghostty VT），Android 端无缝切换至纯 Go `VTScreen` + `core.Canvas` 引擎；默认 `observe: true` 查看不改动桌面端 PTY 尺寸，点击「适配列宽」或发送输入时才发 `RESIZE`。内置 24 会话内存 LRU 帧缓存实现切回瞬开。
+- **Agent 语义收件箱 & 安全直操**：顶部「需要你」卡片与独立「待办」Tab 聚合跨实例阻塞/报错会话（支持实时搜索筛选）；对白名单程序（Claude / Codex）且处于 `blocked + permission` 状态的终端提供一键「允许 / 拒绝」（执行前二次校验 `terminal.get` 防误触）。
+- **移动端终端增强**：单行可滚动 34px 键帽栏（`Esc / Tab / Ctrl / ↑↓←→ / ↵ / ^C / ^D / ^L`）、可折叠输入栏、常用短语（Snippets）、会内输出搜索、URL/文件路径提取、回到底部 FAB，以及 64 KiB 分块 `terminal.put_begin/chunk/finish` 图片与文件上传。
+- **安全基线与 1 分钟冷启动**：应用内自动生成 `ed25519` 密钥对并提供一键复制 `authorized_keys` 命令；凭据存入系统 `core.Secrets`（Android Keystore / iOS Keychain，带 AES-256-GCM 降级）；TOFU 主机指纹首次信任、扫码 `fp` 预置强校验、变更强阻断；支持 `herdr://pair?v=1&...` 与 JSON 扫码/粘贴配对。
+- **Crisp Slate 设计系统**：以亮色为主、完整支持暗色与跟随系统（含「终端画布始终暗色」开关），`>= 680px` 自动切换平板/桌面双栏布局；详见 [`DESIGN.md`](DESIGN.md)。
 
 ## 快速开始
 
 ```sh
-go test ./...                    # 协议层打真实 hc，UI 层 headless
-go tool nsgo dev                 # 本机（Windows/macOS/Linux）跑起来
+# 运行全部单元测试（含 -race 竞态检测、WCAG 对比度、真实本机 hc connect 与 8 屏 headless UI 测试）
+go test -v -race ./...
+
+# 本机桌面端启动预览
+go tool nsgo dev
+
+# 构建 Android arm64 APK（纯 Go 打包，无需 Java/Gradle）
 go tool nsgo build -target android_arm64
-adb install -r dist/releases/herdr-nsgo-0.1.0-android-arm64.apk
+
+# 安装到 USB/无线调试的 Android 手机（例如 OPPO Find X9 Pro）
+adb install -r dist/releases/herdr-nsgo-1.0.0-android-arm64.apk
+
+# 构建 iOS（需配置 Apple 签名证书）
+go tool nsgo build -target ios_arm64
 ```
 
-第一次进去是空态：点「连接一台机器」→ 填 `主机` / `用户名` / `密码` → 它会 SSH 过去跑 `hc connect`。
-桌面端也可以选「用本机」，直接连这台机器上的核心（测试就是这么跑的）。
+## 项目结构
 
-## 结构
-
-| 文件 | 作用 |
+| 文件 | 职责 |
 |---|---|
-| `main.go` | 导航栈，四条路由 |
-| `proto.go` | hc 的数据形状（Terminal / Status / ReadResult …） |
-| `client.go` | JSON-RPC 2.0 客户端；失败带 `kind` 与 `Remediation()` |
-| `transport.go` | SSH 与本地两种传输 |
-| `app.go` | 状态、连接生命周期、轮询、动作、错误解释 |
-| `screens.go` | 四个界面 |
-| `client_test.go` / `ui_test.go` | 协议对真实核心、界面 headless |
-
-## 明确的非目标
-
-- 不做完整 VT 终端（`terminal.attach` 的二进制流），v1 只读文本屏幕。对 agent 会话够用，对 vim 不够。
-- 不做扫码配对、推送、多设备、Pro——Moshi 那些先不抄。
-- 不做终端管理（新建 / kill / 改标签）：那是 hc 已经擅长的，先用 CLI。
-
-## 真机验证发现的五个缺陷（已修）
-
-| 现象 | 根因 | 修法 |
-|---|---|---|
-| `dial tcp: missing port` | 目标没写端口就直接丢给 ssh | `withPort()` 补 `:22` |
-| 连上了但列表一直空 | 各 section 一次性构建静态节点，不跟随信号重建 | 换成 `core.Each` |
-| 失败后仍显示「正在连接…」 | `fail()` 没同步改连接状态 | 失败即置 `stateFailed` |
-| 列表滚到标题栏下面 | 系统标题栏是透明的 | 每个页面给 `HeaderStyle` 实底 |
-| 无状态上报的终端显示英文 `live` | 把生命周期状态当成程序状态 | 映射为「运行中」 |
-
-## 真机测试用的凭据（临时）
-
-真机验证时生成了一对一次性密钥，公钥以 `herdr-nsgo-test` 为注释加进了 kr 的
-`/root/.ssh/authorized_keys`，私钥在 `../oppo/nsgo_testkey`，也存进了手机上的 App。
-
-不想留了就撤销：
-
-```sh
-hc exec --on kr "sed -i '/herdr-nsgo-test/d' ~/.ssh/authorized_keys"
-rm -f ../oppo/nsgo_testkey ../oppo/nsgo_testkey.pub
-```
-
-App 会随之连不上，届时在「添加机器」里换成密码或你自己的私钥。
-
-## 已知限制
-
-- SSH 只支持密码；主机密钥不校验（`InsecureIgnoreHostKey`），和 Moshi 首连行为一致，但要在设置里明说。
-- 会话文字会换行，宽表格会折行；这是「聊天视图」的取舍。
-- 密码与私钥存在设备本地存储（`core.Storage`），未加密。
-- Powerline / Nerd Font 提示符里的私用区字形显示成 □（系统等宽字体没有这些字形）。接 `base/terminal` 并配 Nerd Font 可解决。
-- 文本模式会按宽度折行，TUI 的框线会被折断——这是「聊天视图」的代价，真终端要等 `terminal.attach`。
+| [`theme.go`](theme.go) / [`theme_test.go`](theme_test.go) | Crisp Slate 亮/暗/VT Tokens、WCAG `>= 4.5:1` 校验与禁止裸色静态测试 |
+| [`proto.go`](proto.go) / [`framed.go`](framed.go) / [`client.go`](client.go) | `hc v0.1.22` 协议类型、9 字节 LE `framed` 多路复用、`AttachStream`、分块 `PutFile` 与可操作修复提示 |
+| [`secrets.go`](secrets.go) / [`pairing.go`](pairing.go) / [`transport.go`](transport.go) | `SecretStore`、TOFU 主机指纹校验、`ed25519` 密钥生成、`herdr://pair` 解析与 SSH 拨号 |
+| [`pool.go`](pool.go) / [`approvals.go`](approvals.go) / [`app.go`](app.go) | 多实例 `CorePool`、跨核去重、白名单直操审批、24 会话 LRU 帧缓存与偏好/短语持久化 |
+| [`vt_screen.go`](vt_screen.go) / [`vt_view.go`](vt_view.go) | 纯 Go VT100/xterm-256color/truecolor 仿真器、`SessionTerminal`（Ghostty / Canvas 双后端）与链接/搜索提取 |
+| [`components.go`](components.go) / `screen_*.go` / [`main.go`](main.go) | 4 个核心组件、8 个业务界面、`<680px` 三 Tab / `>=680px` 双栏自适应布局与生命周期唤醒 |
+| [`ui_test.go`](ui_test.go) | 覆盖全部 8 屏与双栏布局的 `nsgotest` headless UI 测试套件 |
