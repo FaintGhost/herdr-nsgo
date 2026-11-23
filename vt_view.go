@@ -887,6 +887,11 @@ func buildVisualLines(all [][]VTCell, wrapCols int) []vtVisualLine {
 			out = append(out, vtVisualLine{origLine: i, colStart: 0, cells: row[:end]})
 			continue
 		}
+		// Keep pure horizontal divider lines (e.g. 140-col '───' rules) as a single clean viewport-width line.
+		if isDividerRow(row[:lastUsed+1]) {
+			out = append(out, vtVisualLine{origLine: i, colStart: 0, cells: row[:wrapCols]})
+			continue
+		}
 		pos := 0
 		for pos <= lastUsed {
 			end := pos + wrapCols
@@ -902,6 +907,22 @@ func buildVisualLines(all [][]VTCell, wrapCols int) []vtVisualLine {
 		}
 	}
 	return out
+}
+
+func isDividerRow(cells []VTCell) bool {
+	seen := 0
+	for _, c := range cells {
+		if c.Width == 0 || c.Rune == 0 || c.Rune == ' ' {
+			continue
+		}
+		switch c.Rune {
+		case '─', '━', '═', '┄', '┈', '-', '_':
+			seen++
+		default:
+			return false
+		}
+	}
+	return seen >= 8
 }
 
 func drawVTScreen(
