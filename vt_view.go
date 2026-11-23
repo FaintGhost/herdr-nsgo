@@ -197,6 +197,7 @@ func (st *SessionTerminal) Feed(data []byte) {
 		st.mu.Unlock()
 		return
 	}
+	firstFrame := st.rawRing.Len() == 0
 	st.screen.Write(data)
 	st.appendRawLocked(data)
 	st.dirtyCache = true
@@ -206,7 +207,11 @@ func (st *SessionTerminal) Feed(data []byte) {
 	if gt != nil {
 		gt.Feed(data)
 	}
-	st.bumpRev()
+	if firstFrame {
+		st.bumpRevImmediate()
+	} else {
+		st.bumpRev()
+	}
 }
 
 func (st *SessionTerminal) appendRawLocked(data []byte) {

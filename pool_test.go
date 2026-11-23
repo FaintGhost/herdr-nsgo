@@ -75,6 +75,27 @@ func TestCorePoolDeduplicatesDirectOverRelay(t *testing.T) {
 	}
 }
 
+func TestGroupSessionsNestsChildrenAndSeparatesFinished(t *testing.T) {
+	p1 := "kr/t1d"
+	items := []AggregatedTerminal{
+		{Key: TermKey{InstanceID: "kr", Addr: "kr/t1d"}, InstanceName: "kr", Terminal: Terminal{Address: "kr/t1d", Name: "main-agent", State: "live"}},
+		{Key: TermKey{InstanceID: "kr", Addr: "kr/t1m"}, InstanceName: "kr", Terminal: Terminal{Address: "kr/t1m", Name: "child-1", Parent: &p1, State: "finished"}},
+		{Key: TermKey{InstanceID: "kr", Addr: "kr/t1n"}, InstanceName: "kr", Terminal: Terminal{Address: "kr/t1n", Name: "child-2", Parent: &p1, State: "working"}},
+		{Key: TermKey{InstanceID: "kr", Addr: "t3"}, InstanceName: "kr", Terminal: Terminal{Address: "t3", Name: "old-zsh", State: "finished"}},
+	}
+
+	active, finished := GroupSessions(items)
+	if len(active) != 1 {
+		t.Fatalf("expected 1 active root group, got %d: %+v", len(active), active)
+	}
+	if active[0].Primary.Key.Addr != "kr/t1d" || len(active[0].Children) != 2 || active[0].ActiveChildren != 1 {
+		t.Errorf("unexpected root group: %+v", active[0])
+	}
+	if len(finished) != 1 || finished[0].Key.Addr != "t3" {
+		t.Errorf("expected 1 standalone finished terminal (t3), got %+v", finished)
+	}
+}
+
 func TestInlineApprovalWhitelist(t *testing.T) {
 	cases := []struct {
 		name      string

@@ -1032,7 +1032,13 @@ func TabBar(cx *core.Scope, a *App, activeTab *core.Signal[string]) core.Node {
 			},
 			Children: []core.Node{
 				core.View{
-					Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: core.Points(4)},
+					Style: core.Style{
+						Position:       core.Relative,
+						Width:          core.Pt(28),
+						Height:         core.Pt(22),
+						AlignItems:     core.AlignCenter,
+						JustifyContent: core.JustifyCenter,
+					},
 					Children: []core.Node{
 						core.Icon{
 							SVG: svg,
@@ -1056,22 +1062,34 @@ func TabBar(cx *core.Scope, a *App, activeTab *core.Signal[string]) core.Node {
 									StyleFunc: func() core.Style {
 										pal := a.paletteOf(cx)
 										return core.Style{
-											Background:     pal.Warn,
-											CornerRadius:   core.Points(9),
-											MinWidth:       core.Pt(18),
-											Padding:        core.Symmetric(core.Points(1), core.Points(6)),
+											Position:       core.Absolute,
+											Top:            core.Pt(-4),
+											Right:          core.Pt(-8),
+											Background:     pal.Danger,
+											BorderWidth:    core.Points(1.5),
+											BorderColor:    pal.Surface,
+											CornerRadius:   core.Points(8),
+											MinWidth:       core.Pt(16),
+											Height:         core.Pt(16),
+											Padding:        core.Symmetric(core.Points(0), core.Points(4)),
 											AlignItems:     core.AlignCenter,
 											JustifyContent: core.JustifyCenter,
 										}
 									},
 									Children: []core.Node{
 										core.Text{
-											ContentFunc: func() string { return fmt.Sprintf("%d", badgeFn()) },
+											ContentFunc: func() string {
+												n := badgeFn()
+												if n > 99 {
+													return "99+"
+												}
+												return fmt.Sprintf("%d", n)
+											},
 											StyleFunc: func() core.Style {
 												pal := a.paletteOf(cx)
 												return core.Style{
 													Color:      pal.AccentFg,
-													FontSize:   core.Points(10),
+													FontSize:   core.Points(9.5),
 													FontWeight: core.FontWeightBold,
 												}
 											},

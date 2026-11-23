@@ -12,15 +12,37 @@ import (
 func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 	a := u.app
 	showSearch := core.NewSignal(cx, false)
+	showFinished := core.NewSignal(cx, false)
+	expandedGroups := core.NewSignalFunc(cx, map[string]bool{}, nil)
+
+	toggleGroup := func(key string) {
+		cur := expandedGroups.Get()
+		next := make(map[string]bool, len(cur)+1)
+		for k, v := range cur {
+			next[k] = v
+		}
+		next[key] = !next[key]
+		expandedGroups.Set(next)
+	}
+
+	activeAllCount := func() int {
+		active, _ := GroupSessions(a.aggTerms.Get())
+		return len(active)
+	}
 
 	countForInstance := func(instID string) int {
+		active, _ := GroupSessions(a.aggTerms.Get())
 		n := 0
-		for _, it := range a.aggTerms.Get() {
-			if it.Key.InstanceID == instID {
+		for _, g := range active {
+			if g.Primary.Key.InstanceID == instID {
 				n++
 			}
 		}
 		return n
+	}
+
+	filteredGroups := func() ([]SessionGroup, []AggregatedTerminal) {
+		return GroupSessions(a.FilteredTerminals())
 	}
 
 	return core.View{
@@ -69,7 +91,7 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 						},
 						Children: []core.Node{
 							FilterPill(cx, a, "pill-all", func() string {
-								return fmt.Sprintf("全部 (%d)", len(a.aggTerms.Get()))
+								return fmt.Sprintf("全部 (%d)", activeAllCount())
 							}, func() bool {
 								return a.activeInstanceFilter.Get() == ""
 							}, nil, func() {
@@ -240,18 +262,22 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 									}
 								},
 							},
-							// Section 2: Active & all sessions
+							// Section 2: Active top-level sessions (with collapsible child sub-sessions)
 							core.View{
 								Style: core.Style{Gap: Tokens.RowGap},
 								Children: []core.Node{
 									SectionHeader(cx, a, func() string {
-										return fmt.Sprintf("活跃会话 · %d", len(a.FilteredTerminals()))
+										active, _ := filteredGroups()
+										return fmt.Sprintf("活跃会话 · %d", len(active))
 									}, nil),
 									core.Show{
-										When: func() bool { return len(a.FilteredTerminals()) == 0 },
+										When: func() bool {
+											active, _ := filteredGroups()
+											return len(active) == 0
+										},
 										Then: func(cx *core.Scope) core.Node {
 											return EmptyStateCard(cx, a,
-												"当前筛选下没有会话",
+												"当前筛选下没有活跃会话",
 												"点击右上角「+」在已连上的实例里启动一个 Claude / Codex 或 Shell 终端。",
 												"home-empty-new-btn", "新建会话", func() {
 													u.showNewSession.Set(true)
@@ -260,16 +286,171 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 										},
 									},
 									core.Each(
-										func() []AggregatedTerminal { return a.FilteredTerminals() },
-										func(it AggregatedTerminal) string { return it.Key.String() },
-										func(cx *core.Scope, item func() AggregatedTerminal, _ func() int) core.Node {
-											return SessionRow(cx, a, item, func() bool {
-												return u.activeSession.Get() == item().Key
-											}, func(k TermKey) {
-												u.openSession(cx, k)
-											})
+										func() []SessionGroup {
+											active, _ := filteredGroups()
+											return active
+										},
+										func(g SessionGroup) string { return g.Primary.Key.String() },
+										func(cx *core.Scope, item func() SessionGroup, _ func() int) core.Node {
+											g0 := item()
+											rootKey := g0.Primary.Key.String()
+											isExpanded := func() bool {
+												g := item()
+												if v, set := expandedGroups.Get()[rootKey]; set {
+													return v
+												}
+												return g.AttentionChildren > 0
+											}
+											return core.View{
+												Style: core.Style{Gap: core.Points(4)},
+												Children: []core.Node{
+													SessionRow(cx, a, func() AggregatedTerminal { return item().Primary }, func() bool {
+														return u.activeSession.Get() == item().Primary.Key
+													}, func(k TermKey) {
+														u.openSession(cx, k)
+													}),
+													// Sub-sessions toggle chip when parent spawned child terminals
+													core.Show{
+														When: func() bool { return len(item().Children) > 0 },
+														Then: func(cx *core.Scope) core.Node {
+															return core.View{
+																Style: core.Style{
+																	Padding: core.Edges{Left: Tokens.Space3},
+																	Gap:     core.Points(5),
+																},
+																Children: []core.Node{
+																	core.View{
+																		TestID: "subsessions-toggle-" + rootKey,
+																		Role:   core.RoleButton,
+																		OnPress: func(core.PressEvent) {
+																			toggleGroup(rootKey)
+																		},
+																		StyleFunc: func() core.Style {
+																			pal := a.paletteOf(cx)
+																			return core.Style{
+																				Direction:    core.Row,
+																				AlignItems:   core.AlignCenter,
+																				AlignSelf:    core.AlignStart,
+																				Gap:          core.Points(6),
+																				Background:   pal.SurfaceRaised,
+																				BorderWidth:  1,
+																				BorderColor:  pal.Border,
+																				CornerRadius: Tokens.RadiusKey,
+																				Padding:      core.Symmetric(core.Points(4), core.Points(10)),
+																			}
+																		},
+																		Children: []core.Node{
+																			core.Text{
+																				ContentFunc: func() string {
+																					g := item()
+																					arrow := "▸"
+																					if isExpanded() {
+																						arrow = "▾"
+																					}
+																					if g.ActiveChildren > 0 {
+																						return fmt.Sprintf("%s %d 个子会话（%d 活跃）", arrow, len(g.Children), g.ActiveChildren)
+																					}
+																					return fmt.Sprintf("%s %d 个子会话", arrow, len(g.Children))
+																				},
+																				StyleFunc: func() core.Style {
+																					pal := a.paletteOf(cx)
+																					fg := pal.TextSecondary
+																					if item().AttentionChildren > 0 {
+																						fg = pal.Warn
+																					}
+																					return core.Style{
+																						Color:      fg,
+																						FontSize:   Tokens.FontMonoMeta,
+																						FontWeight: core.FontWeightSemibold,
+																					}
+																				},
+																			},
+																		},
+																	},
+																	core.Show{
+																		When: isExpanded,
+																		Then: func(cx *core.Scope) core.Node {
+																			return core.View{
+																				StyleFunc: func() core.Style {
+																					pal := a.paletteOf(cx)
+																					return core.Style{
+																						Borders:     core.Edges{Left: 2},
+																						BorderColor: pal.Separator,
+																						Padding:     core.Edges{Left: Tokens.Space2},
+																						Gap:         core.Points(6),
+																					}
+																				},
+																				Children: []core.Node{
+																					core.Each(
+																						func() []AggregatedTerminal { return item().Children },
+																						func(ch AggregatedTerminal) string { return ch.Key.String() },
+																						func(cx *core.Scope, chItem func() AggregatedTerminal, _ func() int) core.Node {
+																							return SessionRow(cx, a, chItem, func() bool {
+																								return u.activeSession.Get() == chItem().Key
+																							}, func(k TermKey) {
+																								u.openSession(cx, k)
+																							})
+																						},
+																					),
+																				},
+																			}
+																		},
+																	},
+																},
+															}
+														},
+													},
+												},
+											}
 										},
 									),
+								},
+							},
+							// Section 3: Collapsible finished sessions (hidden by default so Home stays focused)
+							core.Show{
+								When: func() bool {
+									_, fin := filteredGroups()
+									return len(fin) > 0
+								},
+								Then: func(cx *core.Scope) core.Node {
+									return core.View{
+										Style: core.Style{Gap: Tokens.Space2},
+										Children: []core.Node{
+											ActionButtonFunc(cx, a, "home-finished-toggle", func() string {
+												_, fin := filteredGroups()
+												if showFinished.Get() {
+													return fmt.Sprintf("收起已结束会话 · %d ▴", len(fin))
+												}
+												return fmt.Sprintf("查看已结束会话 · %d ▾", len(fin))
+											}, ActionGhost, func() {
+												showFinished.Set(!showFinished.Get())
+											}),
+											core.Show{
+												When: showFinished.Get,
+												Then: func(cx *core.Scope) core.Node {
+													return core.View{
+														Style: core.Style{Gap: Tokens.RowGap},
+														Children: []core.Node{
+															core.Each(
+																func() []AggregatedTerminal {
+																	_, fin := filteredGroups()
+																	return fin
+																},
+																func(it AggregatedTerminal) string { return it.Key.String() },
+																func(cx *core.Scope, item func() AggregatedTerminal, _ func() int) core.Node {
+																	return SessionRow(cx, a, item, func() bool {
+																		return u.activeSession.Get() == item().Key
+																	}, func(k TermKey) {
+																		u.openSession(cx, k)
+																	})
+																},
+															),
+														},
+													}
+												},
+											},
+										},
+									}
 								},
 							},
 						},

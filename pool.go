@@ -209,6 +209,80 @@ func (tr *alertTracker) diff(snaps []InstanceSnapshot, agg []AggregatedTerminal)
 	return alerts
 }
 
+// SessionGroup pairs a top-level parent terminal with any child sub-sessions spawned from it (via Terminal.Parent).
+type SessionGroup struct {
+	Primary           AggregatedTerminal
+	Children          []AggregatedTerminal
+	ActiveChildren    int
+	AttentionChildren int
+}
+
+// GroupSessions nests child sub-sessions (Terminal.Parent != nil) under their root parent session
+// and separates standalone finished terminals so the active Home list stays clean and scannable.
+func GroupSessions(items []AggregatedTerminal) (active []SessionGroup, finished []AggregatedTerminal) {
+	byKey := make(map[TermKey]int, len(items))
+	for i, it := range items {
+		byKey[it.Key] = i
+	}
+
+	// Resolve root ancestor key for each item (guards against cycles).
+	rootOf := func(it AggregatedTerminal) (TermKey, bool) {
+		cur := it
+		visited := 0
+		for cur.Terminal.Parent != nil && *cur.Terminal.Parent != "" && visited < 8 {
+			parentKey := TermKey{InstanceID: cur.Key.InstanceID, Addr: *cur.Terminal.Parent}
+			idx, ok := byKey[parentKey]
+			if !ok {
+				break
+			}
+			cur = items[idx]
+			visited++
+		}
+		if cur.Key == it.Key {
+			return TermKey{}, false
+		}
+		return cur.Key, true
+	}
+
+	childrenByRoot := make(map[TermKey][]AggregatedTerminal)
+	isChild := make(map[TermKey]bool)
+	for _, it := range items {
+		if rootKey, ok := rootOf(it); ok {
+			childrenByRoot[rootKey] = append(childrenByRoot[rootKey], it)
+			isChild[it.Key] = true
+		}
+	}
+
+	for _, it := range items {
+		if isChild[it.Key] {
+			continue
+		}
+		kids := childrenByRoot[it.Key]
+		activeKids := 0
+		attnKids := 0
+		for _, ch := range kids {
+			if !ch.Terminal.Finished() {
+				activeKids++
+			}
+			if ch.Terminal.NeedsYou() {
+				attnKids++
+			}
+		}
+		if it.Terminal.Finished() && activeKids == 0 && attnKids == 0 {
+			finished = append(finished, it)
+			finished = append(finished, kids...)
+			continue
+		}
+		active = append(active, SessionGroup{
+			Primary:           it,
+			Children:          kids,
+			ActiveChildren:    activeKids,
+			AttentionChildren: attnKids,
+		})
+	}
+	return active, finished
+}
+
 func termSortRank(t Terminal) int {
 	switch t.StateWord() {
 	case "blocked":
