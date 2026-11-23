@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -275,10 +276,17 @@ func (u *uiController) openSession(cx *core.Scope, key TermKey) {
 				Terminal:            key.Addr,
 				Observe:             obs,
 				ResizeNotifications: true,
+				History:             200,
 				Cols:                cols,
 				Rows:                rows,
 			})
 			if err != nil {
+				// Fallback to terminal.read snapshot if attach is unavailable (e.g., finished or unframed core).
+				if r, rerr := client.Read(ctx, key.Addr, 200); rerr == nil && r.Text != "" {
+					st.Feed([]byte(strings.ReplaceAll(r.Text, "\n", "\r\n")))
+					u.app.post(func() { st.ScrollToBottom() })
+					return
+				}
 				u.app.notifyToast("无法接入终端流：" + explain(err))
 				return
 			}
@@ -288,6 +296,22 @@ func (u *uiController) openSession(cx *core.Scope, key TermKey) {
 				return
 			}
 			st.Attach(stream, res.Terminal.Cols, res.Terminal.Rows)
+			// If no initial VT bytes arrive within 400ms (e.g., quiet relayed terminal), seed from terminal.read.
+			time.AfterFunc(400*time.Millisecond, func() {
+				if u.attachGen.Load() != gen {
+					return
+				}
+				if strings.TrimSpace(st.Screen().VisibleText()) == "" {
+					rctx, rcancel := context.WithTimeout(context.Background(), 6*time.Second)
+					defer rcancel()
+					if r, rerr := client.Read(rctx, key.Addr, 200); rerr == nil && r.Text != "" {
+						st.Feed([]byte(strings.ReplaceAll(r.Text, "\n", "\r\n")))
+						u.app.post(func() { st.ScrollToBottom() })
+					}
+				} else {
+					u.app.post(func() { st.ScrollToBottom() })
+				}
+			})
 		}()
 	}
 
