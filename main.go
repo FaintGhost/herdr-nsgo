@@ -36,6 +36,7 @@ func Root(cx *core.Scope) core.Node {
 
 // RootWithApp builds the complete responsive 8-screen shell bound to app (also used by nsgotest).
 func RootWithApp(cx *core.Scope, app *App) core.Node {
+	registerAppFonts(cx)
 	u := &uiController{
 		app:             app,
 		activeTab:       core.NewSignal(cx, "home"),
@@ -281,7 +282,7 @@ func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 				Terminal:            key.Addr,
 				Observe:             obs,
 				ResizeNotifications: true,
-				History:             200,
+				History:             2000,
 				Cols:                cols,
 				Rows:                rows,
 			})
@@ -325,6 +326,39 @@ func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 			})
 		}()
 	}
+
+	var historyDepth atomic.Int32
+	historyDepth.Store(2000)
+	st.SetLoadMore(func() {
+		client := u.app.clientForKey(key)
+		if client == nil {
+			return
+		}
+		nextLines := int(historyDepth.Load()) * 2
+		if nextLines > 16000 {
+			nextLines = 16000
+		}
+		historyDepth.Store(int32(nextLines))
+		st.SetHistoryHint("正在加载更早历史…")
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+			defer cancel()
+			r, err := client.Read(ctx, key.Addr, nextLines)
+			if err != nil {
+				st.SetHistoryHint("加载失败，点此重试")
+				return
+			}
+			if r.Text != "" {
+				st.Screen().ReplaceHistory([]byte(strings.ReplaceAll(r.Text, "\n", "\r\n")))
+				st.bumpRevImmediate()
+			}
+			if r.Complete || nextLines >= 16000 {
+				st.SetHistoryHint("已加载全部可用历史")
+			} else {
+				st.SetHistoryHint("↑ 继续加载更早历史")
+			}
+		}()
+	})
 
 	st.SetReattach(attachWithMode)
 	u.activeTerm.Set(st)

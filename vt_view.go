@@ -31,6 +31,7 @@ type SessionTerminal struct {
 	ghostty      *terminal.Terminal
 	ghosttyIO    *sessionGhosttyBridge
 	reattachFn   func(observe bool, cols, rows int)
+	loadMoreFn   func()
 	pendingInput [][]byte
 	closed       bool
 	rawRing      bytes.Buffer
@@ -45,6 +46,7 @@ type SessionTerminal struct {
 	searchQuery *core.Signal[string]
 	searchIdx   *core.Signal[int]
 	diag        *core.Signal[string]
+	historyHint *core.Signal[string]
 	scrollRef   core.Ref
 	viewportW   float32
 	viewportH   float32
@@ -74,6 +76,7 @@ func NewSessionTerminal(cx *core.Scope, key TermKey, initialCols, initialRows in
 		st.searchQuery = core.NewSignal[string](cx, "")
 		st.searchIdx = core.NewSignal[int](cx, 0)
 		st.diag = core.NewSignal[string](cx, "正在接入终端流…")
+		st.historyHint = core.NewSignal[string](cx, "↑ 加载更早历史")
 	}
 
 	// Pre-seed immediately from LRU FrameCache for 0ms visual feedback before live attach arrives.
@@ -114,6 +117,31 @@ func (st *SessionTerminal) SetDiag(msg string) {
 		return
 	}
 	st.post(func() { st.diag.Set(msg) })
+}
+
+// SetLoadMore registers a callback to pull deeper scrollback history when user taps top loader.
+func (st *SessionTerminal) SetLoadMore(fn func()) {
+	st.mu.Lock()
+	st.loadMoreFn = fn
+	st.mu.Unlock()
+}
+
+// SetHistoryHint updates the top history loader button text ("" hides it).
+func (st *SessionTerminal) SetHistoryHint(msg string) {
+	if st.historyHint == nil {
+		return
+	}
+	st.post(func() { st.historyHint.Set(msg) })
+}
+
+// LoadMoreHistory triggers the registered deeper-history fetch callback.
+func (st *SessionTerminal) LoadMoreHistory() {
+	st.mu.Lock()
+	fn := st.loadMoreFn
+	st.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 // SetReattach registers a callback invoked when observe/active mode transitions require
@@ -657,7 +685,7 @@ func RenderSessionTerminal(
 					DarkTheme: chosenDark,
 					NoKeyBar:  true,
 					Font: core.Font{
-						Family: core.FontMonospace,
+						Family: vtFontFamily,
 						Size:   core.Points(getFontSize()),
 					},
 					Style:  core.Style{FlexGrow: 1},
@@ -712,6 +740,42 @@ func RenderSessionTerminal(
 										Color:      vtPalFn().Muted,
 										FontSize:   Tokens.FontCaption,
 										FontFamily: core.FontMonospace,
+									}
+								},
+							},
+						},
+					}
+				},
+			},
+			core.Show{
+				When: func() bool {
+					return st.historyHint != nil && st.historyHint.Get() != "" && (st.diag == nil || st.diag.Get() == "")
+				},
+				Then: func(cx *core.Scope) core.Node {
+					return core.View{
+						TestID: "vt-load-more-history",
+						Role:   core.RoleButton,
+						OnPress: func(core.PressEvent) {
+							st.LoadMoreHistory()
+						},
+						StyleFunc: func() core.Style {
+							pal := palFn()
+							return core.Style{
+								AlignItems:  core.AlignCenter,
+								Padding:     core.Symmetric(core.Points(6), Tokens.Space3),
+								Borders:     core.Edges{Bottom: 1},
+								BorderColor: pal.Separator,
+							}
+						},
+						Children: []core.Node{
+							core.Text{
+								ContentFunc: st.historyHint.Get,
+								StyleFunc: func() core.Style {
+									pal := palFn()
+									return core.Style{
+										Color:      pal.Accent,
+										FontSize:   Tokens.FontMonoMeta,
+										FontWeight: core.FontWeightSemibold,
 									}
 								},
 							},
@@ -803,7 +867,7 @@ func drawVTScreen(
 	d.SetTextAlign(core.TextAlignLeft)
 
 	baseFont := core.Font{
-		Family: core.FontMonospace,
+		Family: vtFontFamily,
 		Size:   core.Points(fontSize),
 	}
 

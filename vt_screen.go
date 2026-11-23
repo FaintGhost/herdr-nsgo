@@ -108,7 +108,7 @@ const (
 )
 
 const (
-	defaultMaxScrollback = 2000
+	defaultMaxScrollback = 5000
 	maxVTSeqBytes        = 4096
 )
 
@@ -345,6 +345,28 @@ func resizeVTGrid(old [][]VTCell, cols, rows int) [][]VTCell {
 		}
 	}
 	return ng
+}
+
+// ReplaceHistory resets the main screen & scrollback with a deeper plain-text snapshot
+// fetched from terminal.read while preserving dimensions and bumping revision.
+func (s *VTScreen) ReplaceHistory(raw []byte) {
+	s.mu.Lock()
+	s.scrollback = nil
+	s.inAlt = false
+	s.mainGrid = nil
+	s.grid = makeVTGrid(s.cols, s.rows, VTStyle{})
+	s.curCol, s.curRow = 0, 0
+	s.pendingWrap = false
+	s.style = VTStyle{}
+	s.state = vtStateGround
+	s.csiBuf = s.csiBuf[:0]
+	s.oscBuf = s.oscBuf[:0]
+	s.utf8Buf = s.utf8Buf[:0]
+	for _, b := range raw {
+		s.feedByte(b)
+	}
+	s.seq++
+	s.mu.Unlock()
 }
 
 // Write feeds raw VT byte output into the screen emulator.
