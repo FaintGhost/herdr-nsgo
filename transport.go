@@ -29,19 +29,16 @@ func (c *conn) Close() error {
 	return err
 }
 
-// dialSSH runs `hc connect` on the far side. Everything the core sends
-// arrives on this session's stdout, so no port has to be open.
-func dialSSH(h Host) (io.ReadWriteCloser, error) {
+// dialSSH runs `hc connect` on the far side using TOFU host key pinning.
+func dialSSH(h Host, tofu *TOFUStore) (io.ReadWriteCloser, error) {
 	auth, err := authFor(h)
 	if err != nil {
 		return nil, err
 	}
 	cfg := &ssh.ClientConfig{
-		User: h.User,
-		Auth: auth,
-		// Moshi pins nothing until a person decides to; we do the same and
-		// say so in the README.
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		User:            h.User,
+		Auth:            auth,
+		HostKeyCallback: NewTOFUCallback(tofu, h.EffectiveID(), h.PinnedFP),
 		Timeout:         15 * time.Second,
 	}
 	addr := withPort(h.Target)
@@ -102,14 +99,13 @@ func authFor(h Host) ([]ssh.AuthMethod, error) {
 	if h.Password != "" {
 		return []ssh.AuthMethod{ssh.Password(h.Password)}, nil
 	}
-	return nil, errors.New("没有凭据：填密码，或粘贴一个 OpenSSH 私钥")
+	return nil, errors.New("没有凭据：填密码，或使用本机 SSH 密钥 / 粘贴 OpenSSH 私钥")
 }
 
 // normalizeKey rebuilds a key whose newlines a paste or a form dropped:
 // a bare base64 body gets its header, footer and 70-column lines back.
 func normalizeKey(key string) string {
 	if strings.Contains(key, "-----BEGIN") {
-		// Keep the body's lines but repair a single long line.
 		lines := strings.Split(key, "\n")
 		for i, l := range lines {
 			if len(l) > 70 && !strings.Contains(l, "-----") {
@@ -162,13 +158,17 @@ func dialLocal() (io.ReadWriteCloser, error) {
 	}, nil
 }
 
-// Dial opens the transport a host names: "local" runs hc here, anything else
-// is an SSH target like "vps.example.com:22".
-func Dial(h Host) (io.ReadWriteCloser, error) {
+// DialWithTOFU opens the transport a host names using tofu host-key verification.
+func DialWithTOFU(h Host, tofu *TOFUStore) (io.ReadWriteCloser, error) {
 	if h.Target == "" || h.Target == "local" {
 		return dialLocal()
 	}
-	return dialSSH(h)
+	return dialSSH(h, tofu)
+}
+
+// Dial opens the transport a host names using an ephemeral TOFU store.
+func Dial(h Host) (io.ReadWriteCloser, error) {
+	return DialWithTOFU(h, nil)
 }
 
 // readWrite pairs a reader and a writer into one stream.
