@@ -501,7 +501,7 @@ func RenderSessionTerminal(cx *core.Scope, st *SessionTerminal, pal Palette, vtP
 			chosenLight = darkTh
 		}
 		return core.View{
-			TestID: "vt-surface-ghostty",
+			TestID: "vt-surface",
 			Style: core.Style{
 				FlexGrow:   1,
 				Background: vtPal.Bg,
@@ -537,7 +537,7 @@ func RenderSessionTerminal(cx *core.Scope, st *SessionTerminal, pal Palette, vtP
 
 	return core.Scroll{
 		Ref:           &st.scrollRef,
-		TestID:        "vt-surface-canvas-scroll",
+		TestID:        "vt-surface",
 		MinZoomScale:  0.7,
 		MaxZoomScale:  2.2,
 		HideIndicator: false,
