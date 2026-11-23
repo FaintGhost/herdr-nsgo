@@ -44,6 +44,7 @@ type SessionTerminal struct {
 	scrolledUp  *core.Signal[bool]
 	searchQuery *core.Signal[string]
 	searchIdx   *core.Signal[int]
+	diag        *core.Signal[string]
 	scrollRef   core.Ref
 	viewportW   float32
 	viewportH   float32
@@ -72,6 +73,7 @@ func NewSessionTerminal(cx *core.Scope, key TermKey, initialCols, initialRows in
 		st.scrolledUp = core.NewSignal[bool](cx, false)
 		st.searchQuery = core.NewSignal[string](cx, "")
 		st.searchIdx = core.NewSignal[int](cx, 0)
+		st.diag = core.NewSignal[string](cx, "正在接入终端流…")
 	}
 
 	// Pre-seed immediately from LRU FrameCache for 0ms visual feedback before live attach arrives.
@@ -104,6 +106,14 @@ func NewSessionTerminal(cx *core.Scope, key TermKey, initialCols, initialRows in
 
 	st.bumpRevImmediate()
 	return st
+}
+
+// SetDiag updates the subtle loading/diagnostic status shown while the VT screen has no bytes yet.
+func (st *SessionTerminal) SetDiag(msg string) {
+	if st.diag == nil {
+		return
+	}
+	st.post(func() { st.diag.Set(msg) })
 }
 
 // SetReattach registers a callback invoked when observe/active mode transitions require
@@ -169,6 +179,9 @@ func (st *SessionTerminal) Attach(stream *AttachStream, cols, rows int) {
 		st.bumpRev()
 	})
 
+	// Grant initial flow-control credit so credit-gated cores begin streaming immediately.
+	_ = stream.SendCredit(65536)
+
 	go st.readLoop(stream)
 }
 
@@ -180,6 +193,7 @@ func (st *SessionTerminal) readLoop(stream *AttachStream) {
 			chunk := make([]byte, n)
 			copy(chunk, buf[:n])
 			st.Feed(chunk)
+			_ = stream.SendCredit(uint32(n))
 		}
 		if err != nil {
 			return
@@ -208,6 +222,7 @@ func (st *SessionTerminal) Feed(data []byte) {
 		gt.Feed(data)
 	}
 	if firstFrame {
+		st.SetDiag("")
 		st.bumpRevImmediate()
 	} else {
 		st.bumpRev()
@@ -682,8 +697,31 @@ func RenderSessionTerminal(
 			st.scrolledUp.Set(distFromBottom > 60)
 		},
 		Children: []core.Node{
+			core.Show{
+				When: func() bool {
+					return st.diag != nil && st.diag.Get() != ""
+				},
+				Then: func(cx *core.Scope) core.Node {
+					return core.View{
+						Style: core.Style{Padding: core.Symmetric(Tokens.Space2, Tokens.Space3)},
+						Children: []core.Node{
+							core.Text{
+								ContentFunc: st.diag.Get,
+								StyleFunc: func() core.Style {
+									return core.Style{
+										Color:      vtPalFn().Muted,
+										FontSize:   Tokens.FontCaption,
+										FontFamily: core.FontMonospace,
+									}
+								},
+							},
+						},
+					}
+				},
+			},
 			core.Scroll{
 				Horizontal: true,
+				NoShrink:   true,
 				TestID:     "vt-surface-hscroll",
 				StyleFunc: func() core.Style {
 					return core.Style{Background: vtPalFn().Bg}

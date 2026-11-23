@@ -242,25 +242,29 @@ func RootWithApp(cx *core.Scope, app *App) core.Node {
 }
 
 // openSession attaches to key (in observe mode by default), pre-seeding from LRU FrameCache.
-func (u *uiController) openSession(cx *core.Scope, key TermKey) {
+// Always binds SessionTerminal signals to the root app scope (u.app.cx), never an ephemeral
+// row/button child scope that gets disposed when switching from Home/Inbox to Session.
+func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 	if prev := u.activeTerm.Get(); prev != nil {
 		prev.Close()
 		u.activeTerm.Set(nil)
 	}
 	u.activeSession.Set(key)
 
+	rootCX := u.app.cx
 	var cache *FrameCache
 	if u.app.frameCacheOn.Get() {
 		cache = u.app.cache
 	}
-	enableGhostty := cx != nil && !cx.Env().Simulated()
+	enableGhostty := rootCX != nil && !rootCX.Env().Simulated()
 	observe := u.app.observeDefault.Get()
-	st := NewSessionTerminal(cx, key, 100, 32, observe, cache, enableGhostty)
+	st := NewSessionTerminal(rootCX, key, 100, 32, observe, cache, enableGhostty)
 
 	attachWithMode := func(obs bool, cols, rows int) {
 		gen := u.attachGen.Add(1)
 		client := u.app.clientForKey(key)
 		if client == nil {
+			st.SetDiag("实例未在线（client=nil），等待重连…")
 			return
 		}
 		if cols <= 0 {
@@ -269,6 +273,7 @@ func (u *uiController) openSession(cx *core.Scope, key TermKey) {
 		if rows <= 0 {
 			rows = 32
 		}
+		st.SetDiag("正在连接 " + key.Addr + "…")
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 			defer cancel()
@@ -281,12 +286,13 @@ func (u *uiController) openSession(cx *core.Scope, key TermKey) {
 				Rows:                rows,
 			})
 			if err != nil {
-				// Fallback to terminal.read snapshot if attach is unavailable (e.g., finished or unframed core).
+				st.SetDiag("attach 失败，尝试读取快照：" + err.Error())
 				if r, rerr := client.Read(ctx, key.Addr, 200); rerr == nil && r.Text != "" {
 					st.Feed([]byte(strings.ReplaceAll(r.Text, "\n", "\r\n")))
 					u.app.post(func() { st.ScrollToBottom() })
 					return
 				}
+				st.SetDiag("无法接入终端流：" + explain(err))
 				u.app.notifyToast("无法接入终端流：" + explain(err))
 				return
 			}
@@ -304,9 +310,14 @@ func (u *uiController) openSession(cx *core.Scope, key TermKey) {
 				if strings.TrimSpace(st.Screen().VisibleText()) == "" {
 					rctx, rcancel := context.WithTimeout(context.Background(), 6*time.Second)
 					defer rcancel()
-					if r, rerr := client.Read(rctx, key.Addr, 200); rerr == nil && r.Text != "" {
+					r, rerr := client.Read(rctx, key.Addr, 200)
+					if rerr == nil && r.Text != "" {
 						st.Feed([]byte(strings.ReplaceAll(r.Text, "\n", "\r\n")))
 						u.app.post(func() { st.ScrollToBottom() })
+					} else if rerr != nil {
+						st.SetDiag("已接入流，但读取初始快照失败：" + rerr.Error())
+					} else {
+						st.SetDiag("已接入流（当前屏幕无输出）")
 					}
 				} else {
 					u.app.post(func() { st.ScrollToBottom() })
