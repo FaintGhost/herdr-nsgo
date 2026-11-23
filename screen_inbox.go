@@ -38,7 +38,7 @@ func (u *uiController) inboxScreen(cx *core.Scope) core.Node {
 					pal := a.paletteOf(cx)
 					return core.Style{
 						Background:  pal.Surface,
-						Padding:     core.Symmetric(Tokens.PagePadX, Tokens.Space2),
+						Padding:     core.Symmetric(Tokens.Space2, Tokens.PagePadX),
 						Borders:     core.Edges{Bottom: 1},
 						BorderColor: pal.Separator,
 					}

@@ -85,7 +85,7 @@ func StatusBadge(cx *core.Scope, a *App, stateFn func() string) core.Node {
 				FlexShrink:   0,
 				Background:   soft,
 				CornerRadius: Tokens.RadiusKey,
-				Padding:      core.Symmetric(Tokens.Space2, core.Points(3)),
+				Padding:      core.Symmetric(core.Points(3), Tokens.Space2),
 				AlignItems:   core.AlignCenter,
 			}
 		},
@@ -156,8 +156,8 @@ func ActionButtonFunc(cx *core.Scope, a *App, testID string, textFn func() strin
 			}
 			return core.Style{
 				FlexShrink:     0,
-				MinHeight:      core.Pt(Tokens.SizeTouch),
-				Padding:        core.Symmetric(core.Points(14), Tokens.Space2),
+				MinHeight:      core.Pt(38),
+				Padding:        core.Symmetric(Tokens.Space2, core.Points(14)),
 				CornerRadius:   Tokens.RadiusCtrl,
 				Background:     bg,
 				BorderWidth:    bw,
@@ -266,8 +266,8 @@ func FilterPill(cx *core.Scope, a *App, testID string, labelFn func() string, ac
 				Direction:      core.Row,
 				AlignItems:     core.AlignCenter,
 				Gap:            core.Points(6),
-				MinHeight:      core.Pt(32),
-				Padding:        core.Symmetric(Tokens.Space3, core.Points(5)),
+				MinHeight:      core.Pt(30),
+				Padding:        core.Symmetric(core.Points(5), Tokens.Space3),
 				CornerRadius:   Tokens.RadiusCtrl,
 				Background:     bg,
 				BorderWidth:    1,
@@ -387,11 +387,12 @@ func SessionRow(cx *core.Scope, a *App, itemFn func() AggregatedTerminal, select
 				Style: core.Style{
 					FlexGrow:   1,
 					FlexShrink: 1,
-					Padding:    core.Symmetric(Tokens.Space3, core.Points(11)),
+					MinWidth:   core.Pt(0),
+					Padding:    core.Symmetric(core.Points(10), Tokens.Space3),
 					Gap:        core.Points(4),
 				},
 				Children: []core.Node{
-					// Top row: Session name + instance chip + state badge
+					// Top row: Session name (1-line ellipsized) + StatusBadge (never collides)
 					core.View{
 						Style: core.Style{
 							Direction:      core.Row,
@@ -400,62 +401,27 @@ func SessionRow(cx *core.Scope, a *App, itemFn func() AggregatedTerminal, select
 							Gap:            Tokens.Space2,
 						},
 						Children: []core.Node{
-							core.View{
-								Style: core.Style{
-									Direction:  core.Row,
-									AlignItems: core.AlignCenter,
-									Gap:        Tokens.Space2,
-									FlexShrink: 1,
-								},
-								Children: []core.Node{
-									core.Text{
-										ContentFunc: func() string { return itemFn().Terminal.Label() },
-										StyleFunc: func() core.Style {
-											pal := a.paletteOf(cx)
-											return core.Style{
-												Color:      pal.Text,
-												FontSize:   Tokens.FontRowTitle,
-												FontWeight: core.FontWeightSemibold,
-											}
-										},
-									},
-									core.View{
-										StyleFunc: func() core.Style {
-											pal := a.paletteOf(cx)
-											return core.Style{
-												FlexShrink:   0,
-												Background:   pal.SurfaceRaised,
-												CornerRadius: Tokens.RadiusKey,
-												Padding:      core.Symmetric(core.Points(6), core.Points(2)),
-											}
-										},
-										Children: []core.Node{
-											core.Text{
-												ContentFunc: func() string {
-													it := itemFn()
-													if it.Relayed {
-														return it.InstanceName + " · 中继"
-													}
-													return it.InstanceName
-												},
-												StyleFunc: func() core.Style {
-													pal := a.paletteOf(cx)
-													return core.Style{
-														Color:      pal.TextSecondary,
-														FontSize:   Tokens.FontMonoMeta,
-														FontFamily: core.FontMonospace,
-													}
-												},
-											},
-										},
-									},
+							core.Text{
+								MaxLines:    1,
+								ContentFunc: func() string { return itemFn().Terminal.Label() },
+								StyleFunc: func() core.Style {
+									pal := a.paletteOf(cx)
+									return core.Style{
+										FlexGrow:   1,
+										FlexShrink: 1,
+										MinWidth:   core.Pt(0),
+										Color:      pal.Text,
+										FontSize:   Tokens.FontRowTitle,
+										FontWeight: core.FontWeightSemibold,
+									}
 								},
 							},
 							StatusBadge(cx, a, func() string { return itemFn().Terminal.StateWord() }),
 						},
 					},
-					// Second line: Semantic message / last output
+					// Second line: Semantic message / last output (max 2 lines)
 					core.Text{
+						MaxLines: 2,
 						ContentFunc: func() string {
 							it := itemFn()
 							return firstLine(it.Terminal.Status, it.Terminal)
@@ -468,26 +434,71 @@ func SessionRow(cx *core.Scope, a *App, itemFn func() AggregatedTerminal, select
 							}
 						},
 					},
-					// Third line: Mono metadata (addr · app · cwd)
-					core.Text{
-						ContentFunc: func() string {
-							it := itemFn()
-							parts := []string{it.Key.Addr}
-							if app := it.Terminal.AppName(); app != "" {
-								parts = append(parts, app)
-							}
-							if d := shortPath(it.Terminal.CurrentDir()); d != "" {
-								parts = append(parts, d)
-							}
-							return strings.Join(parts, " · ")
+					// Third line: Instance chip + mono metadata (addr · app · cwd)
+					core.View{
+						Style: core.Style{
+							Direction:  core.Row,
+							AlignItems: core.AlignCenter,
+							Gap:        core.Points(6),
+							Margin:     core.Edges{Top: 2},
 						},
-						StyleFunc: func() core.Style {
-							pal := a.paletteOf(cx)
-							return core.Style{
-								Color:      pal.TextMuted,
-								FontSize:   Tokens.FontMonoMeta,
-								FontFamily: core.FontMonospace,
-							}
+						Children: []core.Node{
+							core.View{
+								StyleFunc: func() core.Style {
+									pal := a.paletteOf(cx)
+									return core.Style{
+										FlexShrink:   0,
+										Background:   pal.SurfaceRaised,
+										CornerRadius: core.Points(4),
+										Padding:      core.Symmetric(core.Points(2), core.Points(6)),
+									}
+								},
+								Children: []core.Node{
+									core.Text{
+										MaxLines: 1,
+										ContentFunc: func() string {
+											it := itemFn()
+											if it.Relayed {
+												return it.InstanceName + " · 中继"
+											}
+											return it.InstanceName
+										},
+										StyleFunc: func() core.Style {
+											pal := a.paletteOf(cx)
+											return core.Style{
+												Color:      pal.TextSecondary,
+												FontSize:   core.Points(10.5),
+												FontFamily: core.FontMonospace,
+											}
+										},
+									},
+								},
+							},
+							core.Text{
+								MaxLines: 1,
+								ContentFunc: func() string {
+									it := itemFn()
+									parts := []string{it.Key.Addr}
+									if app := it.Terminal.AppName(); app != "" {
+										parts = append(parts, app)
+									}
+									if d := shortPath(it.Terminal.CurrentDir()); d != "" {
+										parts = append(parts, d)
+									}
+									return strings.Join(parts, " · ")
+								},
+								StyleFunc: func() core.Style {
+									pal := a.paletteOf(cx)
+									return core.Style{
+										FlexGrow:   1,
+										FlexShrink: 1,
+										MinWidth:   core.Pt(0),
+										Color:      pal.TextMuted,
+										FontSize:   Tokens.FontMonoMeta,
+										FontFamily: core.FontMonospace,
+									}
+								},
+							},
 						},
 					},
 				},
@@ -506,14 +517,12 @@ func InlineApprovalCard(cx *core.Scope, a *App, itemFn func() AggregatedTerminal
 		TestID: "attention-card-" + keyStr,
 		StyleFunc: func() core.Style {
 			pal := a.paletteOf(cx)
-			it := itemFn()
-			fg, _, _ := stateColor(pal, it.Terminal.StateWord())
 			return core.Style{
 				Direction:    core.Row,
 				Background:   pal.Surface,
 				CornerRadius: Tokens.RadiusCard,
 				BorderWidth:  1,
-				BorderColor:  fg,
+				BorderColor:  pal.Border,
 				Overflow:     core.Hidden,
 			}
 		},
@@ -527,9 +536,11 @@ func InlineApprovalCard(cx *core.Scope, a *App, itemFn func() AggregatedTerminal
 			},
 			core.View{
 				Style: core.Style{
-					FlexGrow: 1,
-					Padding:  core.All(Tokens.Space3),
-					Gap:      Tokens.Space2,
+					FlexGrow:   1,
+					FlexShrink: 1,
+					MinWidth:   core.Pt(0),
+					Padding:    core.All(Tokens.Space3),
+					Gap:        Tokens.Space2,
 				},
 				Children: []core.Node{
 					core.View{
@@ -541,6 +552,7 @@ func InlineApprovalCard(cx *core.Scope, a *App, itemFn func() AggregatedTerminal
 						},
 						Children: []core.Node{
 							core.Text{
+								MaxLines: 1,
 								ContentFunc: func() string {
 									it := itemFn()
 									return fmt.Sprintf("%s · %s", it.Terminal.Label(), it.InstanceName)
@@ -548,6 +560,9 @@ func InlineApprovalCard(cx *core.Scope, a *App, itemFn func() AggregatedTerminal
 								StyleFunc: func() core.Style {
 									pal := a.paletteOf(cx)
 									return core.Style{
+										FlexGrow:   1,
+										FlexShrink: 1,
+										MinWidth:   core.Pt(0),
 										Color:      pal.Text,
 										FontSize:   Tokens.FontRowTitle,
 										FontWeight: core.FontWeightSemibold,
@@ -562,7 +577,7 @@ func InlineApprovalCard(cx *core.Scope, a *App, itemFn func() AggregatedTerminal
 										FlexShrink:   0,
 										Background:   soft,
 										CornerRadius: Tokens.RadiusKey,
-										Padding:      core.Symmetric(Tokens.Space2, core.Points(3)),
+										Padding:      core.Symmetric(core.Points(3), Tokens.Space2),
 									}
 								},
 								Children: []core.Node{
@@ -583,6 +598,7 @@ func InlineApprovalCard(cx *core.Scope, a *App, itemFn func() AggregatedTerminal
 						},
 					},
 					core.Text{
+						MaxLines: 2,
 						ContentFunc: func() string {
 							it := itemFn()
 							return firstLine(it.Terminal.Status, it.Terminal)
@@ -591,7 +607,7 @@ func InlineApprovalCard(cx *core.Scope, a *App, itemFn func() AggregatedTerminal
 							pal := a.paletteOf(cx)
 							return core.Style{
 								Color:    pal.TextSecondary,
-								FontSize: Tokens.FontBody,
+								FontSize: Tokens.FontCaption,
 							}
 						},
 					},
@@ -680,7 +696,7 @@ func KeycapBar(cx *core.Scope, a *App, items []KeycapItem) core.Node {
 					FlexShrink:     0,
 					MinHeight:      core.Pt(Tokens.SizeKey),
 					MinWidth:       core.Pt(40),
-					Padding:        core.Symmetric(core.Points(10), core.Points(6)),
+					Padding:        core.Symmetric(core.Points(6), core.Points(10)),
 					CornerRadius:   Tokens.RadiusKey,
 					Background:     bg,
 					BorderWidth:    1,
@@ -729,7 +745,7 @@ func KeycapBar(cx *core.Scope, a *App, items []KeycapItem) core.Node {
 				Style: core.Style{
 					Direction: core.Row,
 					Gap:       core.Points(6),
-					Padding:   core.Symmetric(Tokens.Space3, core.Points(6)),
+					Padding:   core.Symmetric(core.Points(6), Tokens.Space3),
 				},
 				Children: nodes,
 			},
@@ -744,10 +760,13 @@ func TopHeader(cx *core.Scope, a *App, titleFn func() string, left core.Node, ri
 		leftChildren = append(leftChildren, left)
 	}
 	leftChildren = append(leftChildren, core.Text{
+		MaxLines:    1,
 		ContentFunc: titleFn,
 		StyleFunc: func() core.Style {
 			pal := a.paletteOf(cx)
 			return core.Style{
+				FlexShrink: 1,
+				MinWidth:   core.Pt(0),
 				Color:      pal.Text,
 				FontSize:   Tokens.FontNav,
 				FontWeight: core.FontWeightBold,
@@ -772,7 +791,7 @@ func TopHeader(cx *core.Scope, a *App, titleFn func() string, left core.Node, ri
 					AlignItems:     core.AlignCenter,
 					JustifyContent: core.JustifySpaceBetween,
 					MinHeight:      core.Pt(Tokens.SizeTopbar),
-					Padding:        core.Symmetric(Tokens.PagePadX, core.Points(6)),
+					Padding:        core.Symmetric(core.Points(6), Tokens.PagePadX),
 					Gap:            Tokens.Space2,
 				},
 				Children: []core.Node{
@@ -781,7 +800,9 @@ func TopHeader(cx *core.Scope, a *App, titleFn func() string, left core.Node, ri
 							Direction:  core.Row,
 							AlignItems: core.AlignCenter,
 							Gap:        Tokens.Space2,
+							FlexGrow:   1,
 							FlexShrink: 1,
+							MinWidth:   core.Pt(0),
 						},
 						Children: leftChildren,
 					},
@@ -950,8 +971,8 @@ func ToastBanner(cx *core.Scope, a *App) core.Node {
 						BorderColor:    pal.Accent,
 						BorderWidth:    1,
 						CornerRadius:   Tokens.RadiusCtrl,
-						Padding:        core.Symmetric(Tokens.Space3, Tokens.Space2),
-						Margin:         core.Symmetric(Tokens.PagePadX, Tokens.Space1),
+						Padding:        core.Symmetric(Tokens.Space2, Tokens.Space3),
+						Margin:         core.Symmetric(Tokens.Space1, Tokens.PagePadX),
 					}
 				},
 				Children: []core.Node{
@@ -971,7 +992,7 @@ func ToastBanner(cx *core.Scope, a *App) core.Node {
 						OnPress: func(core.PressEvent) {
 							a.toastMsg.Set("")
 						},
-						Style: core.Style{FlexShrink: 0, Padding: core.Symmetric(Tokens.Space2, core.Points(2))},
+						Style: core.Style{FlexShrink: 0, Padding: core.Symmetric(core.Points(2), Tokens.Space2)},
 						Children: []core.Node{
 							core.Text{
 								Content: "知道了",
@@ -1007,7 +1028,7 @@ func TabBar(cx *core.Scope, a *App, activeTab *core.Signal[string]) core.Node {
 				AlignItems:     core.AlignCenter,
 				JustifyContent: core.JustifyCenter,
 				Gap:            core.Points(3),
-				Padding:        core.Symmetric(core.Points(4), core.Points(6)),
+				Padding:        core.Symmetric(core.Points(6), core.Points(4)),
 			},
 			Children: []core.Node{
 				core.View{
@@ -1035,9 +1056,12 @@ func TabBar(cx *core.Scope, a *App, activeTab *core.Signal[string]) core.Node {
 									StyleFunc: func() core.Style {
 										pal := a.paletteOf(cx)
 										return core.Style{
-											Background:   pal.Warn,
-											CornerRadius: Tokens.RadiusKey,
-											Padding:      core.Symmetric(core.Points(5), core.Points(1)),
+											Background:     pal.Warn,
+											CornerRadius:   core.Points(9),
+											MinWidth:       core.Pt(18),
+											Padding:        core.Symmetric(core.Points(1), core.Points(6)),
+											AlignItems:     core.AlignCenter,
+											JustifyContent: core.JustifyCenter,
 										}
 									},
 									Children: []core.Node{

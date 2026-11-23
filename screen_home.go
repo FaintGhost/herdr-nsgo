@@ -65,7 +65,7 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 						Style: core.Style{
 							Direction: core.Row,
 							Gap:       Tokens.Space2,
-							Padding:   core.Symmetric(Tokens.PagePadX, Tokens.Space2),
+							Padding:   core.Symmetric(Tokens.Space2, Tokens.PagePadX),
 						},
 						Children: []core.Node{
 							FilterPill(cx, a, "pill-all", func() string {
@@ -110,7 +110,7 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 							pal := a.paletteOf(cx)
 							return core.Style{
 								Background:  pal.Surface,
-								Padding:     core.Symmetric(Tokens.PagePadX, Tokens.Space2),
+								Padding:     core.Symmetric(Tokens.Space2, Tokens.PagePadX),
 								Borders:     core.Edges{Bottom: 1},
 								BorderColor: pal.Separator,
 							}
