@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "threads": [
+    {
+      "id": "Q7bxQVuNH9",
+      "anchor": {
+        "blockId": "KglIssKW",
+        "quote": "",
+        "ask": "approve",
+        "choice": "approve",
+        "answer": null
+      },
+      "status": "open",
+      "statusAt": "2026-11-24T00:32:10.456Z",
+      "statusBy": "human",
+      "messages": [
+        {
+          "id": "DMIXFFyx5r",
+          "author": "human",
+          "name": "FaintGhost",
+          "avatar": "/api/avatar/gravatar/0a71a9e22f646972aa749a616750e3639027deb5215bb61739850b8fae3f55e9",
+          "text": "approve",
+          "at": "2026-11-24T00:32:10.456Z"
+        }
+      ]
+    },
+    {
+      "id": "Ctrh18x4wd",
+      "anchor": {
+        "blockId": "*",
+        "quote": "",
+        "submit": true,
+        "asks": [
+          "approve"
+        ]
+      },
+      "status": "open",
+      "statusAt": "2026-11-24T00:32:10.480Z",
+      "statusBy": "human",
+      "messages": [
+        {
+          "id": "frkaOy9xOz",
+          "author": "human",
+          "name": "FaintGhost",
+          "avatar": "/api/avatar/gravatar/0a71a9e22f646972aa749a616750e3639027deb5215bb61739850b8fae3f55e9",
+          "text": "Submitted the answers",
+          "at": "2026-11-24T00:32:10.480Z"
+        }
+      ]
+    },
+    {
+      "id": "lsNTD7Olii",
+      "anchor": {
+        "blockId": "KglIssKW",
+        "quote": "",
+        "ask": "approve",
+        "note": true
+      },
+      "status": "open",
+      "statusAt": "2026-11-24T00:33:58.770Z",
+      "statusBy": "agent",
+      "messages": [
+        {
+          "id": "PEEcUMa_IM",
+          "author": "agent",
+          "name": "Antigravity",
+          "text": "已确认通过书面设计规范，写入 docs/ryugi/specs/2026-11-24-herdr-chat-view-design.md 并开始按规范执行实现。",
+          "at": "2026-11-24T00:33:58.770Z"
+        }
+      ]
+    }
+  ]
+}

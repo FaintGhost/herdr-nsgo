@@ -1,0 +1,179 @@
+<doc>
+  <h1 id="ZhyjZUVy">herdr-nsgo Chat View（原生会话日志直读 + 终端流兜底）书面设计规范</h1>
+  <p id="HJ4uZeFZ">在保留现有真 2D VT 终端视图（<code>SessionTerminal</code>）完整性的前提下，为 <code>herdr-nsgo</code> 新增面向手机竖屏阅读与操控的 <b>Chat View（会话聊天视图）</b>：优先通过 <code>herdr-core</code> 远端读取 Claude Code、OMP / Pi、Codex、Antigravity 的原生结构化会话 JSONL 日志，无法匹配时自动无感回退至终端流智能重排解析，并支持顶栏一键无损互切。</p>
+  <h2 id="lNmQLyKZ">1. 意图与背景（Intent &amp; Why）</h2>
+  <p id="iBP1BC7X">桌面端 Agent 会话通常运行在 140–200 列的宽屏 PTY 中（包含分栏状态条、竖线边框与底部快捷键栏）。在手机竖屏（约 58 列）下：若保持真 2D 网格（<code>observe</code> 模式），阅读长篇分析与代码需要频繁左右平移；若强行对 VT 网格做本地软换行，则会折断 TUI 竖线框与底栏。因此需要独立于 VT 网格的 <b>Chat View</b>，直接拿到干净的对话轮次、思维链、代码块与折叠工具调用，同时共享同一条实时会话状态与输入通道。</p>
+  <h2 id="0_TGb0N-">2. 已敲定决策（Settled Decisions）</h2>
+  <ul id="FkNAcpTL">
+    <li><b>数据源路线（你已拍板：路线 2 · 深度原生版）</b>：优先通过 <code>herdr-core</code> 的 <code>file.read</code> / <code>machine.exec</code> 读取远端 Harness 原生结构化会话 JSONL 日志（完整长历史、思维链、精确工具入参/出参）；未命中或普通命令行程序自动回退到终端流（VT / <code>terminal.read</code>）解析重排。</li>
+    <li><b>顶栏分段切换与默认视图（设计者拍板）</b>：会话页顶栏提供 <code>聊天 | 终端</code> 分段胶囊（<code>id:session-mode-chat</code> / <code>id:session-mode-vt</code>）。识别为 Agent（Claude Code / Codex / OMP / Pi / Antigravity / OpenCode / Aider）的会话首次进入默认打开「聊天」视图；纯 Shell（<code>zsh</code> / <code>bash</code> / <code>fish</code> / <code>sh</code>）默认打开「终端」视图；用户在单个会话内手动切换后，在当前 App 会话期内记住该会话的视图偏好。</li>
+    <li><b>手机重排对话流结构（设计者拍板）</b>：用户消息采用右对齐青色细框浅底卡片；Agent 回复采用左对齐 3px 语义色竖线卡片，支持段落重排、列表、行内代码与独立等宽代码块（附「复制代码」按钮）；思维链（<code>thinking</code>）与工具调用（<code>Read</code> / <code>Edit</code> / <code>Bash</code> 等）默认折叠为单行紧凑胶囊，点击展开查看详情，避免刷屏。</li>
+    <li><b>实时状态、内联审批与极简底栏（设计者拍板）</b>：对话流底部常驻当前 OSC 7501 实时状态条（如 <code>执行中 · Rerunning failed tag CI jobs</code>）；当会话进入 <code>blocked</code> / <code>error</code> 时直接在对话流底部嵌入现有 <code>InlineApprovalCard</code>（命中安全白名单的 <code>permission</code> 显示一键「允许 / 拒绝」，其余复杂交互显示「切到终端处理」）；聊天模式下自动收起 <code>Esc / Tab / ^C</code> 等终端键帽栏，仅保留输入框、发图、常用短语与「发送 / 中断」按钮。</li>
+  </ul>
+  <h2 id="BH0BvbZl">3. 目标、非目标与反目标</h2>
+  <h3 id="W7Jcy6BR">目标（Goals）</h3>
+  <ul id="dEAJcz4m">
+    <li><b>跨本地与联邦远端机器的原生 JSONL 直读</b>：复用现有单条 <code>framed</code> 连接调用 <code>file.read</code> 与按需 <code>machine.exec</code>（自动识别如 <code>kr/t12</code>、<code>us-contabo/t5</code> 的远端 <code>on: &quot;kr&quot;</code> 路由参数），无需额外建立第二条 SSH 连接。</li>
+    <li><b>四大主力 Harness 原生适配器 + 通用终端兜底</b>：原生支持实测在线的 <b>Claude Code</b>（<code>~/.claude</code>）、<b>OMP &amp; Pi</b>（<code>~/.omp</code> / <code>~/.pi</code>）、<b>Antigravity</b>（<code>~/.gemini/antigravity-cli/brain</code>）与 <b>Codex</b>（<code>~/.codex/sessions</code>）；未命中时无缝回退至 VT 屏幕 + 历史缓冲区的对话块提取器。</li>
+    <li><b>5G 弱网友好的增量分页读取</b>：首次打开仅拉取尾部最近窗口（默认尾部 250 行 JSONL），顶部提供 <code>↑ 加载更早对话</code> 按需向前翻页；会话运行中通过行号偏移（<code>file.read(offset: lastLine+1)</code>）增量追尾，绝不全量重传数 MB 日志。</li>
+    <li><b>乐观发送回显（Optimistic Echo）</b>：用户在 Chat View 发送消息后立即在对话流尾部显示该条用户消息，待远端 JSONL 落盘追平后按内容与时间戳自动去重合并，消除网络往返空白期。</li>
+    <li><b>严格遵循 Crisp Slate 设计系统</b>：亮暗双主题全复用 <code>theme.go</code> 语义 Token，保持 <code>TestNoRawColorsInScreens</code> 与 <code>TestPaletteWCAGContrast</code> 100% 通过。</li>
+  </ul>
+  <h3 id="y1UgYQKn">非目标（Non-Goals）</h3>
+  <ul id="ZeCbWs_C">
+    <li>不在客户端直接改写或删除远端 Agent 的 <code>.jsonl</code> 会话日志文件（严格只读）。</li>
+    <li>不引入重型 WebView / HTML 富文本引擎渲染 Markdown——采用纯 Go + NSGo 原生组件解析渲染标题、段落、列表、引用与等宽代码块，确保 60fps 滚动流畅度与零额外包体积膨胀。</li>
+    <li>不支持在 Chat View 内直接做交互式全屏 TUI 菜单上下键点选（此类交互统一由底部提示卡一键切回「终端」视图完成）。</li>
+  </ul>
+  <h3 id="PvheFfZq">反目标（Anti-Goals）</h3>
+  <ul id="qwHBOqzw">
+    <li>绝不在每次 UI 刷新或每秒轮询时反复执行 <code>machine.exec</code> Shell 子进程：会话文件路径一旦解析命中即按 <code>TermKey</code> 缓存，后续增量更新仅走轻量级纯 RPC <code>file.read(offset, limit)</code>。</li>
+    <li>绝不因远端日志文件不存在、权限受限或单行 JSON 截断而白屏报错：任何读取异常均静默降级至终端流解析或展示当前 <code>Status</code> 卡片，并在来源徽标如实标注 <code>终端回退</code>。</li>
+  </ul>
+  <h2 id="rsoChaud">4. 系统架构与数据流</h2>
+  <mermaid id="SaZldg-V">flowchart TB
+  SessionUI[&quot;screen_session.go\n顶栏: 聊天 | 终端 切换 · 共用底栏与状态&quot;]
+  ChatUI[&quot;screen_chat.go\n原生对话卡片流 · 折叠思维链/工具 · 代码复制 · 内联审批&quot;]
+  VTUI[&quot;vt_view.go\n真 2D VT 网格 · 观察中/已适配 · KeycapBar&quot;]
+  Ctrl[&quot;ChatSessionController (绑定根 u.app.cx)\n路径缓存 · 尾部窗口分页 · 行号增量追尾 · 乐观发送合并&quot;]
+  Resolver[&quot;TranscriptResolver\n1. Claude: ~/.claude/sessions/&lt;pid&gt;.json -&gt; projects/*.jsonl\n2. OMP/Pi: alma.session / -r &lt;id&gt; -&gt; agent/sessions/*.jsonl\n3. Codex / Antigravity 路径探测&quot;]
+  Parsers[&quot;多格式归一化解析器 -&gt; []ChatItem\nClaudeParser | PiOmpParser | CodexParser | AgyParser | VTFallbackParser&quot;]
+  RPC[&quot;Client (复用现有 Framed 连接)\nfile.read(on, path, offset, limit) + 单次按需 machine.exec(on, argv)&quot;]
+
+  SessionUI --&gt; ChatUI
+  SessionUI --&gt; VTUI
+  ChatUI --&gt; Ctrl
+  Ctrl --&gt; Resolver
+  Ctrl --&gt; Parsers
+  Resolver --&gt; RPC
+  Ctrl --&gt; RPC
+  VTUI -. &quot;共享 Screen() 供未命中时兜底&quot; .-&gt; Parsers</mermaid>
+  <h3 id="seZ2uYAq">4.1 协议层扩展（<code>proto.go</code> / <code>client.go</code> · 经实测 OpenRPC 校验）</h3>
+  <ul id="CD0ay9y5">
+    <li><b>补齐 <code>Terminal</code> 与 <code>Foreground</code> 字段</b>：在 <code>proto.go</code> 的 <code>Terminal</code> 中补齐 <code>Argv []string</code>、<code>PID *uint32</code>；在 <code>Foreground</code> 中补齐 <code>Argv []string</code>（已通过 <code>hc get --json</code> 实测确认存在）。</li>
+    <li>
+      <b>新增只读远端文件与探测精确线契约</b>：
+      <ul>
+        <li><code>Client.FileRead(ctx, FileReadParams{Path, Offset, Limit, On, Cwd}) (FileReadResult, error)</code>：映射 <code>file.read</code>，<code>Offset</code> 从 1 开始计行，返回 <code>FileReadResult{Text string, First int, Last int, Lines int}</code>（服务端单次上限 8 MB）。<b>实测关键边界</b>：当请求 <code>Offset &gt; Lines</code> 时，<code>herdr-core</code> 会返回 <code>RPCError{Kind: &quot;invalid_params&quot;, Message: &quot;offset N: the file has M lines&quot;}</code>；因此增量追尾统一从已知存在的最后一行发起 <code>file.read(path, offset: max(1, lastLine), limit: 201)</code>，丢弃首行已读记录并仅解析 <code>First+1 .. Last</code> 新增行（即使同时触发 <code>invalid_params</code> 且消息含 <code>the file has</code> 也视为正常 EOF 无新增，绝不误触发终端回退）。</li>
+        <li><code>Client.MachineExec(ctx, ExecParams{Argv, Line, On, Cwd, Timeout}) (ExecResult, error)</code>：映射 <code>machine.exec</code>，<b>注意 <code>timeout</code> 字段单位为秒（<code>float64</code>，默认传 <code>5.0</code>，服务端上限 600 秒）</b>；返回 <code>ExecResult{Code *int32, Signal *int32, Stdout string, Stderr string, MS uint64, TimedOut bool, Truncated bool}</code>（其中 <code>Stdout</code> / <code>Stderr</code> 均为 Base64 编码；非 0 退出码正常返回 <code>ExecResult</code> 而非 <code>RPCError</code>），仅用于会话首次打开且无法直接推算路径时的单次只读文件定位。</li>
+        <li><b>联邦路由拆分辅助函数</b>：<code>SplitMachineAddr(addr string) (onMachine, localAddr string)</code>——当 <code>addr</code> 形如 <code>&quot;kr/t12&quot;</code> 时提取 <code>on = &quot;kr&quot;</code>，本机 <code>&quot;t9&quot;</code> 则 <code>on = &quot;&quot;</code>，确保本机与跨机器中继会话使用完全一致的寻址逻辑。</li>
+      </ul>
+    </li>
+  </ul>
+  <h3 id="E8A4EM_P">4.2 四大 Harness 会话文件精准定位策略（实测验证）</h3>
+  <p id="5H3gWLEX">定位器（<code>TranscriptResolver</code>）按以下确定性优先级解析出远端绝对路径并缓存于 <code>TermKey -&gt; ResolvedTranscript{Path, Format, On}</code>（仅当 <code>Foreground.PID</code> 变化或文件被轮转时才重新解析）：</p>
+  <table id="vbw3_T4z">
+    <tr>
+      <th>
+        <p>Harness</p>
+      </th>
+      <th>
+        <p>确定性优先定位（零扫描或直读）</p>
+      </th>
+      <th>
+        <p>次级目录匹配（单次轻量只读 <code>machine.exec</code>）</p>
+      </th>
+    </tr>
+    <tr>
+      <td>
+        <p><b>Claude Code</b><br />(<code>claude-code</code>)</p>
+      </td>
+      <td>
+        <p>1. 若 <code>Foreground.PID &gt; 0</code>，直接调用 <code>file.read(&quot;~/.claude/sessions/&lt;pid&gt;.json&quot;)</code>（无需 <code>machine.exec</code>）提取 <code>sessionId</code> 与 <code>cwd</code>，拼出 <code>~/.claude/projects/&lt;slug(cwd)&gt;/&lt;sessionId&gt;.jsonl</code>。<br />2. 检查 <code>Labels[&quot;alma.session&quot;]</code> 或 <code>Argv</code> 中的 <code>--resume / -r &lt;id&gt;</code>。</p>
+      </td>
+      <td>
+        <p>在 <code>~/.claude/projects/&lt;slug(cwd)&gt;/</code> 下按文件修改时间最接近 <code>status_ms / created_ms</code> 选取最新 <code>.jsonl</code>。</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><b>OMP / Pi</b><br />(<code>omp</code> / <code>pi</code>)</p>
+      </td>
+      <td>
+        <p>从 <code>Labels[&quot;alma.session&quot;]</code>（如实测 <code>omp:id:01a16527...</code>、<code>pi:id:01a1e743...</code>）或 <code>Argv / Foreground.Argv</code> 的 <code>-r &lt;uuid&gt;</code> 提取会话 UUID。</p>
+      </td>
+      <td>
+        <p>单次在 <code>~/.omp/agent/sessions/</code> 与 <code>~/.pi/agent/sessions/</code> 中匹配 <code>*_&lt;uuid&gt;.jsonl</code>；若无 UUID，则在对应编码工作目录子夹下选取修改时间最匹配的 <code>.jsonl</code>。</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><b>Antigravity</b><br />(<code>antigravity</code> / <code>agy</code>)</p>
+      </td>
+      <td>
+        <p>检查 <code>Labels</code> 或启动参数中的会话 ID，直接定位 <code>~/.gemini/antigravity-cli/brain/&lt;id&gt;/.system_generated/logs/transcript.jsonl</code>。</p>
+      </td>
+      <td>
+        <p>扫描 <code>~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl</code>，优先匹配包含当前 <code>CurrentDir()</code> 工作区且修改时间与 <code>status_ms / created_ms</code> 最吻合的会话日志。</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><b>Codex</b><br />(<code>codex</code>)</p>
+      </td>
+      <td>
+        <p>检查 <code>Labels[&quot;alma.session&quot;]</code> 或 <code>Argv</code> 中的 <code>resume &lt;uuid&gt;</code>。</p>
+      </td>
+      <td>
+        <p>扫描最近日期目录 <code>~/.codex/sessions/*/*/*/*.jsonl</code>，匹配含 <code>_&lt;uuid&gt;.jsonl</code> 或首行 <code>session_meta.payload.cwd == CurrentDir()</code> 的最新文件。</p>
+      </td>
+    </tr>
+  </table>
+  <p id="gdXRgV5_"><i>注：<code>file.read</code> 对波浪号 <code>~</code> 的展开因平台而异，当无需 <code>machine.exec</code> 直读时若 <code>~/.claude/...</code> 返回 <code>not_found</code>，定位器自动做一次 <code>sh -c &apos;printf %s &quot;$HOME&quot;&apos;</code> 缓存该机器的主目录绝对路径。</i></p>
+  <h3 id="nmG32I5k">4.3 统一对话模型（<code>ChatItem</code>）与四大格式实测归一化规则</h3>
+  <p id="aP31UAEL">不同 Harness 的 JSONL 行经实测样本校验后，统一解析为不可变的 <code>[]ChatTurnItem</code> 视图模型：</p>
+  <ul id="As1_RIAp">
+    <li><b><code>RoleUser</code>（用户提问 / 子会话汇报）</b>：提取纯文本与图片占位提示；若文本形如 <code>&lt;hc from=&quot;t7 review&quot;&gt;...&lt;/hc&gt;</code>，解析出 <code>FromAgent = &quot;t7 review&quot;</code> 并渲染为带子会话来源标签的协作汇报气泡；自动剥离系统注入的 <code>&lt;system-reminder&gt;</code>、<code>&lt;USER_REQUEST&gt;</code> 与 <code>&lt;ADDITIONAL_METADATA&gt;</code> 外壳标签。</li>
+    <li><b><code>RoleAssistant</code>（Agent 回复块）</b>：将正文中连续的自然段、无序/有序列表与 <code>```lang ... ```</code> 围栏代码块拆分为结构化 <code>[]MarkdownBlock</code>（段落文本支持自动软换行，代码块渲染在 <code>pal.SurfaceRaised</code> 等宽容器内并提供右上角一键「复制」按钮）。</li>
+    <li><b><code>RoleThinking</code>（折叠思维链）</b>：默认折叠为单行胶囊 <code>💭 思考过程 · 约 N 字</code>，点击可展开/收起全文。</li>
+    <li><b><code>RoleToolGroup</code>（折叠工具调用组）</b>：提取工具名与核心目标参数（如 <code>Read vt_view.go</code>、<code>Bash go test ./...</code>、<code>Edit screen_session.go</code>）及成功/报错状态点；连续多个工具调用在折叠态紧凑排列，点击任一胶囊展开入参摘要与结果尾部（客户端单条裁剪前 20 行 + 后 20 行防卡顿）。</li>
+    <li>
+      <b>各 Harness 精确字段与去重契约（均经本机与 <code>kr</code> 真实日志核验）</b>：
+      <ul>
+        <li><b>Claude Code</b>：<code>type == &quot;assistant&quot;</code> 且共享同一 <code>message.id</code> 的多行记录为<b>按块增量追加</b>（如首行 <code>[thinking]</code>、次行 <code>[tool_use]</code> 或 <code>[text]</code>），合并时按序追加 <code>message.content</code> 切片而非覆盖；<code>type == &quot;user&quot;</code> 中若 <code>message.content</code> 为数组且含 <code>{type:&quot;tool_result&quot;, tool_use_id, content, is_error}</code>，按 <code>tool_use_id</code> 回填到对应 <code>tool_use</code>。</li>
+        <li><b>OMP / Pi</b>：<code>Labels[&quot;alma.session&quot;]</code> 中的完整 UUID 后缀直接匹配 <code>*_&lt;uuid&gt;.jsonl</code>；仅消费 <code>type == &quot;message&quot;</code> 行——<code>message.role == &quot;assistant&quot;</code> 读取 <code>model</code> 与 <code>content</code>（<code>thinking</code>、<code>text</code>、<code>toolCall{id, name, arguments, intent}</code>），<code>message.role == &quot;toolResult&quot;</code> 按 <code>toolCallId</code> 与 <code>isError</code> 配对回填。</li>
+        <li><b>Codex</b>：仅以权威流 <code>type == &quot;response_item&quot;</code> 构建对话（忽略重复的 <code>event_msg</code> 镜像行，避免双倍渲染；从 <code>turn_context.payload.model</code> 提取模型徽标）——解析 <code>message</code> / <code>agent_message</code>、<code>reasoning.summary</code>、以及 <code>function_call</code> / <code>custom_tool_call</code> 并通过 <code>call_id</code> 配对 <code>function_call_output</code> / <code>custom_tool_call_output</code>。</li>
+        <li><b>Antigravity</b>：解析 <code>USER_INPUT.content</code>、<code>PLANNER_RESPONSE</code>（<code>thinking</code>、<code>content</code>、<code>model</code>、<code>tool_calls:[{name, args}]</code>），并将紧随其后的 <code>GENERIC</code>（<code>source == &quot;MODEL&quot;</code>）输出行按顺序一对一配对回上一轮 <code>tool_calls</code>。</li>
+      </ul>
+    </li>
+    <li><b>终端流兜底解析器（<code>ParseVTTranscript</code>）</b>：当未命中原生 JSONL 时，从 <code>SessionTerminal.Screen().PlainText()</code>（或 <code>terminal.read(lines: 400)</code>）剥离底部固定状态栏、全宽横线分隔符（<code>─</code> / <code>━</code>）与纯空白框线，按提示符（<code>❯</code>、<code>&gt;</code>、<code>$</code>、<code>%</code>）及输出标记（<code>⏺</code>、<code>●</code>、<code>⎿</code>）切分对话块，保证任何 CLI 在聊天视图下都可读。</li>
+  </ul>
+  <h3 id="iHnLPH1C">4.4 增量同步、分页与输入路由（严守 NSGo 作用域与 <code>observe</code> 铁律）</h3>
+  <ul id="mK_IgiU3">
+    <li><b>根作用域绑定</b>：<code>ChatSessionController</code> 的所有 <code>core.Signal</code> 必须绑定到根 <code>u.app.cx</code>（绝不绑定列表行或 <code>core.Show</code> 临时子作用域），避免页面切换后异步回调静默丢帧。</li>
+    <li><b>首屏尾窗 + 向上翻页</b>：首次命中 JSONL 后先执行 <code>file.read(path, offset: 1, limit: 1)</code> 获取总行数 <code>totalLines</code>，随即读取尾部 <code>offset = max(1, totalLines - 249), limit = 250</code>（客户端对超过 512 KiB 的极端单行做安全裁剪）。当 <code>loadedFirstLine &gt; 1</code> 时，列表顶部展示 <code>↑ 加载更早对话（剩余 N 条记录）</code> 按钮，每次向前加载 250 行并保持阅读位置稳定。</li>
+    <li><b>事件驱动 + 无错追尾</b>：监听 <code>CorePool</code> 的终端状态/轮次变化通知；当会话处于 <code>working</code> 状态且当前停留在会话页时，每 1.5s 触发一次 <code>file.read(path, offset: max(1, lastLine), limit: 201)</code> 追尾新行（仅消费行号 <code>&gt; lastLine</code> 的新增行，零报错开销）；<code>idle / done</code> 状态下停止定时轮询，仅在收到 <code>events.subscribe</code> 事件或用户发送消息后追尾一次。</li>
+    <li><b>聊天模式发送严保 <code>observe: true</code>（设计者拍板）</b>：在「聊天」视图下点击底栏发送时，<b>始终调用 RPC <code>terminal.send</code>（<code>App.SendTo</code>）并保持后台 <code>SessionTerminal</code> 处于 <code>observe: true</code></b>，绝不调用 <code>st.SendInput</code> 触发手机列宽 <code>RESIZE(58x24)</code> 把桌面端 140–200 列宽屏 TUI 挤乱；同时复用 <code>herdr-core</code> 原生粘贴间隔与提交键规则，并以 <code>SendResult.Turn</code> 辅助乐观回显去重。仅当用户切到「终端」视图直接敲击终端输入或手动点「适配列宽」时，才允许退出 <code>observe</code> 发送 <code>RESIZE</code>。</li>
+    <li><b>无损切换与连接复用</b>：打开会话时后台仍保持轻量 <code>SessionTerminal</code> 附着（<code>observe: true</code>），因此从「聊天」点顶栏「终端」时 0ms 瞬切到已就绪的彩色 VT 画布，切回「聊天」时滚动位置与展开状态原样保留。</li>
+  </ul>
+  <h2 id="Z3cQwkZz">5. 视觉方向与界面细节（延续 Crisp Slate 设计系统）</h2>
+  <ul id="jEUrSe05">
+    <li><b>设计脉络</b>：严格沿用仓库 <code>DESIGN.md</code> 与 <code>artboard/herdr-design-system</code> 已确立的 <b>Crisp Slate（晴空石板）</b> 视觉语言——高信息密度、1px 细边框、3px 语义左导轨、亮色优先（<code>#F7F8FA</code> 底 + <code>#FFFFFF</code> 卡片）配暗色模式（<code>#0C0F12</code> 底 + <code>#14191F</code> 卡片），零裸色值硬编码。</li>
+    <li><b>顶栏布局（44px）</b>：左侧返回键 + 会话标题（单行省略 <code>MinWidth: 0</code>）；右侧依次为紧凑的 <code>聊天 | 终端</code> 双态胶囊、模式专属操作（终端模式下显示 <code>观察中/已适配</code>，聊天模式下显示极简数据来源微标如 <code>JSONL</code> / <code>终端</code> 兼手动刷新键）、搜索按钮、更多工具按钮。会话内搜索在聊天模式下直接过滤/高亮匹配的对话卡片！</li>
+    <li>
+      <b>对话卡片排版</b>：
+      <ul>
+        <li><b>用户气泡</b>：右侧对齐（左留至少 36pt 余量），背景 <code>pal.AccentSoft</code>，1px <code>pal.Accent</code> 细框，圆角 <code>Tokens.RadiusCard</code>（10pt），字号 <code>Tokens.FontBody</code>（14pt）。</li>
+        <li><b>Agent 卡片</b>：通栏卡片，背景 <code>pal.Surface</code>，1px <code>pal.Border</code> 边框 + 左侧 3px <code>pal.Accent</code> 导轨，顶部小字展示 Harness 矢量图标（<code>HarnessIconBadge</code>）+ 模型名（若有，如 <code>claude-opus-4-7</code> / <code>gpt-5.4</code>）。</li>
+        <li><b>工具与思考胶囊</b>：背景 <code>pal.SurfaceRaised</code>，高度紧凑（单行 30–32pt，<code>MinWidth: 0</code> 单行截断），使用等宽字号 <code>Tokens.FontMonoMeta</code>（11.5pt），报错工具左标 <code>pal.Danger</code> 红点。</li>
+        <li><b>底部实时状态与审批</b>：<code>working</code> 时在列表底部渲染带青色呼吸指示点的单行状态卡（展示 <code>Status.Title / Status.Msg</code>）；<code>NeedsYou()</code> 时渲染 <code>InlineApprovalCard</code>；向上滚动浏览历史时右下角同样浮现 <code>↓ 底部</code> 悬浮按钮。</li>
+      </ul>
+    </li>
+    <li><b>底栏交互增强</b>：聊天视图下隐藏 <code>KeycapBar</code>；当 <code>curTerm().Terminal.StateWord() == &quot;working&quot;</code> 且输入框为空时，右侧主操作按钮显示为醒目的「中断」按钮（触发 <code>InterruptTo</code>），有输入文字时恢复为青色「发送」按钮。</li>
+  </ul>
+  <h2 id="LwTUuse9">6. 留给实现者的工程细节（Left to the Builder）</h2>
+  <ul id="JWQ0s8v9">
+    <li>超长单行 JSONL（例如包含大段 Base64 图片或数万行命令输出的 <code>tool_result</code>）的流式裁剪策略：解析阶段忽略内嵌 Base64 图像原始字节（仅保留 <code>[图片附件]</code> 标记），单个工具输出保留前 20 行 + 后 20 行并提示省略行数，确保内存与 UI 节点数恒定可控。</li>
+    <li><code>cwd</code> 路径到 Claude Code / OMP / Pi 目录名的编码转换规则（实测 Claude 将非字母数字替换为 <code>-</code>，Pi 对首尾斜杠编码为 <code>--root-pp--</code>，解析器同时兼容精确算名与目录模糊匹配）。</li>
+    <li>单元测试与无头 UI 测试覆盖：为 4 种 JSONL 格式、路径定位器、增量分页追尾、乐观回显去重、VT 兜底解析以及 <code>screen_session.go</code> 的 <code>聊天 ↔ 终端</code> 切换补齐表驱动测试与 <code>nsgotest</code> 断言。</li>
+  </ul>
+  <h2 id="hyu45PlZ">7. 关联产物记录</h2>
+  <ul id="ILisvCu5">
+    <li>前置设计规范：<code>.ryugi/artifacts/document/herdr-client-polish/doc.xml</code>（<code>docs/ryugi/specs/2026-11-23-herdr-client-polish-design.md</code>）</li>
+    <li>前置视觉画板：<code>.ryugi/artifacts/artboard/herdr-design-system/canvas.json</code> 与设计系统守则 <code>DESIGN.md</code></li>
+    <li>本特性设计文档：<code>.ryugi/artifacts/document/herdr-chat-view/doc.xml</code></li>
+  </ul>
+  <hr id="w2NrL2F-" />
+  <p id="KglIssKW">请确认以上 Chat View 书面设计规范是否通过：<ask id="approve"><option value="approve">通过，按此设计开始实现</option><option value="revise">需要调整（请留言说明）</option></ask></p>
+</doc>
+
