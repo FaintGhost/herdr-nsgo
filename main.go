@@ -15,12 +15,15 @@ import (
 
 func main() { nsgo.Run(Root) }
 
-// uiController owns reactive navigation, modal state, and the active SessionTerminal lifecycle.
+// uiController owns reactive navigation, modal state, and the active SessionTerminal / ChatSessionController lifecycle.
 type uiController struct {
 	app             *App
 	activeTab       *core.Signal[string] // home, inbox, instances
 	activeSession   *core.Signal[TermKey]
 	activeTerm      *core.Signal[*SessionTerminal]
+	activeChat      *core.Signal[*ChatSessionController]
+	sessionMode     *core.Signal[string] // "chat" or "vt"
+	sessionModes    map[TermKey]string   // per-session remembered mode during app session
 	subPage         *core.Signal[string] // "", settings, tokens
 	showNewSession  *core.Signal[bool]
 	showAddInstance *core.Signal[bool]
@@ -34,20 +37,34 @@ func Root(cx *core.Scope) core.Node {
 	return RootWithApp(cx, NewApp(cx))
 }
 
-// RootWithApp builds the complete responsive 8-screen shell bound to app (also used by nsgotest).
+// RootWithApp builds the complete responsive shell bound to app (also used by nsgotest).
 func RootWithApp(cx *core.Scope, app *App) core.Node {
+	node, _ := rootWithController(cx, app)
+	return node
+}
+
+func rootWithController(cx *core.Scope, app *App) (core.Node, *uiController) {
 	registerAppFonts(cx)
 	u := &uiController{
 		app:             app,
 		activeTab:       core.NewSignal(cx, "home"),
 		activeSession:   core.NewSignal(cx, TermKey{}),
 		activeTerm:      core.NewSignal[*SessionTerminal](cx, nil),
+		activeChat:      core.NewSignal[*ChatSessionController](cx, nil),
+		sessionMode:     core.NewSignal(cx, "chat"),
+		sessionModes:    make(map[TermKey]string),
 		subPage:         core.NewSignal(cx, ""),
 		showNewSession:  core.NewSignal(cx, false),
 		showAddInstance: core.NewSignal(cx, false),
 		showQRModal:     core.NewSignal(cx, false),
 		editingHost:     core.NewSignal(cx, Host{UseLocalKey: true}),
 	}
+
+	app.OnPoolSync(func() {
+		if chat := u.activeChat.Get(); chat != nil {
+			chat.RefreshAsync()
+		}
+	})
 
 	// Open session directly when user taps a system notification (closing any open sheets).
 	app.OnNotificationOpen(func(k TermKey) {
@@ -239,18 +256,51 @@ func RootWithApp(cx *core.Scope, app *App) core.Node {
 				Then: func(cx *core.Scope) core.Node { return u.qrPairingModal(cx) },
 			},
 		},
+	}, u
+}
+
+func (u *uiController) setSessionMode(mode string) {
+	if mode != "chat" && mode != "vt" {
+		return
+	}
+	cur := u.activeSession.Get()
+	if cur != (TermKey{}) {
+		u.sessionModes[cur] = mode
+	}
+	u.sessionMode.Set(mode)
+	if mode == "chat" {
+		if chat := u.activeChat.Get(); chat != nil {
+			chat.RefreshAsync()
+		}
 	}
 }
 
-// openSession attaches to key (in observe mode by default), pre-seeding from LRU FrameCache.
-// Always binds SessionTerminal signals to the root app scope (u.app.cx), never an ephemeral
-// row/button child scope that gets disposed when switching from Home/Inbox to Session.
+// openSession attaches to key (in observe mode by default), pre-seeding from LRU FrameCache,
+// and initializes the root-scoped ChatSessionController.
+// Always binds SessionTerminal and ChatSessionController signals to the root app scope (u.app.cx),
+// never an ephemeral row/button child scope that gets disposed on navigation.
 func (u *uiController) openSession(_ *core.Scope, key TermKey) {
+	if prevChat := u.activeChat.Get(); prevChat != nil {
+		prevChat.Close()
+		u.activeChat.Set(nil)
+	}
 	if prev := u.activeTerm.Get(); prev != nil {
 		prev.Close()
 		u.activeTerm.Set(nil)
 	}
 	u.activeSession.Set(key)
+
+	// Determine initial mode: remembered per-session choice -> Agent="chat" / Shell="vt".
+	mode, remembered := u.sessionModes[key]
+	if !remembered {
+		if at, ok := u.app.FindTerminal(key); ok && IsAgentTerminal(at.Terminal) {
+			mode = "chat"
+		} else {
+			mode = "vt"
+		}
+		u.sessionModes[key] = mode
+	}
+	u.sessionMode.Set(mode)
 
 	rootCX := u.app.cx
 	var cache *FrameCache
@@ -260,6 +310,14 @@ func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 	enableGhostty := rootCX != nil && !rootCX.Env().Simulated()
 	observe := u.app.observeDefault.Get()
 	st := NewSessionTerminal(rootCX, key, 100, 32, observe, cache, enableGhostty)
+
+	chatCtrl := NewChatSessionController(
+		rootCX,
+		key,
+		u.app.TranscriptBackend(),
+		u.app.transcriptResolver,
+		func() string { return st.Screen().PlainText() },
+	)
 
 	attachWithMode := func(obs bool, cols, rows int) {
 		gen := u.attachGen.Add(1)
@@ -362,12 +420,18 @@ func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 
 	st.SetReattach(attachWithMode)
 	u.activeTerm.Set(st)
+	u.activeChat.Set(chatCtrl)
+	chatCtrl.StartLoop()
 	attachWithMode(observe, 100, 32)
 }
 
-// closeSession releases the active VT attach stream and updates the LRU cache.
+// closeSession releases the active VT attach stream, stops Chat tailing, and updates the LRU cache.
 func (u *uiController) closeSession() {
 	u.attachGen.Add(1)
+	if prevChat := u.activeChat.Get(); prevChat != nil {
+		prevChat.Close()
+		u.activeChat.Set(nil)
+	}
 	if prev := u.activeTerm.Get(); prev != nil {
 		prev.Close()
 		u.activeTerm.Set(nil)

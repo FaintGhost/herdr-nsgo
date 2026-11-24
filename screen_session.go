@@ -9,10 +9,12 @@ import (
 	"github.com/nsgo-dev/nsgo/ui"
 )
 
-// sessionScreen renders the real VT Session view:
-// safe-area 44px compact header (back, title, observe/fit pill, search icon, tools icon),
-// collapsible search bar, reactive VT surface keyed by activeSession + scroll-to-bottom FAB,
-// and keyboard-aware bottom dock (single-row 34px KeycapBar with ⌨ toggle + Composer).
+// sessionScreen renders the unified Session view with seamless 0ms switching between
+// Chat View (native JSONL + VT fallback) and real 2D VT Terminal View:
+// - 44px compact safe-area header (back, title, 聊天|终端 segmented pill, mode chip, search, tools)
+// - Collapsible search bar (filters Chat cards in chat mode; jumps VT matches in vt mode)
+// - Active viewport (Chat View or VT Canvas)
+// - Keyboard-aware bottom dock (KeycapBar shown only in VT mode + Composer with working Interrupt button).
 func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 	a := u.app
 	showSearch := core.NewSignal(cx, false)
@@ -27,6 +29,8 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 		return t
 	}
 	curST := func() *SessionTerminal { return u.activeTerm.Get() }
+	curChat := func() *ChatSessionController { return u.activeChat.Get() }
+	isChatMode := func() bool { return u.sessionMode.Get() == "chat" }
 
 	sendKeyOrBytes := func(logicalKey string, rawBytes []byte) {
 		st := curST()
@@ -41,6 +45,16 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 		k := curKey()
 		text := strings.TrimSpace(a.Compose(k.String()))
 		if text == "" {
+			return
+		}
+		// In Chat View, ALWAYS route through RPC terminal.send so the background
+		// SessionTerminal stays in observe=true and never shrinks a 140-col desktop PTY!
+		if isChatMode() {
+			if chat := curChat(); chat != nil {
+				chat.AddOptimisticUser(text)
+			}
+			a.SetCompose(k.String(), "")
+			a.SendTo(k, text)
 			return
 		}
 		st := curST()
@@ -89,6 +103,31 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 		})
 	}
 
+	modeSegmentPill := core.View{
+		StyleFunc: func() core.Style {
+			pal := a.paletteOf(cx)
+			return core.Style{
+				FlexShrink:   0,
+				Direction:    core.Row,
+				AlignItems:   core.AlignCenter,
+				Background:   pal.SurfaceRaised,
+				CornerRadius: Tokens.RadiusCtrl,
+				BorderWidth:  1,
+				BorderColor:  pal.Border,
+				Padding:      core.All(core.Points(2)),
+				Gap:          core.Points(2),
+			}
+		},
+		Children: []core.Node{
+			sessionModeSegmentBtn(cx, a, "session-mode-chat", "聊天", isChatMode, func() {
+				u.setSessionMode("chat")
+			}),
+			sessionModeSegmentBtn(cx, a, "session-mode-vt", "终端", func() bool { return !isChatMode() }, func() {
+				u.setSessionMode("vt")
+			}),
+		},
+	}
+
 	return core.View{
 		TestID: "screen-session",
 		StyleFunc: func() core.Style {
@@ -105,28 +144,50 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 			TopHeader(cx, a, func() string {
 				return curTerm().Terminal.Label()
 			}, leftBtn, []core.Node{
-				FilterPill(cx, a, "session-fit-toggle", func() string {
-					st := curST()
-					if st == nil || (st.observeSig != nil && st.observeSig.Get()) || (st.observeSig == nil && st.Observe()) {
-						return "观察中"
-					}
-					return "已适配"
-				}, func() bool {
-					st := curST()
-					return st != nil && !st.Observe()
-				}, nil, func() {
-					st := curST()
-					if st == nil {
-						return
-					}
-					nextObserve := !st.Observe()
-					st.SetObserve(nextObserve, a.vtFontSize.Get())
-					if nextObserve {
-						a.notifyToast("已切换为观察模式（不改动远端桌面尺寸）")
-					} else {
-						a.notifyToast("已适配手机列宽（发送 RESIZE）")
-					}
-				}),
+				modeSegmentPill,
+				core.Show{
+					When: isChatMode,
+					Then: func(cx *core.Scope) core.Node {
+						return FilterPill(cx, a, "chat-source-pill", func() string {
+							if ch := curChat(); ch != nil {
+								return ch.Source().Label()
+							}
+							return "同步中"
+						}, func() bool {
+							ch := curChat()
+							return ch != nil && ch.Source() == SourceJSONL
+						}, nil, func() {
+							if ch := curChat(); ch != nil {
+								ch.RefreshAsync()
+								a.notifyToast("正在刷新对话记录…")
+							}
+						})
+					},
+					Else: func(cx *core.Scope) core.Node {
+						return FilterPill(cx, a, "session-fit-toggle", func() string {
+							st := curST()
+							if st == nil || (st.observeSig != nil && st.observeSig.Get()) || (st.observeSig == nil && st.Observe()) {
+								return "观察中"
+							}
+							return "已适配"
+						}, func() bool {
+							st := curST()
+							return st != nil && !st.Observe()
+						}, nil, func() {
+							st := curST()
+							if st == nil {
+								return
+							}
+							nextObserve := !st.Observe()
+							st.SetObserve(nextObserve, a.vtFontSize.Get())
+							if nextObserve {
+								a.notifyToast("已切换为观察模式（不改动远端桌面尺寸）")
+							} else {
+								a.notifyToast("已适配手机列宽（发送 RESIZE）")
+							}
+						})
+					},
+				},
 				IconButton(cx, a, "session-search-btn", "搜索", iconSearch, false, func() {
 					showSearch.Set(!showSearch.Get())
 				}),
@@ -135,7 +196,7 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 				}),
 			}),
 			ToastBanner(cx, a),
-			// Collapsible in-session search bar
+			// Collapsible in-session search bar (mode-aware)
 			core.Show{
 				When: showSearch.Get,
 				Then: func(cx *core.Scope) core.Node {
@@ -154,12 +215,18 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 						},
 						Children: []core.Node{
 							core.View{
-								Style: core.Style{FlexGrow: 1},
+								Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinWidth: core.Pt(0)},
 								Children: []core.Node{
 									ui.Input{
 										TestID:      "session-search-input",
-										Placeholder: "在终端输出中搜索…",
+										Placeholder: "搜索当前会话内容…",
 										Value: func() string {
+											if isChatMode() {
+												if ch := curChat(); ch != nil && ch.searchQuery != nil {
+													return ch.searchQuery.Get()
+												}
+												return ""
+											}
 											st := curST()
 											if st == nil || st.searchQuery == nil {
 												return ""
@@ -167,6 +234,12 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 											return st.searchQuery.Get()
 										},
 										OnChange: func(q string) {
+											if isChatMode() {
+												if ch := curChat(); ch != nil && ch.searchQuery != nil {
+													ch.searchQuery.Set(q)
+												}
+												return
+											}
 											if st := curST(); st != nil {
 												st.SetSearch(q)
 											}
@@ -186,102 +259,138 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 									},
 								},
 							},
-							core.Text{
-								ContentFunc: func() string {
-									st := curST()
-									if st == nil {
-										return "0"
+							core.Show{
+								When: func() bool { return !isChatMode() },
+								Then: func(cx *core.Scope) core.Node {
+									return core.View{
+										Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: Tokens.Space2},
+										Children: []core.Node{
+											core.Text{
+												ContentFunc: func() string {
+													st := curST()
+													if st == nil {
+														return "0"
+													}
+													m := st.SearchMatches()
+													if len(m) == 0 {
+														return "0"
+													}
+													idx := 0
+													if st.searchIdx != nil {
+														idx = st.searchIdx.Get()
+													}
+													return fmt.Sprintf("%d/%d", idx+1, len(m))
+												},
+												StyleFunc: func() core.Style {
+													pal := a.paletteOf(cx)
+													return core.Style{Color: pal.TextMuted, FontSize: Tokens.FontMonoMeta, FontFamily: core.FontMonospace}
+												},
+											},
+											ActionButton(cx, a, "search-prev-btn", "↑", ActionSecondary, func() {
+												if st := curST(); st != nil {
+													st.PrevSearchMatch()
+												}
+											}),
+											ActionButton(cx, a, "search-next-btn", "↓", ActionSecondary, func() {
+												if st := curST(); st != nil {
+													st.NextSearchMatch()
+												}
+											}),
+										},
 									}
-									m := st.SearchMatches()
-									if len(m) == 0 {
-										return "0"
-									}
-									idx := 0
-									if st.searchIdx != nil {
-										idx = st.searchIdx.Get()
-									}
-									return fmt.Sprintf("%d/%d", idx+1, len(m))
-								},
-								StyleFunc: func() core.Style {
-									pal := a.paletteOf(cx)
-									return core.Style{Color: pal.TextMuted, FontSize: Tokens.FontMonoMeta, FontFamily: core.FontMonospace}
 								},
 							},
-							ActionButton(cx, a, "search-prev-btn", "↑", ActionSecondary, func() {
-								if st := curST(); st != nil {
-									st.PrevSearchMatch()
-								}
-							}),
-							ActionButton(cx, a, "search-next-btn", "↓", ActionSecondary, func() {
-								if st := curST(); st != nil {
-									st.NextSearchMatch()
-								}
-							}),
 						},
 					}
 				},
 			},
-			// VT Canvas / Ghostty viewport keyed by activeTerm pointer so direct session switches remount cleanly
+			// Main session body: Chat View <-> Terminal View
 			core.View{
 				Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0), Position: core.Relative, Overflow: core.Hidden},
 				Children: []core.Node{
-					core.Each(
-						func() []*SessionTerminal {
-							st := curST()
-							if st == nil {
-								return nil
-							}
-							return []*SessionTerminal{st}
-						},
-						func(st *SessionTerminal) *SessionTerminal { return st },
-						func(cx *core.Scope, item func() *SessionTerminal, _ func() int) core.Node {
-							return RenderSessionTerminal(
-								cx,
-								item(),
-								func() Palette { return a.paletteOf(cx) },
-								func() VTPalette { return a.vtPaletteOf(cx) },
-								a.vtFontSize.Get,
-							)
-						},
-					),
 					core.Show{
-						When: func() bool { return curST() == nil },
+						When: isChatMode,
 						Then: func(cx *core.Scope) core.Node {
-							return RenderSessionTerminal(
-								cx,
-								nil,
-								func() Palette { return a.paletteOf(cx) },
-								func() VTPalette { return a.vtPaletteOf(cx) },
-								a.vtFontSize.Get,
-							)
-						},
-					},
-					// Scroll-to-bottom FAB
-					core.Show{
-						When: func() bool {
-							st := curST()
-							return st != nil && st.scrolledUp != nil && st.scrolledUp.Get()
-						},
-						Then: func(cx *core.Scope) core.Node {
-							return core.View{
-								Style: core.Style{
-									Position: core.Absolute,
-									Right:    core.Pt(14),
-									Bottom:   core.Pt(14),
+							return core.Each(
+								func() []*ChatSessionController {
+									ch := curChat()
+									if ch == nil {
+										return nil
+									}
+									return []*ChatSessionController{ch}
 								},
+								func(ch *ChatSessionController) *ChatSessionController { return ch },
+								func(cx *core.Scope, item func() *ChatSessionController, _ func() int) core.Node {
+									return RenderChatSession(cx, a, item(), curTerm, func() {
+										u.setSessionMode("vt")
+									})
+								},
+							)
+						},
+						Else: func(cx *core.Scope) core.Node {
+							return core.View{
+								Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0), Position: core.Relative, Overflow: core.Hidden},
 								Children: []core.Node{
-									ActionButton(cx, a, "vt-scroll-bottom-fab", "↓ 底部", ActionPrimary, func() {
-										if st := curST(); st != nil {
-											st.ScrollToBottom()
-										}
-									}),
+									core.Each(
+										func() []*SessionTerminal {
+											st := curST()
+											if st == nil {
+												return nil
+											}
+											return []*SessionTerminal{st}
+										},
+										func(st *SessionTerminal) *SessionTerminal { return st },
+										func(cx *core.Scope, item func() *SessionTerminal, _ func() int) core.Node {
+											return RenderSessionTerminal(
+												cx,
+												item(),
+												func() Palette { return a.paletteOf(cx) },
+												func() VTPalette { return a.vtPaletteOf(cx) },
+												a.vtFontSize.Get,
+											)
+										},
+									),
+									core.Show{
+										When: func() bool { return curST() == nil },
+										Then: func(cx *core.Scope) core.Node {
+											return RenderSessionTerminal(
+												cx,
+												nil,
+												func() Palette { return a.paletteOf(cx) },
+												func() VTPalette { return a.vtPaletteOf(cx) },
+												a.vtFontSize.Get,
+											)
+										},
+									},
+									core.Show{
+										When: func() bool {
+											st := curST()
+											return st != nil && st.scrolledUp != nil && st.scrolledUp.Get()
+										},
+										Then: func(cx *core.Scope) core.Node {
+											return core.View{
+												Style: core.Style{
+													Position: core.Absolute,
+													Right:    core.Pt(14),
+													Bottom:   core.Pt(14),
+												},
+												Children: []core.Node{
+													ActionButton(cx, a, "vt-scroll-bottom-fab", "↓ 底部", ActionPrimary, func() {
+														if st := curST(); st != nil {
+															st.ScrollToBottom()
+														}
+													}),
+												},
+											}
+										},
+									},
 								},
 							}
 						},
 					},
 				},
 			},
-			// Keyboard- & SafeArea-aware bottom dock (KeycapBar + collapsible Composer)
+			// Keyboard- & SafeArea-aware bottom dock (KeycapBar in VT mode only + Composer)
 			core.View{
 				StyleFunc: func() core.Style {
 					pal := a.paletteOf(cx)
@@ -291,9 +400,14 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 					}
 				},
 				Children: []core.Node{
-					KeycapBar(cx, a, keycaps),
 					core.Show{
-						When: composerExpanded.Get,
+						When: func() bool { return !isChatMode() },
+						Then: func(cx *core.Scope) core.Node {
+							return KeycapBar(cx, a, keycaps)
+						},
+					},
+					core.Show{
+						When: func() bool { return isChatMode() || composerExpanded.Get() },
 						Then: func(cx *core.Scope) core.Node {
 							return core.View{
 								StyleFunc: func() core.Style {
@@ -326,7 +440,7 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 										showSnippets.Set(true)
 									}),
 									core.View{
-										Style: core.Style{FlexGrow: 1},
+										Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinWidth: core.Pt(0)},
 										Children: []core.Node{
 											ui.Input{
 												TestID:      "session-composer",
@@ -335,7 +449,7 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 													return a.Compose(curKey().String())
 												},
 												OnChange: func(txt string) {
-													if ctrlLatched.Get() && len(txt) == 1 {
+													if !isChatMode() && ctrlLatched.Get() && len(txt) == 1 {
 														ch := strings.ToLower(txt)[0]
 														if ch >= 'a' && ch <= 'z' {
 															ctrlLatched.Set(false)
@@ -363,7 +477,21 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 											},
 										},
 									},
-									IconButton(cx, a, "session-send-btn", "发送", iconSend, true, sendComposerText),
+									core.Show{
+										When: func() bool {
+											return isChatMode() &&
+												curTerm().Terminal.StateWord() == "working" &&
+												strings.TrimSpace(a.Compose(curKey().String())) == ""
+										},
+										Then: func(cx *core.Scope) core.Node {
+											return ActionButton(cx, a, "session-interrupt-btn", "中断", ActionDanger, func() {
+												a.InterruptTo(curKey())
+											})
+										},
+										Else: func(cx *core.Scope) core.Node {
+											return IconButton(cx, a, "session-send-btn", "发送", iconSend, true, sendComposerText)
+										},
+									},
 								},
 							}
 						},
@@ -495,6 +623,51 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 					return SheetModal(cx, a, "sheet-session-tools", "会话工具与链接", "sheet-session-tools-close", func() {
 						showTools.Set(false)
 					}, body)
+				},
+			},
+		},
+	}
+}
+
+func sessionModeSegmentBtn(cx *core.Scope, a *App, testID, label string, activeFn func() bool, onPress func()) core.Node {
+	return core.View{
+		TestID: testID,
+		Role:   core.RoleButton,
+		OnPress: func(core.PressEvent) {
+			if onPress != nil {
+				onPress()
+			}
+		},
+		StyleFunc: func() core.Style {
+			pal := a.paletteOf(cx)
+			bg := pal.SurfaceRaised
+			if activeFn() {
+				bg = pal.Accent
+			}
+			return core.Style{
+				FlexShrink:     0,
+				MinHeight:      core.Pt(26),
+				Padding:        core.Symmetric(core.Points(3), core.Points(9)),
+				CornerRadius:   Tokens.RadiusKey,
+				Background:     bg,
+				AlignItems:     core.AlignCenter,
+				JustifyContent: core.JustifyCenter,
+			}
+		},
+		Children: []core.Node{
+			core.Text{
+				Content: label,
+				StyleFunc: func() core.Style {
+					pal := a.paletteOf(cx)
+					fg := pal.TextSecondary
+					if activeFn() {
+						fg = pal.AccentFg
+					}
+					return core.Style{
+						Color:      fg,
+						FontSize:   Tokens.FontCaption,
+						FontWeight: core.FontWeightSemibold,
+					}
 				},
 			},
 		},

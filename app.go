@@ -105,10 +105,15 @@ type App struct {
 	composes *core.Signal[map[string]string]
 	filter   *core.Signal[string]
 
-	mu       sync.Mutex
-	hosts    []Host
-	alerts   *alertTracker
-	onNotify func(TermKey)
+	mu                 sync.Mutex
+	hosts              []Host
+	cachedSnaps        []InstanceSnapshot
+	cachedAgg          []AggregatedTerminal
+	alerts             *alertTracker
+	onNotify           func(TermKey)
+	onPoolSync         func()
+	transcriptResolver *TranscriptResolver
+	transcriptBackend  TranscriptBackend
 }
 
 // NewApp wires state, secrets, TOFU store, preferences, snippets, and starts CorePool.
@@ -120,6 +125,7 @@ func NewApp(cx *core.Scope) *App {
 		tofu:                 NewStorageTOFUStore(cx),
 		cache:                NewFrameCache(24),
 		alerts:               newAlertTracker(),
+		transcriptResolver:   NewTranscriptResolver(),
 		instances:            core.NewSignalFunc(cx, []InstanceSnapshot(nil), nil),
 		aggTerms:             core.NewSignalFunc(cx, []AggregatedTerminal(nil), nil),
 		activeInstanceFilter: core.NewSignal(cx, ""),
@@ -196,6 +202,31 @@ func (a *App) OnNotificationOpen(fn func(TermKey)) {
 	a.mu.Unlock()
 }
 
+// OnPoolSync registers a UI-thread listener invoked whenever CorePool snapshots/events update.
+func (a *App) OnPoolSync(fn func()) {
+	a.mu.Lock()
+	a.onPoolSync = fn
+	a.mu.Unlock()
+}
+
+// SetTranscriptBackend overrides the default pooled Client transcript backend (used in tests).
+func (a *App) SetTranscriptBackend(b TranscriptBackend) {
+	a.mu.Lock()
+	a.transcriptBackend = b
+	a.mu.Unlock()
+}
+
+// TranscriptBackend returns the active TranscriptBackend for Chat View.
+func (a *App) TranscriptBackend() TranscriptBackend {
+	a.mu.Lock()
+	b := a.transcriptBackend
+	a.mu.Unlock()
+	if b != nil {
+		return b
+	}
+	return NewAppTranscriptBackend(a)
+}
+
 func (a *App) post(fn func()) {
 	if a.cx != nil {
 		a.cx.Post(fn)
@@ -236,6 +267,11 @@ func (a *App) syncPoolToSignals() {
 			flatTerms = append(flatTerms, item.Terminal)
 		}
 
+		a.mu.Lock()
+		a.cachedSnaps = snaps
+		a.cachedAgg = agg
+		a.mu.Unlock()
+
 		a.instances.Set(snaps)
 		a.aggTerms.Set(agg)
 		a.terms.Set(flatTerms)
@@ -247,6 +283,13 @@ func (a *App) syncPoolToSignals() {
 		// Compute deduplicated notifications strictly on the UI thread.
 		for _, alert := range a.alerts.diff(snaps, agg) {
 			a.dispatchAlertNotification(alert)
+		}
+
+		a.mu.Lock()
+		syncFn := a.onPoolSync
+		a.mu.Unlock()
+		if syncFn != nil {
+			syncFn()
 		}
 	})
 }
@@ -559,7 +602,36 @@ func (a *App) Attention() []Terminal {
 	return out
 }
 
-// FindTerminal locates an AggregatedTerminal by TermKey.
+// SeedSnapshots sets both reactive signals and thread-safe cached snapshots (used in headless UI tests).
+func (a *App) SeedSnapshots(snaps []InstanceSnapshot) {
+	agg := AggregateTerminals(snaps)
+	a.mu.Lock()
+	a.cachedSnaps = snaps
+	a.cachedAgg = agg
+	a.mu.Unlock()
+	a.instances.Set(snaps)
+	a.aggTerms.Set(agg)
+}
+
+// FindTerminalSafe locates an AggregatedTerminal without touching NSGo reactive signals (safe on any goroutine).
+func (a *App) FindTerminalSafe(key TermKey) (AggregatedTerminal, bool) {
+	a.mu.Lock()
+	agg := a.cachedAgg
+	a.mu.Unlock()
+	for _, item := range agg {
+		if item.Key == key {
+			return item, true
+		}
+	}
+	for _, item := range a.pool.Terminals() {
+		if item.Key == key {
+			return item, true
+		}
+	}
+	return AggregatedTerminal{Key: key, Terminal: Terminal{Address: key.Addr}}, false
+}
+
+// FindTerminal locates an AggregatedTerminal by TermKey (reactive on UI thread).
 func (a *App) FindTerminal(key TermKey) (AggregatedTerminal, bool) {
 	for _, item := range a.aggTerms.Get() {
 		if item.Key == key {
@@ -582,13 +654,26 @@ func (a *App) Terminal(addr string) (Terminal, bool) {
 // ---------------------------------------------------------------------------
 // Actions (multi-instance aware)
 
+func (a *App) snapshotsSafe() ([]InstanceSnapshot, []AggregatedTerminal) {
+	a.mu.Lock()
+	snaps := a.cachedSnaps
+	agg := a.cachedAgg
+	a.mu.Unlock()
+	if len(snaps) == 0 && a.pool != nil {
+		snaps = a.pool.Snapshots()
+		agg = AggregateTerminals(snaps)
+	}
+	return snaps, agg
+}
+
 func (a *App) clientForKey(key TermKey) *Client {
+	snaps, agg := a.snapshotsSafe()
 	if key.InstanceID != "" {
 		if c := a.pool.ClientFor(key.InstanceID); c != nil {
 			return c
 		}
 		// Direct core offline: try falling back to an active online relay carrying this terminal.
-		for _, it := range a.aggTerms.Get() {
+		for _, it := range agg {
 			if it.Relayed && strings.HasSuffix(it.Key.Addr, "/"+key.Addr) {
 				if c := a.pool.ClientFor(it.Key.InstanceID); c != nil {
 					return c
@@ -596,7 +681,7 @@ func (a *App) clientForKey(key TermKey) *Client {
 			}
 		}
 	}
-	for _, s := range a.instances.Get() {
+	for _, s := range snaps {
 		if s.Online {
 			return a.pool.ClientFor(s.InstanceID)
 		}

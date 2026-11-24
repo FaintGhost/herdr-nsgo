@@ -59,7 +59,7 @@ func testSeededApp(cx *core.Scope) (*App, core.Node) {
 			},
 		},
 	})
-	app.aggTerms.Set(AggregateTerminals(app.instances.Get()))
+	app.SeedSnapshots(app.instances.Get())
 	app.hosts = []Host{
 		{ID: "kr", Label: "kr-prod", Target: "100.97.151.80:22", User: "root", UseLocalKey: true},
 		{ID: "mac", Label: "mac-mini", Target: "100.64.0.10:22", User: "dev", UseLocalKey: true},
@@ -168,9 +168,11 @@ func TestUISessionVTViewObserveToggleKeycapAndSnippets(t *testing.T) {
 		return node
 	}, nsgotest.Size(390, 844))
 
-	// Open session mac::t1 from Home.
+	// Open session mac::t1 (Claude agent -> defaults to Chat View; switch to Terminal View to exercise VT controls).
 	app.Press("id:session-row-mac::t1")
 	app.Find("id:screen-session")
+	app.Find("id:chat-surface")
+	app.Press("id:session-mode-vt")
 	app.Find("id:session-fit-toggle")
 	app.Find("id:vt-surface")
 	app.Find("id:keycap-esc")

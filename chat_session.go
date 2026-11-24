@@ -65,7 +65,7 @@ func (b *appTranscriptBackend) FindTerminal(key TermKey) (AggregatedTerminal, bo
 	if b.app == nil {
 		return AggregatedTerminal{}, false
 	}
-	return b.app.FindTerminal(key)
+	return b.app.FindTerminalSafe(key)
 }
 
 func (b *appTranscriptBackend) resolveClientAndOn(instanceID, requestedOn string) (*Client, string) {
@@ -76,7 +76,8 @@ func (b *appTranscriptBackend) resolveClientAndOn(instanceID, requestedOn string
 		if c := b.app.pool.ClientFor(instanceID); c != nil {
 			return c, requestedOn
 		}
-		for _, it := range b.app.aggTerms.Get() {
+		_, agg := b.app.snapshotsSafe()
+		for _, it := range agg {
 			if it.Relayed && it.Key.InstanceID != "" {
 				if c := b.app.pool.ClientFor(it.Key.InstanceID); c != nil {
 					relayOn, _ := SplitMachineAddr(it.Key.Addr)
