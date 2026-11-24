@@ -691,22 +691,41 @@ func (a *App) clientForKey(key TermKey) *Client {
 
 // SendTo sends text + Enter to the terminal identified by key.
 func (a *App) SendTo(key TermKey, text string) {
-	c := a.clientForKey(key)
-	if c == nil {
-		a.notifyToast("该实例尚未连上，先检查实例连接。")
+	a.SendToWithCallback(key, text, func(err error) {
+		if err == nil {
+			a.post(func() {
+				if strings.TrimSpace(a.Compose(key.String())) == strings.TrimSpace(text) {
+					a.setCompose(key.String(), "")
+				}
+			})
+		}
+	})
+}
+
+// SendToWithCallback sends text + Enter via terminal.send and invokes onDone (if non-nil) with any error.
+func (a *App) SendToWithCallback(key TermKey, text string, onDone func(error)) {
+	if strings.TrimSpace(text) == "" {
 		return
 	}
-	if strings.TrimSpace(text) == "" {
+	c := a.clientForKey(key)
+	if c == nil {
+		err := errors.New("该实例尚未连上，先检查实例连接。")
+		a.notifyToast(err.Error())
+		if onDone != nil {
+			onDone(err)
+		}
 		return
 	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		if _, err := c.Send(ctx, key.Addr, text); err != nil {
+		_, err := c.Send(ctx, key.Addr, text)
+		if err != nil {
 			a.notifyToast(explain(err))
-			return
 		}
-		a.post(func() { a.setCompose(key.String(), "") })
+		if onDone != nil {
+			onDone(err)
+		}
 	}()
 }
 

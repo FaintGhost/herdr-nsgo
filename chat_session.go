@@ -76,16 +76,28 @@ func (b *appTranscriptBackend) resolveClientAndOn(instanceID, requestedOn string
 		if c := b.app.pool.ClientFor(instanceID); c != nil {
 			return c, requestedOn
 		}
-		_, agg := b.app.snapshotsSafe()
+		snaps, agg := b.app.snapshotsSafe()
+		offlineCoreID := ""
+		for _, s := range snaps {
+			if s.InstanceID == instanceID {
+				offlineCoreID = s.CoreID
+				break
+			}
+		}
 		for _, it := range agg {
-			if it.Relayed && it.Key.InstanceID != "" {
-				if c := b.app.pool.ClientFor(it.Key.InstanceID); c != nil {
-					relayOn, _ := SplitMachineAddr(it.Key.Addr)
-					if requestedOn == "" {
-						return c, relayOn
-					}
-					return c, requestedOn
+			if !it.Relayed || it.Key.InstanceID == "" {
+				continue
+			}
+			relayOn, _ := SplitMachineAddr(it.Key.Addr)
+			matchesTarget := (offlineCoreID != "" && it.CoreID == offlineCoreID) || relayOn == instanceID
+			if !matchesTarget {
+				continue
+			}
+			if c := b.app.pool.ClientFor(it.Key.InstanceID); c != nil {
+				if requestedOn == "" {
+					return c, relayOn
 				}
+				return c, requestedOn
 			}
 		}
 	}
@@ -201,45 +213,85 @@ func claudeProjectSlug(cwd string) string {
 	return b.String()
 }
 
+func isLikelySessionID(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) < 6 || strings.ContainsAny(s, " \t\r\n") {
+		return false
+	}
+	if strings.HasSuffix(s, ".jsonl") {
+		return true
+	}
+	hasDigitOrSep := false
+	for _, r := range s {
+		if (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			hasDigitOrSep = true
+			break
+		}
+	}
+	return hasDigitOrSep
+}
+
 func extractSessionIDFromTerm(t Terminal) string {
 	if t.Labels != nil {
 		if alma := strings.TrimSpace(t.Labels["alma.session"]); alma != "" {
-			// Formats like "omp:id:01a16527-..." or "pi:id:01a1e743-..."
 			parts := strings.Split(alma, ":")
-			if last := strings.TrimSpace(parts[len(parts)-1]); last != "" {
+			if last := strings.TrimSpace(parts[len(parts)-1]); isLikelySessionID(last) {
 				return last
 			}
 		}
 	}
-	var allArgs []string
-	if t.Foreground != nil {
-		allArgs = append(allArgs, t.Foreground.Argv...)
+	var argSlices [][]string
+	if t.Foreground != nil && len(t.Foreground.Argv) > 0 {
+		argSlices = append(argSlices, t.Foreground.Argv)
 	}
-	allArgs = append(allArgs, t.Argv...)
-	for i := 0; i < len(allArgs); i++ {
-		tok := strings.TrimSpace(allArgs[i])
-		if tok == "-r" || tok == "--resume" || tok == "resume" || tok == "--session" {
-			if i+1 < len(allArgs) {
-				return strings.TrimSpace(allArgs[i+1])
+	if len(t.Argv) > 0 {
+		argSlices = append(argSlices, t.Argv)
+	}
+	for _, args := range argSlices {
+		for i := 0; i < len(args); i++ {
+			tok := strings.TrimSpace(args[i])
+			if tok == "-r" || tok == "--resume" || tok == "--session" || (tok == "resume" && i == 1) {
+				if i+1 < len(args) {
+					cand := strings.Trim(strings.TrimSpace(args[i+1]), `"'`)
+					if isLikelySessionID(cand) {
+						return cand
+					}
+				}
 			}
-		}
-		// Handle shell command strings like `omp -r 01a16527-...`
-		fields := strings.Fields(tok)
-		for j := 0; j < len(fields)-1; j++ {
-			if fields[j] == "-r" || fields[j] == "--resume" || fields[j] == "resume" {
-				return strings.Trim(fields[j+1], `"'`)
+			// Only split shell command strings after `-c` (e.g. `sh -c "omp -r 01a16527..."`), never free-text prompts!
+			if i > 0 && args[i-1] == "-c" {
+				fields := strings.Fields(tok)
+				for j := 0; j < len(fields)-1; j++ {
+					if fields[j] == "-r" || fields[j] == "--resume" || fields[j] == "--session" {
+						cand := strings.Trim(fields[j+1], `"'`)
+						if isLikelySessionID(cand) {
+							return cand
+						}
+					}
+				}
 			}
 		}
 	}
 	return ""
 }
 
-func terminalPID(t Terminal) uint32 {
+func terminalPIDs(t Terminal) []uint32 {
+	var pids []uint32
 	if t.Foreground != nil && t.Foreground.PID > 0 {
-		return t.Foreground.PID
+		pids = append(pids, t.Foreground.PID)
 	}
-	if t.PID != nil {
-		return *t.PID
+	if t.PID != nil && *t.PID > 0 {
+		if len(pids) == 0 || pids[0] != *t.PID {
+			pids = append(pids, *t.PID)
+		}
+	}
+	return pids
+}
+
+func terminalPID(t Terminal) uint32 {
+	pids := terminalPIDs(t)
+	if len(pids) > 0 {
+		return pids[0]
 	}
 	return 0
 }
@@ -271,9 +323,9 @@ func (r *TranscriptResolver) Resolve(ctx context.Context, key TermKey, term Term
 
 	switch kind {
 	case "claude":
-		resolved, ok = r.resolveClaude(ctx, key.InstanceID, on, curPID, term, backend)
+		resolved, ok = r.resolveClaude(ctx, key.InstanceID, on, terminalPIDs(term), term, backend)
 	case "omp", "pi":
-		resolved, ok = r.resolvePiOmp(ctx, key.InstanceID, on, term, backend)
+		resolved, ok = r.resolvePiOmp(ctx, key.InstanceID, on, kind, term, backend)
 	case "codex":
 		resolved, ok = r.resolveCodex(ctx, key.InstanceID, on, term, backend)
 	case "antigravity":
@@ -311,58 +363,67 @@ func (r *TranscriptResolver) fileExists(ctx context.Context, backend TranscriptB
 	return false
 }
 
-func (r *TranscriptResolver) resolveClaude(ctx context.Context, instanceID, on string, pid uint32, term Terminal, backend TranscriptBackend) (ResolvedTranscript, bool) {
-	home := ""
+func (r *TranscriptResolver) resolveClaude(ctx context.Context, instanceID, on string, pids []uint32, term Terminal, backend TranscriptBackend) (ResolvedTranscript, bool) {
 	r.mu.Lock()
-	home = r.homeDirs[instanceID+"::"+on]
+	home := r.homeDirs[instanceID+"::"+on]
 	r.mu.Unlock()
 
-	// 1. Direct PID session metadata lookup (~/.claude/sessions/<pid>.json) — zero MachineExec when home known or relative on remote!
-	if pid > 0 {
-		var candidates []string
+	tryPIDFile := func(pidMetaPath, homePrefix string) (ResolvedTranscript, bool) {
+		fr, err := backend.FileRead(ctx, instanceID, FileReadParams{
+			Path:   pidMetaPath,
+			Offset: 1,
+			Limit:  20,
+			On:     on,
+		})
+		if err != nil {
+			return ResolvedTranscript{}, false
+		}
+		var meta struct {
+			SessionID string `json:"sessionId"`
+			Cwd       string `json:"cwd"`
+		}
+		if json.Unmarshal([]byte(fr.Text), &meta) != nil || meta.SessionID == "" {
+			return ResolvedTranscript{}, false
+		}
+		cwd := nonEmpty(meta.Cwd, term.CurrentDir())
+		slug := claudeProjectSlug(cwd)
+		prefix := homePrefix
+		if prefix == "" && strings.HasPrefix(pidMetaPath, "/") {
+			if idx := strings.Index(pidMetaPath, "/.claude/"); idx > 0 {
+				prefix = pidMetaPath[:idx]
+			}
+		}
+		var jsonlPath string
+		if prefix != "" {
+			jsonlPath = fmt.Sprintf("%s/.claude/projects/%s/%s.jsonl", prefix, slug, meta.SessionID)
+		} else {
+			jsonlPath = fmt.Sprintf(".claude/projects/%s/%s.jsonl", slug, meta.SessionID)
+		}
+		if r.fileExists(ctx, backend, instanceID, on, jsonlPath) {
+			return ResolvedTranscript{Path: jsonlPath, Format: FormatClaude, On: on}, true
+		}
+		return ResolvedTranscript{}, false
+	}
+
+	// 1. Direct PID session metadata lookup (~/.claude/sessions/<pid>.json), falling back to $HOME if relative misses!
+	for _, pid := range pids {
 		if home != "" {
-			candidates = append(candidates, fmt.Sprintf("%s/.claude/sessions/%d.json", home, pid))
+			if res, ok := tryPIDFile(fmt.Sprintf("%s/.claude/sessions/%d.json", home, pid), home); ok {
+				return res, true
+			}
 		}
 		if on != "" {
-			candidates = append(candidates, fmt.Sprintf(".claude/sessions/%d.json", pid))
-		}
-		if len(candidates) == 0 {
-			if h := r.resolveHome(ctx, backend, instanceID, on); h != "" {
-				home = h
-				candidates = append(candidates, fmt.Sprintf("%s/.claude/sessions/%d.json", home, pid))
+			if res, ok := tryPIDFile(fmt.Sprintf(".claude/sessions/%d.json", pid), ""); ok {
+				return res, true
 			}
 		}
-		for _, pidMetaPath := range candidates {
-			fr, err := backend.FileRead(ctx, instanceID, FileReadParams{
-				Path:   pidMetaPath,
-				Offset: 1,
-				Limit:  20,
-				On:     on,
-			})
-			if err != nil {
-				continue
-			}
-			var meta struct {
-				SessionID string `json:"sessionId"`
-				Cwd       string `json:"cwd"`
-			}
-			if json.Unmarshal([]byte(fr.Text), &meta) == nil && meta.SessionID != "" {
-				cwd := nonEmpty(meta.Cwd, term.CurrentDir())
-				slug := claudeProjectSlug(cwd)
-				prefix := home
-				if prefix == "" && strings.HasPrefix(pidMetaPath, "/") {
-					if idx := strings.Index(pidMetaPath, "/.claude/"); idx > 0 {
-						prefix = pidMetaPath[:idx]
-					}
-				}
-				var jsonlPath string
-				if prefix != "" {
-					jsonlPath = fmt.Sprintf("%s/.claude/projects/%s/%s.jsonl", prefix, slug, meta.SessionID)
-				} else {
-					jsonlPath = fmt.Sprintf(".claude/projects/%s/%s.jsonl", slug, meta.SessionID)
-				}
-				if r.fileExists(ctx, backend, instanceID, on, jsonlPath) {
-					return ResolvedTranscript{Path: jsonlPath, Format: FormatClaude, On: on}, true
+	}
+	if len(pids) > 0 && home == "" {
+		if h := r.resolveHome(ctx, backend, instanceID, on); h != "" {
+			home = h
+			for _, pid := range pids {
+				if res, ok := tryPIDFile(fmt.Sprintf("%s/.claude/sessions/%d.json", home, pid), home); ok {
+					return res, true
 				}
 			}
 		}
@@ -381,7 +442,7 @@ func (r *TranscriptResolver) resolveClaude(ctx context.Context, instanceID, on s
 		}
 	}
 
-	// 3. Fallback single read-only MachineExec using Env vars (injection-safe).
+	// 3. Fallback single read-only MachineExec using Env vars (falls through to HC_SLUG if HC_SID misses).
 	er, err := backend.MachineExec(ctx, instanceID, ExecParams{
 		On:      on,
 		Timeout: 5.0,
@@ -389,32 +450,47 @@ func (r *TranscriptResolver) resolveClaude(ctx context.Context, instanceID, on s
 			"HC_SID":  sid,
 			"HC_SLUG": slug,
 		},
-		Line: `if [ -n "$HC_SID" ]; then ls -1t "$HOME/.claude/projects"/*/*"$HC_SID"*.jsonl 2>/dev/null | head -n 1; elif [ -n "$HC_SLUG" ]; then ls -1t "$HOME/.claude/projects/$HC_SLUG"/*.jsonl 2>/dev/null | head -n 1; fi`,
+		Line: `found=""; if [ -n "$HC_SID" ]; then found=$(ls -1t "$HOME/.claude/projects"/*/*"$HC_SID"*.jsonl 2>/dev/null | head -n 1); fi; if [ -z "$found" ] && [ -n "$HC_SLUG" ]; then found=$(ls -1t "$HOME/.claude/projects/$HC_SLUG"/*.jsonl 2>/dev/null | head -n 1); fi; printf "%s\n" "$found"`,
 	})
 	if err != nil {
 		return ResolvedTranscript{}, false
 	}
-	found := firstOutputLine(er.StdoutText())
-	if found != "" {
+	if found := firstOutputLine(er.StdoutText()); found != "" {
 		return ResolvedTranscript{Path: found, Format: FormatClaude, On: on}, true
 	}
 	return ResolvedTranscript{}, false
 }
 
-func (r *TranscriptResolver) resolvePiOmp(ctx context.Context, instanceID, on string, term Terminal, backend TranscriptBackend) (ResolvedTranscript, bool) {
+func (r *TranscriptResolver) resolvePiOmp(ctx context.Context, instanceID, on, kind string, term Terminal, backend TranscriptBackend) (ResolvedTranscript, bool) {
 	sid := extractSessionIDFromTerm(term)
-	if strings.HasSuffix(sid, ".jsonl") && r.fileExists(ctx, backend, instanceID, on, sid) {
-		return ResolvedTranscript{Path: sid, Format: FormatPiOmp, On: on}, true
+	if strings.HasSuffix(sid, ".jsonl") {
+		cand := sid
+		if strings.HasPrefix(cand, "~/") {
+			if h := r.resolveHome(ctx, backend, instanceID, on); h != "" {
+				cand = h + cand[1:]
+			}
+		}
+		if r.fileExists(ctx, backend, instanceID, on, cand) {
+			return ResolvedTranscript{Path: cand, Format: FormatPiOmp, On: on}, true
+		}
 	}
 	slug := strings.Trim(reNonAlnum.ReplaceAllString(term.CurrentDir(), "-"), "-")
+	primaryDir := ".omp"
+	secondaryDir := ".pi"
+	if kind == "pi" {
+		primaryDir = ".pi"
+		secondaryDir = ".omp"
+	}
 	er, err := backend.MachineExec(ctx, instanceID, ExecParams{
 		On:      on,
 		Timeout: 5.0,
 		Env: map[string]string{
 			"HC_SID":  sid,
 			"HC_SLUG": slug,
+			"HC_P":    primaryDir,
+			"HC_S":    secondaryDir,
 		},
-		Line: `if [ -n "$HC_SID" ]; then ls -1t "$HOME/.omp/agent/sessions"/*/*"$HC_SID"*.jsonl "$HOME/.pi/agent/sessions"/*/*"$HC_SID"*.jsonl 2>/dev/null | head -n 1; elif [ -n "$HC_SLUG" ]; then ls -1t "$HOME/.omp/agent/sessions"/*"$HC_SLUG"*/*.jsonl "$HOME/.pi/agent/sessions"/*"$HC_SLUG"*/*.jsonl 2>/dev/null | head -n 1; else ls -1t "$HOME/.omp/agent/sessions"/*/*.jsonl "$HOME/.pi/agent/sessions"/*/*.jsonl 2>/dev/null | head -n 1; fi`,
+		Line: `found=""; if [ -n "$HC_SID" ]; then found=$(ls -1t "$HOME/$HC_P/agent/sessions"/*/*"$HC_SID"*.jsonl "$HOME/$HC_S/agent/sessions"/*/*"$HC_SID"*.jsonl 2>/dev/null | head -n 1); fi; if [ -z "$found" ] && [ -n "$HC_SLUG" ]; then found=$(ls -1t "$HOME/$HC_P/agent/sessions"/*"$HC_SLUG"*/*.jsonl "$HOME/$HC_S/agent/sessions"/*"$HC_SLUG"*/*.jsonl 2>/dev/null | head -n 1); fi; if [ -z "$found" ]; then found=$(ls -1t "$HOME/$HC_P/agent/sessions"/*/*.jsonl "$HOME/$HC_S/agent/sessions"/*/*.jsonl 2>/dev/null | head -n 1); fi; printf "%s\n" "$found"`,
 	})
 	if err != nil {
 		return ResolvedTranscript{}, false
@@ -435,7 +511,7 @@ func (r *TranscriptResolver) resolveCodex(ctx context.Context, instanceID, on st
 			"HC_SID": sid,
 			"HC_CWD": cwd,
 		},
-		Line: `if [ -n "$HC_SID" ]; then ls -1t "$HOME/.codex/sessions"/*/*/*/*"$HC_SID"*.jsonl 2>/dev/null | head -n 1; else for f in $(ls -1t "$HOME/.codex/sessions"/*/*/*/*.jsonl 2>/dev/null | head -n 15); do head -n 1 "$f" | grep -Fq "\"cwd\":\"$HC_CWD\"" && { printf "%s\n" "$f"; break; }; done; fi`,
+		Line: `found=""; if [ -n "$HC_SID" ]; then found=$(ls -1t "$HOME/.codex/sessions"/*/*/*/*"$HC_SID"*.jsonl 2>/dev/null | head -n 1); fi; if [ -z "$found" ]; then for f in $(ls -1t "$HOME/.codex/sessions"/*/*/*/*.jsonl 2>/dev/null | head -n 15); do head -n 1 "$f" | grep -Fq "\"cwd\":\"$HC_CWD\"" && { found="$f"; break; }; done; fi; printf "%s\n" "$found"`,
 	})
 	if err != nil {
 		return ResolvedTranscript{}, false
@@ -481,8 +557,9 @@ func firstOutputLine(s string) string {
 // ChatSessionController (Root-Scope Reactive Session Transcript State)
 
 type optimisticMsg struct {
-	id   string
-	text string
+	id        string
+	text      string
+	afterLine int // only reconciles against JSONL items with SourceLine > afterLine
 }
 
 // ChatSessionController manages paginated JSONL loading, error-free incremental tailing,
@@ -495,6 +572,8 @@ type ChatSessionController struct {
 	resolver   *TranscriptResolver
 	vtFallback func() string
 
+	syncMu     sync.Mutex
+	loopCtx    context.Context
 	cancel     context.CancelFunc
 	refreshing atomic.Bool
 	optSeq     atomic.Uint64
@@ -532,12 +611,15 @@ func NewChatSessionController(
 	if resolver == nil {
 		resolver = NewTranscriptResolver()
 	}
+	lctx, lcancel := context.WithCancel(context.Background())
 	c := &ChatSessionController{
 		cx:         cx,
 		key:        key,
 		backend:    backend,
 		resolver:   resolver,
 		vtFallback: vtFallback,
+		loopCtx:    lctx,
+		cancel:     lcancel,
 		source:     SourceLoading,
 		expanded:   make(map[string]bool),
 	}
@@ -551,11 +633,16 @@ func NewChatSessionController(
 
 // StartLoop launches the initial sync and lightweight 1.5s working-only tail ticker.
 func (c *ChatSessionController) StartLoop() {
-	ctx, cancel := context.WithCancel(context.Background())
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
 	if c.cancel != nil {
 		c.cancel()
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c.loopCtx = ctx
 	c.cancel = cancel
 	c.mu.Unlock()
 
@@ -610,9 +697,22 @@ func (c *ChatSessionController) Close() {
 	}
 }
 
+func (c *ChatSessionController) isClosed() bool {
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	return closed
+}
+
 func (c *ChatSessionController) bumpRev(scrollToEnd bool) {
+	if c.isClosed() {
+		return
+	}
 	if c.cx != nil && c.rev != nil {
 		c.cx.Post(func() {
+			if c.isClosed() {
+				return
+			}
 			c.rev.Set(c.rev.Get() + 1)
 			if scrollToEnd && (c.scrolledUp == nil || !c.scrolledUp.Get()) {
 				c.scrollRef.ScrollToEnd(false)
@@ -698,43 +798,73 @@ func (c *ChatSessionController) ToggleExpanded(id string) {
 }
 
 // AddOptimisticUser immediately appends a sent user message to the chat tail
-// and automatically deduplicates it once the underlying transcript records it.
-func (c *ChatSessionController) AddOptimisticUser(text string) {
+// (recording its baseline file line so earlier identical prompts never eat it),
+// returning an ID that RemoveOptimistic can roll back if terminal.send fails.
+func (c *ChatSessionController) AddOptimisticUser(text string) string {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
-		return
+		return ""
 	}
 	seq := c.optSeq.Add(1)
+	id := fmt.Sprintf("opt-%d", seq)
 	c.mu.Lock()
 	c.optimistic = append(c.optimistic, optimisticMsg{
-		id:   fmt.Sprintf("opt-%d", seq),
-		text: trimmed,
+		id:        id,
+		text:      trimmed,
+		afterLine: c.lastLine,
 	})
 	c.rebuildMergedLocked()
 	c.mu.Unlock()
 	c.bumpRev(true)
+	return id
+}
+
+// RemoveOptimistic removes a pending optimistic message (used when terminal.send returns an error).
+func (c *ChatSessionController) RemoveOptimistic(id string) {
+	if id == "" {
+		return
+	}
+	c.mu.Lock()
+	kept := c.optimistic[:0]
+	changed := false
+	for _, opt := range c.optimistic {
+		if opt.id == id {
+			changed = true
+			continue
+		}
+		kept = append(kept, opt)
+	}
+	c.optimistic = kept
+	if changed {
+		c.rebuildMergedLocked()
+	}
+	c.mu.Unlock()
+	if changed {
+		c.bumpRev(false)
+	}
 }
 
 func (c *ChatSessionController) rebuildMergedLocked() {
-	// Reconcile optimistic user messages against the tail of parsedItems (last 20 items).
+	// Reconcile optimistic user messages ONLY against parsed items strictly newer than opt.afterLine!
 	if len(c.optimistic) > 0 && len(c.parsedItems) > 0 {
-		tailStart := len(c.parsedItems) - 20
-		if tailStart < 0 {
-			tailStart = 0
-		}
 		usedIdx := make(map[int]bool)
 		var remaining []optimisticMsg
 		for _, opt := range c.optimistic {
 			matched := false
-			for i := tailStart; i < len(c.parsedItems); i++ {
+			for i := 0; i < len(c.parsedItems); i++ {
 				if usedIdx[i] {
 					continue
 				}
-				if c.parsedItems[i].Role == RoleUser && strings.TrimSpace(c.parsedItems[i].Text) == opt.text {
-					usedIdx[i] = true
-					matched = true
-					break
+				it := c.parsedItems[i]
+				if it.Role != RoleUser || strings.TrimSpace(it.Text) != opt.text {
+					continue
 				}
+				if c.source == SourceJSONL && it.SourceLine <= opt.afterLine {
+					continue
+				}
+				usedIdx[i] = true
+				matched = true
+				break
 			}
 			if !matched {
 				remaining = append(remaining, opt)
@@ -756,21 +886,30 @@ func (c *ChatSessionController) rebuildMergedLocked() {
 	c.mergedItems = merged
 }
 
-// RefreshAsync triggers a non-overlapping background refresh.
+// RefreshAsync triggers a non-overlapping background refresh tied to the controller's lifecycle context.
 func (c *ChatSessionController) RefreshAsync() {
-	if !c.refreshing.CompareAndSwap(false, true) {
+	if c.isClosed() || !c.refreshing.CompareAndSwap(false, true) {
 		return
+	}
+	c.mu.Lock()
+	parentCtx := c.loopCtx
+	c.mu.Unlock()
+	if parentCtx == nil {
+		parentCtx = context.Background()
 	}
 	go func() {
 		defer c.refreshing.Store(false)
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
 		defer cancel()
 		_ = c.RefreshSync(ctx)
 	}()
 }
 
-// RefreshSync performs one synchronous transcript discovery / tail step.
+// RefreshSync performs one serialized transcript discovery / tail step.
 func (c *ChatSessionController) RefreshSync(ctx context.Context) error {
+	c.syncMu.Lock()
+	defer c.syncMu.Unlock()
+
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -799,17 +938,48 @@ func (c *ChatSessionController) RefreshSync(ctx context.Context) error {
 			}
 		}
 	}
+	if c.isClosed() || ctx.Err() != nil {
+		return ctx.Err()
+	}
 
 	if !hasResolved {
 		c.applyVTFallback()
 		return nil
 	}
 
-	// Initial tail window load vs error-free incremental tailing from max(1, lastLine).
 	if lastLine <= 0 {
 		return c.loadInitialJSONLWindow(ctx, curPath, curFmt, curOn)
 	}
 	return c.tailJSONLFromLastLine(ctx, curPath, curFmt, curOn, lastLine)
+}
+
+// readWindowAdaptive halves Limit if oversized lines hit herdr-core's 8 MiB file.read response cap.
+func (c *ChatSessionController) readWindowAdaptive(ctx context.Context, path, on string, endLine, wantLines int) (FileReadResult, error) {
+	limit := wantLines
+	for {
+		start := endLine - limit + 1
+		if start < 1 {
+			start = 1
+		}
+		count := endLine - start + 1
+		win, err := c.backend.FileRead(ctx, c.key.InstanceID, FileReadParams{
+			Path:   path,
+			Offset: start,
+			Limit:  count,
+			On:     on,
+		})
+		if err == nil {
+			return win, nil
+		}
+		var rpcErr *RPCError
+		if errors.As(err, &rpcErr) && (rpcErr.Kind() == "not_found" || rpcErr.Kind() == "invalid_params") {
+			return FileReadResult{}, err
+		}
+		if limit <= 10 {
+			return FileReadResult{}, err
+		}
+		limit /= 2
+	}
 }
 
 func (c *ChatSessionController) loadInitialJSONLWindow(ctx context.Context, path string, format TranscriptFormat, on string) error {
@@ -848,22 +1018,18 @@ func (c *ChatSessionController) loadInitialJSONLWindow(ctx context.Context, path
 		c.format = format
 		c.onMachine = on
 		c.source = SourceJSONL
+		c.firstLine = 0
+		c.lastLine = 0
+		c.totalLines = 0
+		c.rawLines = nil
+		c.parsedItems = nil
 		c.rebuildMergedLocked()
 		c.mu.Unlock()
 		c.bumpRev(false)
 		return nil
 	}
 
-	start := total - chatTailWindowLines + 1
-	if start < 1 {
-		start = 1
-	}
-	win, err := c.backend.FileRead(ctx, c.key.InstanceID, FileReadParams{
-		Path:   path,
-		Offset: start,
-		Limit:  chatTailWindowLines,
-		On:     on,
-	})
+	win, err := c.readWindowAdaptive(ctx, path, on, total, chatTailWindowLines)
 	if err != nil {
 		c.resolver.Invalidate(c.key)
 		c.applyVTFallback()
@@ -871,7 +1037,7 @@ func (c *ChatSessionController) loadInitialJSONLWindow(ctx context.Context, path
 	}
 
 	chunkLines := splitJSONLLines(win.Text)
-	parsed := ParseTranscriptLines(format, chunkLines)
+	parsed := ParseTranscriptLinesAt(format, chunkLines, win.First)
 
 	c.mu.Lock()
 	c.resolvedPath = path
@@ -890,84 +1056,105 @@ func (c *ChatSessionController) loadInitialJSONLWindow(ctx context.Context, path
 }
 
 func (c *ChatSessionController) tailJSONLFromLastLine(ctx context.Context, path string, format TranscriptFormat, on string, lastLine int) error {
-	// Always query from known-valid lastLine (>= 1) so EOF never triggers invalid_params!
-	win, err := c.backend.FileRead(ctx, c.key.InstanceID, FileReadParams{
-		Path:   path,
-		Offset: lastLine,
-		Limit:  201,
-		On:     on,
-	})
-	if err != nil {
-		// Guard: if offset > lines (e.g. file truncated or empty), handle gracefully without dropping loaded JSONL on normal EOF.
-		if isOffsetPastEOF(err, lastLine) {
-			return nil
+	curOffset := lastLine
+	anyChanged := false
+	grew := false
+
+	// Loop up to 8 batches (up to ~1600 lines) so large multi-tool bursts finish catching up in one sync!
+	for batch := 0; batch < 8; batch++ {
+		win, err := c.backend.FileRead(ctx, c.key.InstanceID, FileReadParams{
+			Path:   path,
+			Offset: curOffset,
+			Limit:  201,
+			On:     on,
+		})
+		if err != nil {
+			// Because curOffset == lastLine >= 1, "offset N: the file has M lines" means M < curOffset (file truncated/rotated)!
+			if isOffsetPastEOF(err, curOffset) {
+				c.mu.Lock()
+				c.lastLine = 0
+				c.mu.Unlock()
+				return c.loadInitialJSONLWindow(ctx, path, format, on)
+			}
+			var rpcErr *RPCError
+			if errors.As(err, &rpcErr) && rpcErr.Kind() == "not_found" {
+				c.resolver.Invalidate(c.key)
+				c.mu.Lock()
+				c.resolvedPath = ""
+				c.lastLine = 0
+				c.mu.Unlock()
+				c.applyVTFallback()
+			}
+			break
 		}
-		var rpcErr *RPCError
-		if errors.As(err, &rpcErr) && rpcErr.Kind() == "not_found" {
-			c.resolver.Invalidate(c.key)
+
+		if win.Lines < curOffset {
 			c.mu.Lock()
-			c.resolvedPath = ""
 			c.lastLine = 0
 			c.mu.Unlock()
-			c.applyVTFallback()
+			return c.loadInitialJSONLWindow(ctx, path, format, on)
 		}
-		return nil
-	}
 
-	// File rotated/shrunk: reload fresh window.
-	if win.Lines < lastLine {
+		chunk := splitJSONLLines(win.Text)
+		if len(chunk) == 0 {
+			break
+		}
+
 		c.mu.Lock()
-		c.lastLine = 0
+		prevCount := len(c.mergedItems)
+		if len(c.rawLines) > 0 && win.First == c.lastLine {
+			sameTail := len(chunk) == 1 && c.rawLines[len(c.rawLines)-1] == chunk[0] && win.Lines == c.totalLines
+			if sameTail {
+				c.mu.Unlock()
+				break
+			}
+			c.rawLines[len(c.rawLines)-1] = chunk[0]
+			if len(chunk) > 1 {
+				c.rawLines = append(c.rawLines, chunk[1:]...)
+			}
+		} else if win.First > c.lastLine {
+			c.rawLines = append(c.rawLines, chunk...)
+		}
+		c.lastLine = win.Last
+		c.totalLines = win.Lines
+		c.source = SourceJSONL
+		c.parsedItems = ParseTranscriptLinesAt(format, c.rawLines, c.firstLine)
+		c.rebuildMergedLocked()
+		if len(c.mergedItems) > prevCount {
+			grew = true
+		}
+		anyChanged = true
 		c.mu.Unlock()
-		return c.loadInitialJSONLWindow(ctx, path, format, on)
-	}
 
-	chunk := splitJSONLLines(win.Text)
-	if len(chunk) == 0 {
-		return nil
-	}
-
-	c.mu.Lock()
-	prevCount := len(c.mergedItems)
-	if len(c.rawLines) > 0 && win.First == c.lastLine {
-		// Replace last line (in case previous read saw a partial flush) and append new lines.
-		sameTail := len(chunk) == 1 && c.rawLines[len(c.rawLines)-1] == chunk[0] && win.Lines == c.totalLines
-		if sameTail {
-			c.mu.Unlock()
-			return nil
+		if win.Last >= win.Lines {
+			break
 		}
-		c.rawLines[len(c.rawLines)-1] = chunk[0]
-		if len(chunk) > 1 {
-			c.rawLines = append(c.rawLines, chunk[1:]...)
-		}
-	} else if win.First > c.lastLine {
-		c.rawLines = append(c.rawLines, chunk...)
+		curOffset = win.Last
 	}
-	c.lastLine = win.Last
-	c.totalLines = win.Lines
-	c.source = SourceJSONL
-	c.parsedItems = ParseTranscriptLines(format, c.rawLines)
-	c.rebuildMergedLocked()
-	grew := len(c.mergedItems) > prevCount
-	c.mu.Unlock()
 
-	c.bumpRev(grew)
+	if anyChanged {
+		c.bumpRev(grew)
+	}
 	return nil
 }
 
 // LoadOlder triggers an asynchronous fetch of the previous 250 JSONL lines.
 func (c *ChatSessionController) LoadOlder() {
 	c.mu.Lock()
-	if c.loadingOlder || c.source != SourceJSONL || c.firstLine <= 1 {
+	if c.closed || c.loadingOlder || c.source != SourceJSONL || c.firstLine <= 1 {
 		c.mu.Unlock()
 		return
 	}
 	c.loadingOlder = true
+	parentCtx := c.loopCtx
 	c.mu.Unlock()
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
 	c.bumpRev(false)
 
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		ctx, cancel := context.WithTimeout(parentCtx, 12*time.Second)
 		defer cancel()
 		_ = c.LoadOlderSync(ctx)
 	}()
@@ -975,8 +1162,11 @@ func (c *ChatSessionController) LoadOlder() {
 
 // LoadOlderSync synchronously prepends up to 250 earlier JSONL lines before firstLine.
 func (c *ChatSessionController) LoadOlderSync(ctx context.Context) error {
+	c.syncMu.Lock()
+	defer c.syncMu.Unlock()
+
 	c.mu.Lock()
-	if c.source != SourceJSONL || c.firstLine <= 1 || c.resolvedPath == "" {
+	if c.closed || c.source != SourceJSONL || c.firstLine <= 1 || c.resolvedPath == "" {
 		c.loadingOlder = false
 		c.mu.Unlock()
 		return nil
@@ -995,18 +1185,7 @@ func (c *ChatSessionController) LoadOlderSync(ctx context.Context) error {
 		c.bumpRev(false)
 	}()
 
-	prevStart := prevEnd - chatTailWindowLines + 1
-	if prevStart < 1 {
-		prevStart = 1
-	}
-	count := prevEnd - prevStart + 1
-
-	win, err := c.backend.FileRead(ctx, c.key.InstanceID, FileReadParams{
-		Path:   path,
-		Offset: prevStart,
-		Limit:  count,
-		On:     on,
-	})
+	win, err := c.readWindowAdaptive(ctx, path, on, prevEnd, chatTailWindowLines)
 	if err != nil {
 		return err
 	}
@@ -1021,26 +1200,42 @@ func (c *ChatSessionController) LoadOlderSync(ctx context.Context) error {
 	if win.Lines > c.totalLines {
 		c.totalLines = win.Lines
 	}
-	c.parsedItems = ParseTranscriptLines(format, c.rawLines)
+	c.parsedItems = ParseTranscriptLinesAt(format, c.rawLines, c.firstLine)
 	c.rebuildMergedLocked()
 	c.mu.Unlock()
 	return nil
 }
 
 func (c *ChatSessionController) applyVTFallback() {
+	if c.isClosed() {
+		return
+	}
 	raw := ""
 	if c.vtFallback != nil {
 		raw = c.vtFallback()
 	}
-	if strings.TrimSpace(raw) == "" && c.backend != nil {
-		rctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	if strings.TrimSpace(raw) == "" && c.backend != nil && !c.isClosed() {
+		c.mu.Lock()
+		parentCtx := c.loopCtx
+		c.mu.Unlock()
+		if parentCtx == nil {
+			parentCtx = context.Background()
+		}
+		rctx, cancel := context.WithTimeout(parentCtx, 4*time.Second)
 		if rr, err := c.backend.ReadTerminal(rctx, c.key, 400); err == nil {
 			raw = rr.Text
 		}
 		cancel()
 	}
+	if c.isClosed() {
+		return
+	}
 	parsed := ParseVTTranscript(raw)
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
 	c.source = SourceVTFallback
 	c.parsedItems = parsed
 	c.rebuildMergedLocked()

@@ -81,6 +81,47 @@ func RenderChatSession(
 							Gap:     Tokens.Space2,
 						},
 						Children: []core.Node{
+							// Compact source & manual refresh meta bar (keeps TopHeader spacious on 390px phones)
+							core.View{
+								Style: core.Style{
+									Direction:      core.Row,
+									AlignItems:     core.AlignCenter,
+									JustifyContent: core.JustifySpaceBetween,
+									Gap:            Tokens.Space2,
+								},
+								Children: []core.Node{
+									core.Text{
+										MaxLines: 1,
+										ContentFunc: func() string {
+											t := termFn()
+											parts := []string{t.Key.Addr}
+											if d := shortPath(t.Terminal.CurrentDir()); d != "" {
+												parts = append(parts, d)
+											}
+											return strings.Join(parts, " · ")
+										},
+										StyleFunc: func() core.Style {
+											pal := a.paletteOf(cx)
+											return core.Style{
+												FlexGrow:   1,
+												FlexShrink: 1,
+												MinWidth:   core.Pt(0),
+												Color:      pal.TextMuted,
+												FontSize:   Tokens.FontMonoMeta,
+												FontFamily: core.FontMonospace,
+											}
+										},
+									},
+									FilterPill(cx, a, "chat-source-pill", func() string {
+										return chat.Source().Label() + " · 刷新"
+									}, func() bool {
+										return chat.Source() == SourceJSONL
+									}, nil, func() {
+										chat.RefreshAsync()
+										a.notifyToast("正在刷新对话记录…")
+									}),
+								},
+							},
 							// Pagination loader for earlier JSONL lines
 							core.Show{
 								When: chat.HasOlder,
@@ -394,183 +435,204 @@ func renderChatThinkingPill(cx *core.Scope, a *App, chat *ChatSessionController,
 	}
 }
 
+type indexedChatTool struct {
+	Key   string
+	Index int
+	Tool  ChatToolCall
+}
+
 func renderChatToolGroup(cx *core.Scope, a *App, chat *ChatSessionController, itemFn func() ChatTurnItem) core.Node {
-	it0 := itemFn()
-	groupID := it0.ID
-	rows := make([]core.Node, 0, len(it0.Tools))
-	for idx := range it0.Tools {
-		ti := idx
-		expandKey := fmt.Sprintf("%s#%d", groupID, ti)
-		testID := fmt.Sprintf("chat-tool-%s-%d", groupID, ti)
-		getTC := func() ChatToolCall {
-			cur := itemFn()
-			if ti < len(cur.Tools) {
-				return cur.Tools[ti]
-			}
-			return it0.Tools[ti]
-		}
-		rows = append(rows, core.View{
-			StyleFunc: func() core.Style {
-				pal := a.paletteOf(cx)
-				bc := pal.Border
-				if getTC().IsError {
-					bc = pal.Danger
-				}
-				return core.Style{
-					Background:   pal.SurfaceRaised,
-					CornerRadius: Tokens.RadiusCtrl,
-					BorderWidth:  1,
-					BorderColor:  bc,
-					Overflow:     core.Hidden,
-				}
-			},
-			Children: []core.Node{
-				core.View{
-					TestID: testID,
-					Role:   core.RoleButton,
-					OnPress: func(core.PressEvent) {
-						chat.ToggleExpanded(expandKey)
-					},
-					Style: core.Style{
-						Direction:  core.Row,
-						AlignItems: core.AlignCenter,
-						Gap:        core.Points(6),
-						Padding:    core.Symmetric(core.Points(6), Tokens.Space3),
-					},
-					Children: []core.Node{
-						core.View{
-							StyleFunc: func() core.Style {
-								pal := a.paletteOf(cx)
-								tc := getTC()
-								c := pal.TextMuted
-								if tc.IsError {
-									c = pal.Danger
-								} else if tc.Output != "" {
-									c = pal.Accent
-								}
-								return core.Style{
-									FlexShrink:   0,
-									Width:        core.Pt(7),
-									Height:       core.Pt(7),
-									CornerRadius: 4,
-									Background:   c,
-								}
-							},
-						},
-						core.Text{
-							MaxLines:    1,
-							ContentFunc: func() string { return getTC().Name },
-							StyleFunc: func() core.Style {
-								pal := a.paletteOf(cx)
-								fg := pal.Text
-								if getTC().IsError {
-									fg = pal.Danger
-								}
-								return core.Style{
-									FlexShrink: 0,
-									Color:      fg,
-									FontSize:   Tokens.FontMonoMeta,
-									FontWeight: core.FontWeightSemibold,
-									FontFamily: core.FontMonospace,
-								}
-							},
-						},
-						core.Text{
-							MaxLines:    1,
-							ContentFunc: func() string { return getTC().Target },
-							StyleFunc: func() core.Style {
-								pal := a.paletteOf(cx)
-								return core.Style{
-									FlexGrow:   1,
-									FlexShrink: 1,
-									MinWidth:   core.Pt(0),
-									Color:      pal.TextSecondary,
-									FontSize:   Tokens.FontMonoMeta,
-									FontFamily: core.FontMonospace,
-								}
-							},
-						},
-						core.Text{
-							ContentFunc: func() string {
-								if chat.IsExpanded(expandKey) {
-									return "▾"
-								}
-								return "▸"
-							},
-							StyleFunc: func() core.Style {
-								pal := a.paletteOf(cx)
-								return core.Style{
-									FlexShrink: 0,
-									Color:      pal.TextMuted,
-									FontSize:   Tokens.FontMonoMeta,
-								}
-							},
-						},
-					},
-				},
-				core.Show{
-					When: func() bool { return chat.IsExpanded(expandKey) },
-					Then: func(cx *core.Scope) core.Node {
-						return core.View{
-							StyleFunc: func() core.Style {
-								pal := a.paletteOf(cx)
-								return core.Style{
-									Padding:     core.Symmetric(Tokens.Space2, Tokens.Space3),
-									Borders:     core.Edges{Top: 1},
-									BorderColor: pal.Separator,
-									Background:  pal.Surface,
-									Gap:         core.Points(4),
-								}
-							},
-							Children: []core.Node{
-								core.Show{
-									When: func() bool { return getTC().InputSummary != "" },
-									Then: func(cx *core.Scope) core.Node {
-										return core.Text{
-											ContentFunc: func() string { return "参数: " + getTC().InputSummary },
-											StyleFunc: func() core.Style {
-												pal := a.paletteOf(cx)
-												return core.Style{
-													Color:      pal.TextMuted,
-													FontSize:   Tokens.FontMonoMeta,
-													FontFamily: core.FontMonospace,
-												}
-											},
-										}
-									},
-								},
-								core.Text{
-									ContentFunc: func() string {
-										out := getTC().Output
-										if out == "" {
-											return "（执行中或无输出）"
-										}
-										return out
-									},
-									StyleFunc: func() core.Style {
-										pal := a.paletteOf(cx)
-										fg := pal.TextSecondary
-										if getTC().IsError {
-											fg = pal.Danger
-										}
-										return core.Style{
-											Color:      fg,
-											FontSize:   Tokens.FontMonoMeta,
-											FontFamily: core.FontMonospace,
-										}
-									},
-								},
-							},
-						}
-					},
-				},
-			},
-		})
-	}
+	groupID := itemFn().ID
 	return core.View{
-		Style:    core.Style{Gap: core.Points(4)},
-		Children: rows,
+		Style: core.Style{Gap: core.Points(4)},
+		Children: []core.Node{
+			core.Each(
+				func() []indexedChatTool {
+					tools := itemFn().Tools
+					out := make([]indexedChatTool, len(tools))
+					for i, tc := range tools {
+						out[i] = indexedChatTool{
+							Key:   fmt.Sprintf("%s#%d", groupID, i),
+							Index: i,
+							Tool:  tc,
+						}
+					}
+					return out
+				},
+				func(it indexedChatTool) string { return it.Key },
+				func(cx *core.Scope, entryFn func() indexedChatTool, _ func() int) core.Node {
+					initEntry := entryFn()
+					expandKey := initEntry.Key
+					testID := fmt.Sprintf("chat-tool-%s-%d", groupID, initEntry.Index)
+					getTC := func() ChatToolCall { return entryFn().Tool }
+
+					return core.View{
+						StyleFunc: func() core.Style {
+							pal := a.paletteOf(cx)
+							bc := pal.Border
+							if getTC().IsError {
+								bc = pal.Danger
+							}
+							return core.Style{
+								Background:   pal.SurfaceRaised,
+								CornerRadius: Tokens.RadiusCtrl,
+								BorderWidth:  1,
+								BorderColor:  bc,
+								Overflow:     core.Hidden,
+							}
+						},
+						Children: []core.Node{
+							core.View{
+								TestID: testID,
+								Role:   core.RoleButton,
+								OnPress: func(core.PressEvent) {
+									chat.ToggleExpanded(expandKey)
+								},
+								Style: core.Style{
+									Direction:  core.Row,
+									AlignItems: core.AlignCenter,
+									Gap:        core.Points(6),
+									Padding:    core.Symmetric(core.Points(6), Tokens.Space3),
+								},
+								Children: []core.Node{
+									core.View{
+										StyleFunc: func() core.Style {
+											pal := a.paletteOf(cx)
+											tc := getTC()
+											c := pal.TextMuted
+											if tc.IsError {
+												c = pal.Danger
+											} else if tc.Output != "" {
+												c = pal.Accent
+											}
+											return core.Style{
+												FlexShrink:   0,
+												Width:        core.Pt(7),
+												Height:       core.Pt(7),
+												CornerRadius: 4,
+												Background:   c,
+											}
+										},
+									},
+									core.Text{
+										MaxLines:    1,
+										ContentFunc: func() string { return singleLineClip(getTC().Name, 24) },
+										StyleFunc: func() core.Style {
+											pal := a.paletteOf(cx)
+											fg := pal.Text
+											if getTC().IsError {
+												fg = pal.Danger
+											}
+											return core.Style{
+												FlexShrink: 0,
+												Color:      fg,
+												FontSize:   Tokens.FontMonoMeta,
+												FontWeight: core.FontWeightSemibold,
+												FontFamily: core.FontMonospace,
+											}
+										},
+									},
+									core.Text{
+										MaxLines:    1,
+										ContentFunc: func() string { return getTC().Target },
+										StyleFunc: func() core.Style {
+											pal := a.paletteOf(cx)
+											return core.Style{
+												FlexGrow:   1,
+												FlexShrink: 1,
+												MinWidth:   core.Pt(0),
+												Color:      pal.TextSecondary,
+												FontSize:   Tokens.FontMonoMeta,
+												FontFamily: core.FontMonospace,
+											}
+										},
+									},
+									core.Text{
+										ContentFunc: func() string {
+											if chat.IsExpanded(expandKey) {
+												return "▾"
+											}
+											return "▸"
+										},
+										StyleFunc: func() core.Style {
+											pal := a.paletteOf(cx)
+											return core.Style{
+												FlexShrink: 0,
+												Color:      pal.TextMuted,
+												FontSize:   Tokens.FontMonoMeta,
+											}
+										},
+									},
+								},
+							},
+							core.Show{
+								When: func() bool { return chat.IsExpanded(expandKey) },
+								Then: func(cx *core.Scope) core.Node {
+									return core.View{
+										StyleFunc: func() core.Style {
+											pal := a.paletteOf(cx)
+											return core.Style{
+												Padding:     core.Symmetric(Tokens.Space2, Tokens.Space3),
+												Borders:     core.Edges{Top: 1},
+												BorderColor: pal.Separator,
+												Background:  pal.Surface,
+												Gap:         core.Points(4),
+											}
+										},
+										Children: []core.Node{
+											core.Show{
+												When: func() bool { return getTC().InputSummary != "" },
+												Then: func(cx *core.Scope) core.Node {
+													return core.Text{
+														ContentFunc: func() string { return "参数: " + getTC().InputSummary },
+														StyleFunc: func() core.Style {
+															pal := a.paletteOf(cx)
+															return core.Style{
+																Color:      pal.TextMuted,
+																FontSize:   Tokens.FontMonoMeta,
+																FontFamily: core.FontMonospace,
+															}
+														},
+													}
+												},
+											},
+											core.Text{
+												ContentFunc: func() string {
+													out := getTC().Output
+													if out == "" {
+														return "（执行中或无输出）"
+													}
+													return out
+												},
+												StyleFunc: func() core.Style {
+													pal := a.paletteOf(cx)
+													fg := pal.TextSecondary
+													if getTC().IsError {
+														fg = pal.Danger
+													}
+													return core.Style{
+														Color:      fg,
+														FontSize:   Tokens.FontMonoMeta,
+														FontFamily: core.FontMonospace,
+													}
+												},
+											},
+										},
+									}
+								},
+							},
+						},
+					}
+				},
+			),
+		},
 	}
+}
+
+type indexedMarkdownBlock struct {
+	Key   string
+	Index int
+	Block MarkdownBlock
 }
 
 func renderChatAssistantCard(
@@ -579,181 +641,203 @@ func renderChatAssistantCard(
 	itemFn func() ChatTurnItem,
 	termFn func() AggregatedTerminal,
 ) core.Node {
-	it0 := itemFn()
-	blocks := it0.Blocks
-	if len(blocks) == 0 && it0.Text != "" {
-		blocks = SplitMarkdownBlocks(it0.Text)
-	}
+	cardID := itemFn().ID
 
-	blockNodes := make([]core.Node, 0, len(blocks))
-	for i, blk := range blocks {
-		bi := i
-		b := blk
-		switch b.Kind {
-		case BlockCode:
-			codeText := b.Text
-			langLabel := b.Lang
-			if langLabel == "" {
-				langLabel = "code"
+	blocksNode := core.Each(
+		func() []indexedMarkdownBlock {
+			it := itemFn()
+			blks := it.Blocks
+			if len(blks) == 0 && it.Text != "" {
+				blks = SplitMarkdownBlocks(it.Text)
 			}
-			blockNodes = append(blockNodes, core.View{
-				StyleFunc: func() core.Style {
-					pal := a.paletteOf(cx)
-					return core.Style{
-						Background:   pal.SurfaceRaised,
-						CornerRadius: Tokens.RadiusCtrl,
-						BorderWidth:  1,
-						BorderColor:  pal.Border,
-						Overflow:     core.Hidden,
-					}
-				},
-				Children: []core.Node{
-					core.View{
-						StyleFunc: func() core.Style {
-							pal := a.paletteOf(cx)
-							return core.Style{
-								Direction:      core.Row,
-								AlignItems:     core.AlignCenter,
-								JustifyContent: core.JustifySpaceBetween,
-								Padding:        core.Symmetric(core.Points(4), Tokens.Space2),
-								Borders:        core.Edges{Bottom: 1},
-								BorderColor:    pal.Separator,
-							}
-						},
-						Children: []core.Node{
-							core.Text{
-								MaxLines: 1,
-								Content:  langLabel,
-								StyleFunc: func() core.Style {
-									pal := a.paletteOf(cx)
-									return core.Style{
-										Color:      pal.TextMuted,
-										FontSize:   Tokens.FontMonoMeta,
-										FontFamily: core.FontMonospace,
-									}
-								},
-							},
-							core.View{
-								TestID: fmt.Sprintf("chat-copy-code-%s-%d", it0.ID, bi),
-								Role:   core.RoleButton,
-								OnPress: func(core.PressEvent) {
-									if cx != nil {
-										cx.SetClipboard(codeText)
-										a.notifyToast("已复制代码块")
-									}
-								},
-								StyleFunc: func() core.Style {
-									pal := a.paletteOf(cx)
-									return core.Style{
-										Background:   pal.Surface,
-										CornerRadius: Tokens.RadiusKey,
-										BorderWidth:  1,
-										BorderColor:  pal.Border,
-										Padding:      core.Symmetric(core.Points(2), core.Points(8)),
-									}
-								},
-								Children: []core.Node{
-									core.Text{
-										Content: "复制",
-										StyleFunc: func() core.Style {
-											pal := a.paletteOf(cx)
-											return core.Style{
-												Color:      pal.Accent,
-												FontSize:   Tokens.FontMonoMeta,
-												FontWeight: core.FontWeightSemibold,
-											}
-										},
-									},
-								},
-							},
-						},
-					},
-					core.Scroll{
-						Horizontal:    true,
-						NoShrink:      true,
-						HideIndicator: false,
-						Children: []core.Node{
-							core.View{
-								Style: core.Style{Padding: core.Symmetric(Tokens.Space2, Tokens.Space3)},
-								Children: []core.Node{
-									core.Text{
-										Content: codeText,
-										StyleFunc: func() core.Style {
-											pal := a.paletteOf(cx)
-											return core.Style{
-												Color:      pal.Text,
-												FontSize:   Tokens.FontMonoMeta,
-												FontFamily: vtFontFamily,
-											}
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			})
-
-		case BlockList:
-			listRows := make([]core.Node, 0, len(b.Items))
-			for _, li := range b.Items {
-				lineItem := li
-				listRows = append(listRows, core.View{
-					Style: core.Style{
-						Direction: core.Row,
-						Gap:       core.Points(6),
+			out := make([]indexedMarkdownBlock, len(blks))
+			for i, b := range blks {
+				out[i] = indexedMarkdownBlock{
+					Key:   fmt.Sprintf("%s-blk-%d-%d", cardID, i, b.Kind),
+					Index: i,
+					Block: b,
+				}
+			}
+			return out
+		},
+		func(b indexedMarkdownBlock) string { return b.Key },
+		func(cx *core.Scope, blkFn func() indexedMarkdownBlock, _ func() int) core.Node {
+			initBlk := blkFn()
+			bi := initBlk.Index
+			switch initBlk.Block.Kind {
+			case BlockCode:
+				return core.View{
+					StyleFunc: func() core.Style {
+						pal := a.paletteOf(cx)
+						return core.Style{
+							Background:   pal.SurfaceRaised,
+							CornerRadius: Tokens.RadiusCtrl,
+							BorderWidth:  1,
+							BorderColor:  pal.Border,
+							Overflow:     core.Hidden,
+						}
 					},
 					Children: []core.Node{
-						core.Text{
-							Content: "•",
+						core.View{
 							StyleFunc: func() core.Style {
 								pal := a.paletteOf(cx)
 								return core.Style{
-									FlexShrink: 0,
-									Color:      pal.Accent,
-									FontSize:   Tokens.FontBody,
-									FontWeight: core.FontWeightBold,
+									Direction:      core.Row,
+									AlignItems:     core.AlignCenter,
+									JustifyContent: core.JustifySpaceBetween,
+									Gap:            Tokens.Space2,
+									Padding:        core.Symmetric(core.Points(4), Tokens.Space2),
+									Borders:        core.Edges{Bottom: 1},
+									BorderColor:    pal.Separator,
 								}
 							},
+							Children: []core.Node{
+								core.Text{
+									MaxLines: 1,
+									ContentFunc: func() string {
+										lang := blkFn().Block.Lang
+										if lang == "" {
+											return "code"
+										}
+										return lang
+									},
+									StyleFunc: func() core.Style {
+										pal := a.paletteOf(cx)
+										return core.Style{
+											FlexGrow:   1,
+											FlexShrink: 1,
+											MinWidth:   core.Pt(0),
+											Color:      pal.TextMuted,
+											FontSize:   Tokens.FontMonoMeta,
+											FontFamily: core.FontMonospace,
+										}
+									},
+								},
+								core.View{
+									TestID: fmt.Sprintf("chat-copy-code-%s-%d", cardID, bi),
+									Role:   core.RoleButton,
+									OnPress: func(core.PressEvent) {
+										if cx != nil {
+											cx.SetClipboard(blkFn().Block.Text)
+											a.notifyToast("已复制代码块")
+										}
+									},
+									StyleFunc: func() core.Style {
+										pal := a.paletteOf(cx)
+										return core.Style{
+											FlexShrink:   0,
+											Background:   pal.Surface,
+											CornerRadius: Tokens.RadiusKey,
+											BorderWidth:  1,
+											BorderColor:  pal.Border,
+											Padding:      core.Symmetric(core.Points(2), core.Points(8)),
+										}
+									},
+									Children: []core.Node{
+										core.Text{
+											Content: "复制",
+											StyleFunc: func() core.Style {
+												pal := a.paletteOf(cx)
+												return core.Style{
+													Color:      pal.Accent,
+													FontSize:   Tokens.FontMonoMeta,
+													FontWeight: core.FontWeightSemibold,
+												}
+											},
+										},
+									},
+								},
+							},
 						},
-						core.Text{
-							Content: lineItem,
-							StyleFunc: func() core.Style {
-								pal := a.paletteOf(cx)
-								return core.Style{
-									FlexGrow:   1,
-									FlexShrink: 1,
-									MinWidth:   core.Pt(0),
-									Color:      pal.Text,
-									FontSize:   Tokens.FontBody,
-								}
+						core.Scroll{
+							Horizontal:    true,
+							NoShrink:      true,
+							HideIndicator: false,
+							Children: []core.Node{
+								core.View{
+									Style: core.Style{Padding: core.Symmetric(Tokens.Space2, Tokens.Space3)},
+									Children: []core.Node{
+										core.Text{
+											ContentFunc: func() string { return blkFn().Block.Text },
+											StyleFunc: func() core.Style {
+												pal := a.paletteOf(cx)
+												return core.Style{
+													Color:      pal.Text,
+													FontSize:   Tokens.FontMonoMeta,
+													FontFamily: vtFontFamily,
+												}
+											},
+										},
+									},
+								},
 							},
 						},
 					},
-				})
-			}
-			blockNodes = append(blockNodes, core.View{
-				Style:    core.Style{Gap: core.Points(4)},
-				Children: listRows,
-			})
+				}
 
-		default:
-			paraText := b.Text
-			blockNodes = append(blockNodes, core.Text{
-				Content: paraText,
-				StyleFunc: func() core.Style {
-					pal := a.paletteOf(cx)
-					return core.Style{
-						Color:    pal.Text,
-						FontSize: Tokens.FontBody,
-					}
-				},
-			})
-		}
-	}
+			case BlockList:
+				return core.View{
+					Style: core.Style{Gap: core.Points(4)},
+					Children: []core.Node{
+						core.Each(
+							func() []string { return blkFn().Block.Items },
+							func(s string) string { return s },
+							func(cx *core.Scope, liFn func() string, _ func() int) core.Node {
+								return core.View{
+									Style: core.Style{
+										Direction: core.Row,
+										Gap:       core.Points(6),
+									},
+									Children: []core.Node{
+										core.Text{
+											Content: "•",
+											StyleFunc: func() core.Style {
+												pal := a.paletteOf(cx)
+												return core.Style{
+													FlexShrink: 0,
+													Color:      pal.Accent,
+													FontSize:   Tokens.FontBody,
+													FontWeight: core.FontWeightBold,
+												}
+											},
+										},
+										core.Text{
+											ContentFunc: liFn,
+											StyleFunc: func() core.Style {
+												pal := a.paletteOf(cx)
+												return core.Style{
+													FlexGrow:   1,
+													FlexShrink: 1,
+													MinWidth:   core.Pt(0),
+													Color:      pal.Text,
+													FontSize:   Tokens.FontBody,
+												}
+											},
+										},
+									},
+								}
+							},
+						),
+					},
+				}
+
+			default:
+				return core.Text{
+					ContentFunc: func() string { return blkFn().Block.Text },
+					StyleFunc: func() core.Style {
+						pal := a.paletteOf(cx)
+						return core.Style{
+							Color:    pal.Text,
+							FontSize: Tokens.FontBody,
+						}
+					},
+				}
+			}
+		},
+	)
 
 	return core.View{
-		TestID: "chat-assistant-" + it0.ID,
+		TestID: "chat-assistant-" + cardID,
 		StyleFunc: func() core.Style {
 			pal := a.paletteOf(cx)
 			return core.Style{
@@ -783,7 +867,7 @@ func renderChatAssistantCard(
 					Padding:    core.Symmetric(core.Points(10), Tokens.Space3),
 					Gap:        Tokens.Space2,
 				},
-				Children: append([]core.Node{
+				Children: []core.Node{
 					core.View{
 						Style: core.Style{
 							Direction:  core.Row,
@@ -825,7 +909,8 @@ func renderChatAssistantCard(
 							},
 						},
 					},
-				}, blockNodes...),
+					blocksNode,
+				},
 			},
 		},
 	}

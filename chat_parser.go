@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // ChatRole identifies one card or collapsible row in Chat View.
@@ -67,6 +68,7 @@ type ChatTurnItem struct {
 	Blocks     []MarkdownBlock
 	Tools      []ChatToolCall
 	Optimistic bool
+	SourceLine int // 1-based file line number where this item originated (0 for VT/optimistic)
 }
 
 const maxSafeJSONLLineBytes = 512 * 1024
@@ -95,6 +97,9 @@ func IsAgentTerminal(t Terminal) bool {
 // "antigravity", "codex", "other-agent", or "") from terminal metadata.
 func DetectHarnessKind(t Terminal) string {
 	candidates := []string{t.AppName()}
+	if t.Template != nil && strings.TrimSpace(*t.Template) != "" {
+		candidates = append(candidates, *t.Template)
+	}
 	if t.Labels != nil {
 		if alma := t.Labels["alma.session"]; alma != "" {
 			candidates = append(candidates, alma)
@@ -254,13 +259,35 @@ func cleanUserPrompt(raw string) (text, fromAgent string) {
 	return s, fromAgent
 }
 
+func utf8SafePrefix(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	end := maxBytes
+	for end > 0 && !utf8.RuneStart(s[end]) {
+		end--
+	}
+	return s[:end]
+}
+
+func utf8SafeSuffix(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	start := len(s) - maxBytes
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	return s[start:]
+}
+
 func truncateToolOutput(s string) string {
 	s = strings.TrimSpace(strings.ReplaceAll(s, "\r\n", "\n"))
 	if s == "" {
 		return ""
 	}
 	if len(s) > 16384 {
-		s = s[:8192] + "\n… [输出超长已裁剪] …\n" + s[len(s)-8192:]
+		s = utf8SafePrefix(s, 8192) + "\n… [输出超长已裁剪] …\n" + utf8SafeSuffix(s, 8192)
 	}
 	lines := strings.Split(s, "\n")
 	if len(lines) <= 40 {
@@ -270,6 +297,94 @@ func truncateToolOutput(s string) string {
 	head := strings.Join(lines[:20], "\n")
 	tail := strings.Join(lines[len(lines)-20:], "\n")
 	return fmt.Sprintf("%s\n…（省略中间 %d 行）…\n%s", head, omitted, tail)
+}
+
+// sanitizeOversizedJSONLLine shrinks JSON string literals > 32 KiB (such as embedded
+// Base64 screenshots or multi-megabyte tool_result outputs) in a single O(N) pass so
+// lines > 512 KiB remain valid JSON and preserve user text, [图片附件], and head/tail outputs.
+func sanitizeOversizedJSONLLine(raw string) string {
+	if len(raw) <= maxSafeJSONLLineBytes {
+		return raw
+	}
+	const maxLiteralBytes = 32768
+	var out strings.Builder
+	out.Grow(65536)
+
+	n := len(raw)
+	i := 0
+	for i < n {
+		if raw[i] != '"' {
+			out.WriteByte(raw[i])
+			i++
+			continue
+		}
+		// Scan to closing unescaped quote.
+		start := i
+		i++
+		for i < n {
+			if raw[i] == '\\' {
+				i += 2
+				continue
+			}
+			if raw[i] == '"' {
+				i++
+				break
+			}
+			i++
+		}
+		end := i
+		if end > n {
+			end = n
+		}
+		litLen := end - start
+		// Check if followed by ':' (a JSON object key is never truncated).
+		j := end
+		for j < n && (raw[j] == ' ' || raw[j] == '\t') {
+			j++
+		}
+		isKey := j < n && raw[j] == ':'
+		if isKey || litLen <= maxLiteralBytes {
+			out.WriteString(raw[start:end])
+			continue
+		}
+
+		// Oversized string value: inspect decoded or raw content.
+		var decoded string
+		if json.Unmarshal([]byte(raw[start:end]), &decoded) != nil {
+			out.WriteString(`"[超长内容已省略]"`)
+			continue
+		}
+		if looksLikeBase64Blob(decoded) {
+			out.WriteString(`"[base64-omitted]"`)
+			continue
+		}
+		clipped := utf8SafePrefix(decoded, 8192) + "\n… [输出超长已裁剪] …\n" + utf8SafeSuffix(decoded, 8192)
+		enc, err := json.Marshal(clipped)
+		if err != nil {
+			out.WriteString(`"[超长内容已省略]"`)
+		} else {
+			out.Write(enc)
+		}
+	}
+	return out.String()
+}
+
+func looksLikeBase64Blob(s string) bool {
+	if len(s) < 4096 {
+		return false
+	}
+	sample := s
+	if len(sample) > 512 {
+		sample = sample[:512]
+	}
+	for i := 0; i < len(sample); i++ {
+		c := sample[i]
+		isB64 := (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=' || c == '-' || c == '_'
+		if !isB64 {
+			return false
+		}
+	}
+	return true
 }
 
 func extractToolTarget(name string, rawArgs any) (target, summary string) {
@@ -336,29 +451,41 @@ func singleLineClip(s string, maxRunes int) string {
 	return s
 }
 
-// ParseTranscriptLines dispatches lines to the matching Harness JSONL parser.
+// ParseTranscriptLines dispatches lines (starting at line 1) to the matching Harness JSONL parser.
 func ParseTranscriptLines(format TranscriptFormat, lines []string) []ChatTurnItem {
+	return ParseTranscriptLinesAt(format, lines, 1)
+}
+
+// ParseTranscriptLinesAt dispatches lines starting at 1-based file line firstLine so
+// item IDs and SourceLine remain stable across LoadOlder pagination prepends.
+func ParseTranscriptLinesAt(format TranscriptFormat, lines []string, firstLine int) []ChatTurnItem {
+	if firstLine < 1 {
+		firstLine = 1
+	}
 	switch format {
 	case FormatClaude:
-		return ParseClaudeJSONL(lines)
+		return parseClaudeJSONLAt(lines, firstLine)
 	case FormatPiOmp:
-		return ParsePiOmpJSONL(lines)
+		return parsePiOmpJSONLAt(lines, firstLine)
 	case FormatCodex:
-		return ParseCodexJSONL(lines)
+		return parseCodexJSONLAt(lines, firstLine)
 	case FormatAntigravity:
-		return ParseAntigravityJSONL(lines)
+		return parseAntigravityJSONLAt(lines, firstLine)
 	default:
 		return ParseVTTranscript(strings.Join(lines, "\n"))
 	}
 }
 
-// appendOrMergeTool appends a ChatToolCall, coalescing adjacent tool calls into one RoleToolGroup.
-func appendToolItem(items *[]ChatTurnItem, id string, tc ChatToolCall, toolIdx map[string][2]int) {
+// appendToolItem appends a ChatToolCall, coalescing adjacent tool calls into one RoleToolGroup.
+func appendToolItem(items *[]ChatTurnItem, id string, sourceLine int, tc ChatToolCall, toolIdx map[string][2]int) {
 	n := len(*items)
 	if n > 0 && (*items)[n-1].Role == RoleToolGroup {
 		grpIdx := n - 1
 		subIdx := len((*items)[grpIdx].Tools)
 		(*items)[grpIdx].Tools = append((*items)[grpIdx].Tools, tc)
+		if sourceLine > (*items)[grpIdx].SourceLine {
+			(*items)[grpIdx].SourceLine = sourceLine
+		}
 		if tc.ID != "" {
 			toolIdx[tc.ID] = [2]int{grpIdx, subIdx}
 		}
@@ -366,9 +493,10 @@ func appendToolItem(items *[]ChatTurnItem, id string, tc ChatToolCall, toolIdx m
 	}
 	grpIdx := n
 	*items = append(*items, ChatTurnItem{
-		ID:    id,
-		Role:  RoleToolGroup,
-		Tools: []ChatToolCall{tc},
+		ID:         id,
+		Role:       RoleToolGroup,
+		Tools:      []ChatToolCall{tc},
+		SourceLine: sourceLine,
 	})
 	if tc.ID != "" {
 		toolIdx[tc.ID] = [2]int{grpIdx, 0}
@@ -391,16 +519,25 @@ func attachToolResult(items []ChatTurnItem, toolIdx map[string][2]int, callID, o
 // 1. Claude Code (~/.claude/projects/*/*.jsonl)
 
 func ParseClaudeJSONL(lines []string) []ChatTurnItem {
+	return parseClaudeJSONLAt(lines, 1)
+}
+
+func parseClaudeJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 	var items []ChatTurnItem
 	toolIdx := make(map[string][2]int)
 	seenUUID := make(map[string]bool)
 	lastAsstMsgID := ""
+	baseIdx := firstLine - 1
 
 	for lineNo, raw := range lines {
 		raw = strings.TrimSpace(raw)
-		if raw == "" || len(raw) > maxSafeJSONLLineBytes {
+		if raw == "" {
 			continue
 		}
+		raw = sanitizeOversizedJSONLLine(raw)
+		absIdx := baseIdx + lineNo
+		srcLine := absIdx + 1
+
 		var env struct {
 			Type    string `json:"type"`
 			UUID    string `json:"uuid"`
@@ -423,16 +560,16 @@ func ParseClaudeJSONL(lines []string) []ChatTurnItem {
 
 		switch env.Type {
 		case "user":
-			// Content can be a string OR array of blocks (including tool_result).
 			var strContent string
 			if json.Unmarshal(env.Message.Content, &strContent) == nil {
 				txt, from := cleanUserPrompt(strContent)
 				if txt != "" {
 					items = append(items, ChatTurnItem{
-						ID:        nonEmpty(env.UUID, fmt.Sprintf("cu-%d", lineNo)),
-						Role:      RoleUser,
-						Text:      txt,
-						FromAgent: from,
+						ID:         nonEmpty(env.UUID, fmt.Sprintf("cu-%d", absIdx)),
+						Role:       RoleUser,
+						Text:       txt,
+						FromAgent:  from,
+						SourceLine: srcLine,
 					})
 				}
 				continue
@@ -465,10 +602,11 @@ func ParseClaudeJSONL(lines []string) []ChatTurnItem {
 				joined, from := cleanUserPrompt(strings.Join(userParts, "\n"))
 				if joined != "" {
 					items = append(items, ChatTurnItem{
-						ID:        nonEmpty(env.UUID, fmt.Sprintf("cu-%d", lineNo)),
-						Role:      RoleUser,
-						Text:      joined,
-						FromAgent: from,
+						ID:         nonEmpty(env.UUID, fmt.Sprintf("cu-%d", absIdx)),
+						Role:       RoleUser,
+						Text:       joined,
+						FromAgent:  from,
+						SourceLine: srcLine,
 					})
 				}
 			}
@@ -485,7 +623,7 @@ func ParseClaudeJSONL(lines []string) []ChatTurnItem {
 			if json.Unmarshal(env.Message.Content, &blocks) != nil {
 				continue
 			}
-			msgID := nonEmpty(env.Message.ID, nonEmpty(env.UUID, fmt.Sprintf("ca-%d", lineNo)))
+			msgID := nonEmpty(env.Message.ID, nonEmpty(env.UUID, fmt.Sprintf("ca-%d", absIdx)))
 			for bi, b := range blocks {
 				switch b.Type {
 				case "thinking":
@@ -495,18 +633,20 @@ func ParseClaudeJSONL(lines []string) []ChatTurnItem {
 					}
 					if len(items) > 0 && items[len(items)-1].Role == RoleThinking && lastAsstMsgID == msgID {
 						items[len(items)-1].Text += "\n" + th
+						items[len(items)-1].SourceLine = srcLine
 					} else {
 						items = append(items, ChatTurnItem{
-							ID:    fmt.Sprintf("%s-th-%d-%d", msgID, lineNo, bi),
-							Role:  RoleThinking,
-							Text:  th,
-							Model: env.Message.Model,
-							App:   "claude-code",
+							ID:         fmt.Sprintf("%s-th-%d-%d", msgID, absIdx, bi),
+							Role:       RoleThinking,
+							Text:       th,
+							Model:      env.Message.Model,
+							App:        "claude-code",
+							SourceLine: srcLine,
 						})
 					}
 				case "tool_use":
 					target, summary := extractToolTarget(b.Name, b.Input)
-					appendToolItem(&items, fmt.Sprintf("%s-tg-%d", msgID, lineNo), ChatToolCall{
+					appendToolItem(&items, fmt.Sprintf("%s-tg-%d", msgID, absIdx), srcLine, ChatToolCall{
 						ID:           b.ID,
 						Name:         b.Name,
 						Target:       target,
@@ -521,14 +661,16 @@ func ParseClaudeJSONL(lines []string) []ChatTurnItem {
 						merged := items[len(items)-1].Text + "\n\n" + txt
 						items[len(items)-1].Text = merged
 						items[len(items)-1].Blocks = SplitMarkdownBlocks(merged)
+						items[len(items)-1].SourceLine = srcLine
 					} else {
 						items = append(items, ChatTurnItem{
-							ID:     fmt.Sprintf("%s-txt-%d-%d", msgID, lineNo, bi),
-							Role:   RoleAssistant,
-							Text:   txt,
-							Model:  env.Message.Model,
-							App:    "claude-code",
-							Blocks: SplitMarkdownBlocks(txt),
+							ID:         fmt.Sprintf("%s-txt-%d-%d", msgID, absIdx, bi),
+							Role:       RoleAssistant,
+							Text:       txt,
+							Model:      env.Message.Model,
+							App:        "claude-code",
+							Blocks:     SplitMarkdownBlocks(txt),
+							SourceLine: srcLine,
 						})
 					}
 				}
@@ -569,14 +711,23 @@ func extractClaudeToolResultContent(raw json.RawMessage) string {
 // 2. OMP & Pi (~/.omp/agent/sessions/*/*.jsonl & ~/.pi/agent/sessions/*/*.jsonl)
 
 func ParsePiOmpJSONL(lines []string) []ChatTurnItem {
+	return parsePiOmpJSONLAt(lines, 1)
+}
+
+func parsePiOmpJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 	var items []ChatTurnItem
 	toolIdx := make(map[string][2]int)
+	baseIdx := firstLine - 1
 
 	for lineNo, raw := range lines {
 		raw = strings.TrimSpace(raw)
-		if raw == "" || len(raw) > maxSafeJSONLLineBytes {
+		if raw == "" {
 			continue
 		}
+		raw = sanitizeOversizedJSONLLine(raw)
+		absIdx := baseIdx + lineNo
+		srcLine := absIdx + 1
+
 		var env struct {
 			Type    string `json:"type"`
 			ID      string `json:"id"`
@@ -592,7 +743,7 @@ func ParsePiOmpJSONL(lines []string) []ChatTurnItem {
 		if json.Unmarshal([]byte(raw), &env) != nil || env.Type != "message" {
 			continue
 		}
-		rowID := nonEmpty(env.ID, fmt.Sprintf("omp-%d", lineNo))
+		rowID := nonEmpty(env.ID, fmt.Sprintf("omp-%d", absIdx))
 
 		switch env.Message.Role {
 		case "user":
@@ -600,10 +751,11 @@ func ParsePiOmpJSONL(lines []string) []ChatTurnItem {
 			cleaned, from := cleanUserPrompt(txt)
 			if cleaned != "" {
 				items = append(items, ChatTurnItem{
-					ID:        rowID,
-					Role:      RoleUser,
-					Text:      cleaned,
-					FromAgent: from,
+					ID:         rowID,
+					Role:       RoleUser,
+					Text:       cleaned,
+					FromAgent:  from,
+					SourceLine: srcLine,
 				})
 			}
 		case "assistant":
@@ -618,12 +770,13 @@ func ParsePiOmpJSONL(lines []string) []ChatTurnItem {
 			if json.Unmarshal(env.Message.Content, &blocks) != nil {
 				if s := extractPiContentText(env.Message.Content); s != "" {
 					items = append(items, ChatTurnItem{
-						ID:     rowID,
-						Role:   RoleAssistant,
-						Text:   s,
-						Model:  env.Message.Model,
-						App:    "omp",
-						Blocks: SplitMarkdownBlocks(s),
+						ID:         rowID,
+						Role:       RoleAssistant,
+						Text:       s,
+						Model:      env.Message.Model,
+						App:        "omp",
+						Blocks:     SplitMarkdownBlocks(s),
+						SourceLine: srcLine,
 					})
 				}
 				continue
@@ -633,16 +786,17 @@ func ParsePiOmpJSONL(lines []string) []ChatTurnItem {
 				case "thinking":
 					if th := strings.TrimSpace(b.Thinking); th != "" {
 						items = append(items, ChatTurnItem{
-							ID:    fmt.Sprintf("%s-th-%d", rowID, bi),
-							Role:  RoleThinking,
-							Text:  th,
-							Model: env.Message.Model,
-							App:   "omp",
+							ID:         fmt.Sprintf("%s-th-%d", rowID, bi),
+							Role:       RoleThinking,
+							Text:       th,
+							Model:      env.Message.Model,
+							App:        "omp",
+							SourceLine: srcLine,
 						})
 					}
 				case "toolCall":
 					target, summary := extractToolTarget(b.Name, b.Arguments)
-					appendToolItem(&items, fmt.Sprintf("%s-tg-%d", rowID, bi), ChatToolCall{
+					appendToolItem(&items, fmt.Sprintf("%s-tg-%d", rowID, bi), srcLine, ChatToolCall{
 						ID:           b.ID,
 						Name:         b.Name,
 						Target:       target,
@@ -651,12 +805,13 @@ func ParsePiOmpJSONL(lines []string) []ChatTurnItem {
 				case "text":
 					if txt := strings.TrimSpace(b.Text); txt != "" {
 						items = append(items, ChatTurnItem{
-							ID:     fmt.Sprintf("%s-txt-%d", rowID, bi),
-							Role:   RoleAssistant,
-							Text:   txt,
-							Model:  env.Message.Model,
-							App:    "omp",
-							Blocks: SplitMarkdownBlocks(txt),
+							ID:         fmt.Sprintf("%s-txt-%d", rowID, bi),
+							Role:       RoleAssistant,
+							Text:       txt,
+							Model:      env.Message.Model,
+							App:        "omp",
+							Blocks:     SplitMarkdownBlocks(txt),
+							SourceLine: srcLine,
 						})
 					}
 				}
@@ -664,7 +819,7 @@ func ParsePiOmpJSONL(lines []string) []ChatTurnItem {
 		case "toolResult":
 			out := extractPiContentText(env.Message.Content)
 			if !attachToolResult(items, toolIdx, env.Message.ToolCallID, out, env.Message.IsError) && out != "" {
-				appendToolItem(&items, rowID, ChatToolCall{
+				appendToolItem(&items, rowID, srcLine, ChatToolCall{
 					ID:      env.Message.ToolCallID,
 					Name:    nonEmpty(env.Message.ToolName, "tool"),
 					Output:  truncateToolOutput(out),
@@ -703,15 +858,24 @@ func extractPiContentText(raw json.RawMessage) string {
 // 3. Codex (~/.codex/sessions/*/*/*/*.jsonl — authoritative response_item stream)
 
 func ParseCodexJSONL(lines []string) []ChatTurnItem {
+	return parseCodexJSONLAt(lines, 1)
+}
+
+func parseCodexJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 	var items []ChatTurnItem
 	toolIdx := make(map[string][2]int)
 	curModel := ""
+	baseIdx := firstLine - 1
 
 	for lineNo, raw := range lines {
 		raw = strings.TrimSpace(raw)
-		if raw == "" || len(raw) > maxSafeJSONLLineBytes {
+		if raw == "" {
 			continue
 		}
+		raw = sanitizeOversizedJSONLLine(raw)
+		absIdx := baseIdx + lineNo
+		srcLine := absIdx + 1
+
 		var env struct {
 			Type    string          `json:"type"`
 			Payload json.RawMessage `json:"payload"`
@@ -729,7 +893,6 @@ func ParseCodexJSONL(lines []string) []ChatTurnItem {
 			continue
 		}
 		if env.Type != "response_item" {
-			// Explicitly ignore event_msg mirrors to prevent duplicate rendering.
 			continue
 		}
 
@@ -750,7 +913,7 @@ func ParseCodexJSONL(lines []string) []ChatTurnItem {
 		if json.Unmarshal(env.Payload, &item) != nil {
 			continue
 		}
-		rowID := nonEmpty(item.ID, fmt.Sprintf("cx-%d", lineNo))
+		rowID := nonEmpty(item.ID, fmt.Sprintf("cx-%d", absIdx))
 
 		switch item.Type {
 		case "message", "agent_message":
@@ -766,20 +929,22 @@ func ParseCodexJSONL(lines []string) []ChatTurnItem {
 				cleaned, from := cleanUserPrompt(txt)
 				if cleaned != "" {
 					items = append(items, ChatTurnItem{
-						ID:        rowID,
-						Role:      RoleUser,
-						Text:      cleaned,
-						FromAgent: from,
+						ID:         rowID,
+						Role:       RoleUser,
+						Text:       cleaned,
+						FromAgent:  from,
+						SourceLine: srcLine,
 					})
 				}
 			} else if role == "assistant" {
 				items = append(items, ChatTurnItem{
-					ID:     rowID,
-					Role:   RoleAssistant,
-					Text:   txt,
-					Model:  curModel,
-					App:    "codex",
-					Blocks: SplitMarkdownBlocks(txt),
+					ID:         rowID,
+					Role:       RoleAssistant,
+					Text:       txt,
+					Model:      curModel,
+					App:        "codex",
+					Blocks:     SplitMarkdownBlocks(txt),
+					SourceLine: srcLine,
 				})
 			}
 		case "reasoning":
@@ -791,11 +956,12 @@ func ParseCodexJSONL(lines []string) []ChatTurnItem {
 			}
 			if len(parts) > 0 {
 				items = append(items, ChatTurnItem{
-					ID:    rowID,
-					Role:  RoleThinking,
-					Text:  strings.Join(parts, "\n"),
-					Model: curModel,
-					App:   "codex",
+					ID:         rowID,
+					Role:       RoleThinking,
+					Text:       strings.Join(parts, "\n"),
+					Model:      curModel,
+					App:        "codex",
+					SourceLine: srcLine,
 				})
 			}
 		case "function_call", "custom_tool_call":
@@ -804,7 +970,7 @@ func ParseCodexJSONL(lines []string) []ChatTurnItem {
 				rawArgs = item.Input
 			}
 			target, summary := extractToolTarget(item.Name, rawArgs)
-			appendToolItem(&items, rowID, ChatToolCall{
+			appendToolItem(&items, rowID, srcLine, ChatToolCall{
 				ID:           item.CallID,
 				Name:         item.Name,
 				Target:       target,
@@ -849,14 +1015,23 @@ func extractCodexContentText(raw json.RawMessage) string {
 // 4. Antigravity (~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl)
 
 func ParseAntigravityJSONL(lines []string) []ChatTurnItem {
+	return parseAntigravityJSONLAt(lines, 1)
+}
+
+func parseAntigravityJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 	var items []ChatTurnItem
 	var pendingToolRefs [][2]int
+	baseIdx := firstLine - 1
 
 	for lineNo, raw := range lines {
 		raw = strings.TrimSpace(raw)
-		if raw == "" || len(raw) > maxSafeJSONLLineBytes {
+		if raw == "" {
 			continue
 		}
+		raw = sanitizeOversizedJSONLLine(raw)
+		absIdx := baseIdx + lineNo
+		srcLine := absIdx + 1
+
 		var row struct {
 			StepIndex int    `json:"step_index"`
 			Source    string `json:"source"`
@@ -873,7 +1048,7 @@ func ParseAntigravityJSONL(lines []string) []ChatTurnItem {
 		if json.Unmarshal([]byte(raw), &row) != nil {
 			continue
 		}
-		rowID := fmt.Sprintf("agy-%d-%d", row.StepIndex, lineNo)
+		rowID := fmt.Sprintf("agy-%d-%d", row.StepIndex, absIdx)
 
 		switch row.Type {
 		case "USER_INPUT":
@@ -881,31 +1056,34 @@ func ParseAntigravityJSONL(lines []string) []ChatTurnItem {
 			txt, from := cleanUserPrompt(row.Content)
 			if txt != "" {
 				items = append(items, ChatTurnItem{
-					ID:        rowID,
-					Role:      RoleUser,
-					Text:      txt,
-					FromAgent: from,
+					ID:         rowID,
+					Role:       RoleUser,
+					Text:       txt,
+					FromAgent:  from,
+					SourceLine: srcLine,
 				})
 			}
 		case "PLANNER_RESPONSE":
 			pendingToolRefs = nil
 			if th := strings.TrimSpace(row.Thinking); th != "" {
 				items = append(items, ChatTurnItem{
-					ID:    rowID + "-th",
-					Role:  RoleThinking,
-					Text:  th,
-					Model: row.Model,
-					App:   "antigravity",
+					ID:         rowID + "-th",
+					Role:       RoleThinking,
+					Text:       th,
+					Model:      row.Model,
+					App:        "antigravity",
+					SourceLine: srcLine,
 				})
 			}
 			if txt := strings.TrimSpace(row.Content); txt != "" {
 				items = append(items, ChatTurnItem{
-					ID:     rowID + "-txt",
-					Role:   RoleAssistant,
-					Text:   txt,
-					Model:  row.Model,
-					App:    "antigravity",
-					Blocks: SplitMarkdownBlocks(txt),
+					ID:         rowID + "-txt",
+					Role:       RoleAssistant,
+					Text:       txt,
+					Model:      row.Model,
+					App:        "antigravity",
+					Blocks:     SplitMarkdownBlocks(txt),
+					SourceLine: srcLine,
 				})
 			}
 			if len(row.ToolCalls) > 0 {
@@ -913,7 +1091,7 @@ func ParseAntigravityJSONL(lines []string) []ChatTurnItem {
 				for ti, tc := range row.ToolCalls {
 					callKey := fmt.Sprintf("%s-tc-%d", rowID, ti)
 					target, summary := extractToolTarget(tc.Name, tc.Args)
-					appendToolItem(&items, rowID+"-tg", ChatToolCall{
+					appendToolItem(&items, rowID+"-tg", srcLine, ChatToolCall{
 						ID:           callKey,
 						Name:         tc.Name,
 						Target:       target,

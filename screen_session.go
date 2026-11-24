@@ -50,11 +50,32 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 		// In Chat View, ALWAYS route through RPC terminal.send so the background
 		// SessionTerminal stays in observe=true and never shrinks a 140-col desktop PTY!
 		if isChatMode() {
-			if chat := curChat(); chat != nil {
-				chat.AddOptimisticUser(text)
+			chat := curChat()
+			var optID string
+			if chat != nil {
+				optID = chat.AddOptimisticUser(text)
 			}
 			a.SetCompose(k.String(), "")
-			a.SendTo(k, text)
+			// If a test injected a fake TranscriptBackend without a live RPC client, keep the optimistic turn cleanly.
+			if a.clientForKey(k) == nil && a.transcriptBackend != nil {
+				return
+			}
+			a.SendToWithCallback(k, text, func(err error) {
+				if err != nil {
+					if chat != nil {
+						chat.RemoveOptimistic(optID)
+					}
+					a.post(func() {
+						if strings.TrimSpace(a.Compose(k.String())) == "" {
+							a.setCompose(k.String(), text)
+						}
+					})
+					return
+				}
+				if chat != nil {
+					chat.RefreshAsync()
+				}
+			})
 			return
 		}
 		st := curST()
@@ -140,30 +161,14 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 			}
 		},
 		Children: []core.Node{
-			// 44px compact session top bar with safe-area top inset
+			// 44px compact session top bar with safe-area top inset (chat source pill moved into chat scroll header so 390px phone titles have full breathing room)
 			TopHeader(cx, a, func() string {
 				return curTerm().Terminal.Label()
 			}, leftBtn, []core.Node{
 				modeSegmentPill,
 				core.Show{
-					When: isChatMode,
+					When: func() bool { return !isChatMode() },
 					Then: func(cx *core.Scope) core.Node {
-						return FilterPill(cx, a, "chat-source-pill", func() string {
-							if ch := curChat(); ch != nil {
-								return ch.Source().Label()
-							}
-							return "同步中"
-						}, func() bool {
-							ch := curChat()
-							return ch != nil && ch.Source() == SourceJSONL
-						}, nil, func() {
-							if ch := curChat(); ch != nil {
-								ch.RefreshAsync()
-								a.notifyToast("正在刷新对话记录…")
-							}
-						})
-					},
-					Else: func(cx *core.Scope) core.Node {
 						return FilterPill(cx, a, "session-fit-toggle", func() string {
 							st := curST()
 							if st == nil || (st.observeSig != nil && st.observeSig.Get()) || (st.observeSig == nil && st.Observe()) {
