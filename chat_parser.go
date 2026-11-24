@@ -387,23 +387,50 @@ func looksLikeBase64Blob(s string) bool {
 	return true
 }
 
+var reLooseToolTarget = regexp.MustCompile(`"(?:file_path|path|Path|command|CommandLine|cmd|query)"\s*:\s*"([^"]+)"`)
+
 func extractToolTarget(name string, rawArgs any) (target, summary string) {
 	var m map[string]any
+	parseStr := func(v string) (string, string, bool) {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return "", "", true
+		}
+		if json.Unmarshal([]byte(v), &m) == nil {
+			return "", "", false
+		}
+		if sub := reLooseToolTarget.FindStringSubmatch(v); len(sub) == 2 {
+			val := strings.Trim(sub[1], `"' `)
+			if strings.HasPrefix(val, "/") {
+				b := filepath.Base(val)
+				if b != "." && b != "/" {
+					val = b
+				}
+			}
+			return singleLineClip(val, 64), truncateToolOutput(v), true
+		}
+		trimmed := strings.Trim(v, `"' `)
+		return singleLineClip(trimmed, 80), truncateToolOutput(v), true
+	}
+
 	switch v := rawArgs.(type) {
 	case map[string]any:
 		m = v
 	case string:
-		if strings.TrimSpace(v) != "" {
-			if json.Unmarshal([]byte(v), &m) != nil {
-				s := singleLineClip(v, 80)
-				return s, truncateToolOutput(v)
-			}
+		if t, s, done := parseStr(v); done {
+			return t, s
 		}
 	case json.RawMessage:
 		if len(v) > 0 {
 			if json.Unmarshal(v, &m) != nil {
-				s := singleLineClip(string(v), 80)
-				return s, truncateToolOutput(string(v))
+				var innerStr string
+				if json.Unmarshal(v, &innerStr) == nil {
+					if t, s, done := parseStr(innerStr); done {
+						return t, s
+					}
+				} else if t, s, done := parseStr(string(v)); done {
+					return t, s
+				}
 			}
 		}
 	}
@@ -1106,7 +1133,9 @@ func parseAntigravityJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 				pendingToolRefs = pendingToolRefs[1:]
 				if loc[0] < len(items) && loc[1] < len(items[loc[0]].Tools) {
 					items[loc[0]].Tools[loc[1]].Output = truncateToolOutput(row.Content)
-					if (row.Status != "" && row.Status != "DONE") || strings.Contains(row.Content, "Command exited with code 1") {
+					stUpper := strings.ToUpper(strings.TrimSpace(row.Status))
+					failedExit := strings.Contains(row.Content, "Command exited with code ") && !strings.Contains(row.Content, "Command exited with code 0")
+					if stUpper == "ERROR" || stUpper == "FAILED" || failedExit {
 						items[loc[0]].Tools[loc[1]].IsError = true
 					}
 				}

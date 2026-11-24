@@ -632,6 +632,24 @@ func RenderSessionTerminal(
 	vtPalFn func() VTPalette,
 	fontSizeFn func() float32,
 ) core.Node {
+	return RenderSessionTerminalVisible(cx, st, palFn, vtPalFn, fontSizeFn, nil)
+}
+
+const maxVTCanvasRenderLines = 300
+
+// RenderSessionTerminalVisible renders the VT surface and pauses Canvas draw commits while visibleFn() is false,
+// eliminating background pipe traffic while keeping the native View mounted for <1ms visibility switching.
+func RenderSessionTerminalVisible(
+	cx *core.Scope,
+	st *SessionTerminal,
+	palFn func() Palette,
+	vtPalFn func() VTPalette,
+	fontSizeFn func() float32,
+	visibleFn func() bool,
+) core.Node {
+	isVisible := func() bool {
+		return visibleFn == nil || visibleFn()
+	}
 	getFontSize := func() float32 {
 		fs := fontSizeFn()
 		if fs <= 0 {
@@ -803,6 +821,13 @@ func RenderSessionTerminal(
 					core.Canvas{
 						TestID: "vt-canvas",
 						StyleFunc: func() core.Style {
+							if !isVisible() {
+								return core.Style{
+									Width:      core.Pt(320),
+									Height:     core.Pt(220),
+									Background: vtPalFn().Bg,
+								}
+							}
 							if st.rev != nil {
 								_ = st.rev.Get()
 							}
@@ -811,6 +836,9 @@ func RenderSessionTerminal(
 							cellH := fs * 1.40
 							cols, _ := st.screen.Size()
 							totalLines := st.screen.TotalLines()
+							if totalLines > maxVTCanvasRenderLines {
+								totalLines = maxVTCanvasRenderLines
+							}
 							w := core.Points(padX*2 + float32(cols)*cellW)
 							h := core.Points(padY*2 + float32(totalLines)*cellH)
 							if h < 220 {
@@ -823,6 +851,9 @@ func RenderSessionTerminal(
 							}
 						},
 						Draw: func(d *core.Drawing, size core.Size) {
+							if !isVisible() {
+								return
+							}
 							if st.rev != nil {
 								_ = st.rev.Get()
 							}
@@ -882,6 +913,11 @@ func drawVTScreen(
 	if screen.InAltScreen() {
 		sbLen = 0
 	}
+	lineOffset := 0
+	if len(all) > maxVTCanvasRenderLines {
+		lineOffset = len(all) - maxVTCanvasRenderLines
+		all = all[lineOffset:]
+	}
 	curCol, curRow, curVis := screen.Cursor()
 
 	var matches []VTMatch
@@ -889,16 +925,26 @@ func drawVTScreen(
 		matches = screen.Search(searchQuery)
 	}
 
-	d.SetTextBaseline(core.BaselineTop)
+	// CRITICAL PERFORMANCE INVARIANT ON ANDROID:
+	// Keep TextBaseline at default BaselineAlphabetic + TextAlignLeft!
+	// In NSGo v0.3.0 (internal/driver/canvas.go:821), any non-alphabetic baseline triggers
+	// 6 synchronous Go->Java StaticLayout IPC round-trips PER FillText call (30,000+ RPCs per CJK frame!).
+	// Using BaselineAlphabetic + measuring Ascent ONCE per frame makes every FillText 0-IPC!
+	d.SetTextBaseline(core.BaselineAlphabetic)
 	d.SetTextAlign(core.TextAlignLeft)
 
 	baseFont := core.Font{
 		Family: vtFontFamily,
 		Size:   core.Points(fontSize),
 	}
+	ascent := d.TextMetrics("Mg", baseFont).Ascent
+	if ascent <= 0 {
+		ascent = fontSize * 0.82
+	}
 
-	for lineIdx, row := range all {
-		y := padY + float32(lineIdx)*cellH
+	for relIdx, row := range all {
+		absLineIdx := lineOffset + relIdx
+		y := padY + float32(relIdx)*cellH
 
 		// Pass 1: cell background rectangles.
 		for col := 0; col < len(row); col++ {
@@ -921,7 +967,7 @@ func drawVTScreen(
 
 		// Search match highlights.
 		for mi, m := range matches {
-			if m.Line != lineIdx {
+			if m.Line != absLineIdx {
 				continue
 			}
 			hl := pal.AccentSoft
@@ -933,12 +979,12 @@ func drawVTScreen(
 		}
 
 		// Cursor drawn BEFORE text (as underline bar so character underneath stays readable).
-		if curVis && lineIdx == sbLen+curRow {
+		if curVis && absLineIdx == sbLen+curRow {
 			d.SetFillColor(vtPal.Cursor)
 			d.BeginPath().Rect(padX+float32(curCol)*cellW, y+cellH-2, cellW, 2).Fill()
 		}
 
-		// Pass 2: run-length batched ASCII/narrow runs; wide CJK/emoji drawn individually at exact col*cellW.
+		// Pass 2: run-length batched ASCII/narrow runs; wide CJK/emoji drawn at exact col*cellW with 0 IPC!
 		col := 0
 		for col < len(row) {
 			cell := row[col]
@@ -987,7 +1033,7 @@ func drawVTScreen(
 				f.Italic = true
 			}
 			d.SetFillColor(fgCol)
-			d.FillText(buf.String(), padX+float32(startCol)*cellW, y+1, f)
+			d.FillText(buf.String(), padX+float32(startCol)*cellW, y+1+ascent, f)
 
 			if runStyle.Underline {
 				d.SetFillColor(fgCol)

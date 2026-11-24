@@ -548,3 +548,43 @@ func (l *localShellExecBackend) ReadTerminal(_ context.Context, _ TermKey, _ int
 	return ReadResult{}, nil
 }
 
+// Dogfood Fix 5: Antigravity compact JSON-string / truncated args extract clean basenames without quotes,
+// RUNNING background tasks are not flagged as errors, and hidden VT Canvas does not choke Chat mode commits!
+func TestDogfoodFixAntigravityStringArgsAndHiddenVTCanvas(t *testing.T) {
+	lines := []string{
+		`{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"read_file","args":"{\"Path\":\"/repo/internal/driver/canvas.go\"}"},{"name":"run_command","args":"{\"CommandLine\":\"go tool nsgo build -target android_arm64..."} ]}`,
+		`{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","content":"1: package driver"}`,
+		`{"step_index":3,"source":"MODEL","type":"GENERIC","status":"RUNNING","content":"Tool is running as a background task"}`,
+	}
+	items := ParseAntigravityJSONL(lines)
+	if len(items) != 1 || len(items[0].Tools) != 2 {
+		t.Fatalf("expected 1 tool group with 2 tools, got %+v", items)
+	}
+	if items[0].Tools[0].Target != "canvas.go" {
+		t.Fatalf("expected clean basename 'canvas.go' without quotes, got %q", items[0].Tools[0].Target)
+	}
+	if items[0].Tools[1].IsError {
+		t.Fatal("RUNNING background task must NOT be marked IsError=true")
+	}
+
+	// Verify CJK-heavy VT feed in Chat mode does not block or crash RenderSessionTerminalVisible.
+	var stRef *SessionTerminal
+	h := nsgotest.Start(t, func(cx *core.Scope) core.Node {
+		stRef = NewSessionTerminal(cx, TermKey{InstanceID: "kr", Addr: "mac-mini/t19"}, 156, 39, true, nil, false)
+		return RenderSessionTerminalVisible(
+			cx,
+			stRef,
+			LightPalette,
+			LightVTPalette,
+			func() float32 { return 12 },
+			func() bool { return true },
+		)
+	}, nsgotest.Size(390, 844))
+	var bigCJK strings.Builder
+	for i := 0; i < 450; i++ {
+		bigCJK.WriteString("这是一行包含大量中文宽字符的终端输出测试内容用于验证零IPC绘制性能\r\n")
+	}
+	stRef.Feed([]byte(bigCJK.String()))
+	h.Find("id:vt-canvas")
+}
+

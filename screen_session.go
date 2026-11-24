@@ -438,12 +438,13 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 										},
 										func(st *SessionTerminal) *SessionTerminal { return st },
 										func(cx *core.Scope, item func() *SessionTerminal, _ func() int) core.Node {
-											return RenderSessionTerminal(
+											return RenderSessionTerminalVisible(
 												cx,
 												item(),
 												func() Palette { return a.paletteOf(cx) },
 												func() VTPalette { return a.vtPaletteOf(cx) },
 												a.vtFontSize.Get,
+												func() bool { return !isChatMode() },
 											)
 										},
 									),
