@@ -269,7 +269,7 @@ func (u *uiController) setSessionMode(mode string) {
 	}
 	u.sessionMode.Set(mode)
 	if mode == "chat" {
-		if chat := u.activeChat.Get(); chat != nil {
+		if chat := u.activeChat.Get(); chat != nil && chat.Source() == SourceLoading {
 			chat.RefreshAsync()
 		}
 	}

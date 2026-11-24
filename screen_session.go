@@ -161,38 +161,11 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 			}
 		},
 		Children: []core.Node{
-			// 44px compact session top bar with safe-area top inset (chat source pill moved into chat scroll header so 390px phone titles have full breathing room)
+			// 44px compact session top bar with FIXED right controls across modes so toggling 聊天 <-> 终端 NEVER shifts or deforms the header!
 			TopHeader(cx, a, func() string {
 				return curTerm().Terminal.Label()
 			}, leftBtn, []core.Node{
 				modeSegmentPill,
-				core.Show{
-					When: func() bool { return !isChatMode() },
-					Then: func(cx *core.Scope) core.Node {
-						return FilterPill(cx, a, "session-fit-toggle", func() string {
-							st := curST()
-							if st == nil || (st.observeSig != nil && st.observeSig.Get()) || (st.observeSig == nil && st.Observe()) {
-								return "观察中"
-							}
-							return "已适配"
-						}, func() bool {
-							st := curST()
-							return st != nil && !st.Observe()
-						}, nil, func() {
-							st := curST()
-							if st == nil {
-								return
-							}
-							nextObserve := !st.Observe()
-							st.SetObserve(nextObserve, a.vtFontSize.Get())
-							if nextObserve {
-								a.notifyToast("已切换为观察模式（不改动远端桌面尺寸）")
-							} else {
-								a.notifyToast("已适配手机列宽（发送 RESIZE）")
-							}
-						})
-					},
-				},
 				IconButton(cx, a, "session-search-btn", "搜索", iconSearch, false, func() {
 					showSearch.Set(!showSearch.Get())
 				}),
@@ -309,14 +282,36 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 					}
 				},
 			},
-			// Main session body: Chat View <-> Terminal View
+			// Main session body: BOTH Chat View and Terminal View stay mounted AND laid out in memory
+			// (Absolute full-bleed + VisibilityHidden), so toggling 聊天 <-> 终端 runs ZERO Yoga re-layout
+			// and ZERO view remount — flipping native View visibility in <1ms!
 			core.View{
 				Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0), Position: core.Relative, Overflow: core.Hidden},
 				Children: []core.Node{
-					core.Show{
-						When: isChatMode,
-						Then: func(cx *core.Scope) core.Node {
-							return core.Each(
+					// Layer 1: Chat View (always mounted & laid out while session is open)
+					core.View{
+						StyleFunc: func() core.Style {
+							vis := core.VisibilityVisible
+							pe := core.PointerEventsAuto
+							z := 2
+							if !isChatMode() {
+								vis = core.VisibilityHidden
+								pe = core.PointerEventsNone
+								z = 0
+							}
+							return core.Style{
+								Position:      core.Absolute,
+								Top:           core.Pt(0),
+								Right:         core.Pt(0),
+								Bottom:        core.Pt(0),
+								Left:          core.Pt(0),
+								Visibility:    vis,
+								PointerEvents: pe,
+								ZIndex:        z,
+							}
+						},
+						Children: []core.Node{
+							core.Each(
 								func() []*ChatSessionController {
 									ch := curChat()
 									if ch == nil {
@@ -330,10 +325,107 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 										u.setSessionMode("vt")
 									})
 								},
-							)
+							),
 						},
-						Else: func(cx *core.Scope) core.Node {
-							return core.View{
+					},
+					// Layer 2: Terminal View + dedicated VT sub-bar (always mounted & laid out while session is open)
+					core.View{
+						StyleFunc: func() core.Style {
+							vis := core.VisibilityVisible
+							pe := core.PointerEventsAuto
+							z := 2
+							if isChatMode() {
+								vis = core.VisibilityHidden
+								pe = core.PointerEventsNone
+								z = 0
+							}
+							return core.Style{
+								Position:      core.Absolute,
+								Top:           core.Pt(0),
+								Right:         core.Pt(0),
+								Bottom:        core.Pt(0),
+								Left:          core.Pt(0),
+								Visibility:    vis,
+								PointerEvents: pe,
+								ZIndex:        z,
+							}
+						},
+						Children: []core.Node{
+							// Dedicated VT sub-status bar: shows PTY cols×rows + Observe/Fit toggle without touching TopHeader!
+							core.View{
+								StyleFunc: func() core.Style {
+									pal := a.paletteOf(cx)
+									return core.Style{
+										Direction:      core.Row,
+										AlignItems:     core.AlignCenter,
+										JustifyContent: core.JustifySpaceBetween,
+										Gap:            Tokens.Space2,
+										Padding:        core.Symmetric(core.Points(5), Tokens.PagePadX),
+										Background:     pal.Surface,
+										Borders:        core.Edges{Bottom: 1},
+										BorderColor:    pal.Separator,
+									}
+								},
+								Children: []core.Node{
+									core.Text{
+										MaxLines: 1,
+										ContentFunc: func() string {
+											st := curST()
+											cols, rows := 0, 0
+											if st != nil {
+												cols, rows = st.Screen().Size()
+											}
+											if cols <= 0 {
+												cols = curTerm().Terminal.Cols
+												rows = curTerm().Terminal.Rows
+											}
+											obs := st == nil || (st.observeSig != nil && st.observeSig.Get()) || (st.observeSig == nil && st.Observe())
+											modeNote := "已适配手机列宽"
+											if obs {
+												modeNote = "观察模式 · 不改桌面列宽"
+											}
+											if cols > 0 && rows > 0 {
+												return fmt.Sprintf("%d×%d · %s", cols, rows, modeNote)
+											}
+											return modeNote
+										},
+										StyleFunc: func() core.Style {
+											pal := a.paletteOf(cx)
+											return core.Style{
+												FlexGrow:   1,
+												FlexShrink: 1,
+												MinWidth:   core.Pt(0),
+												Color:      pal.TextMuted,
+												FontSize:   Tokens.FontMonoMeta,
+												FontFamily: core.FontMonospace,
+											}
+										},
+									},
+									FilterPill(cx, a, "session-fit-toggle", func() string {
+										st := curST()
+										if st == nil || (st.observeSig != nil && st.observeSig.Get()) || (st.observeSig == nil && st.Observe()) {
+											return "观察中"
+										}
+										return "适配列宽"
+									}, func() bool {
+										st := curST()
+										return st != nil && !st.Observe()
+									}, nil, func() {
+										st := curST()
+										if st == nil {
+											return
+										}
+										nextObserve := !st.Observe()
+										st.SetObserve(nextObserve, a.vtFontSize.Get())
+										if nextObserve {
+											a.notifyToast("已切换为观察模式（不改动远端桌面尺寸）")
+										} else {
+											a.notifyToast("已适配手机列宽（发送 RESIZE）")
+										}
+									}),
+								},
+							},
+							core.View{
 								Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0), Position: core.Relative, Overflow: core.Hidden},
 								Children: []core.Node{
 									core.Each(
@@ -390,12 +482,12 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 										},
 									},
 								},
-							}
+							},
 						},
 					},
 				},
 			},
-			// Keyboard- & SafeArea-aware bottom dock (KeycapBar in VT mode only + Composer)
+			// Keyboard- & SafeArea-aware bottom dock (KeycapBar kept mounted & toggled via DisplayNone + Composer)
 			core.View{
 				StyleFunc: func() core.Style {
 					pal := a.paletteOf(cx)
@@ -405,10 +497,15 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 					}
 				},
 				Children: []core.Node{
-					core.Show{
-						When: func() bool { return !isChatMode() },
-						Then: func(cx *core.Scope) core.Node {
-							return KeycapBar(cx, a, keycaps)
+					core.View{
+						StyleFunc: func() core.Style {
+							if isChatMode() {
+								return core.Style{Display: core.DisplayNone}
+							}
+							return core.Style{Display: core.DisplayFlex}
+						},
+						Children: []core.Node{
+							KeycapBar(cx, a, keycaps),
 						},
 					},
 					core.Show{

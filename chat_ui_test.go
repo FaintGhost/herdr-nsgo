@@ -139,3 +139,104 @@ func TestUIChatViewDefaultSwitchExpandAndObserveSafeSend(t *testing.T) {
 	h.Find("id:vt-surface")
 	_ = appRef
 }
+
+func TestUISessionZeroRemountSwitchAndStableHeader(t *testing.T) {
+	claudeKey := TermKey{InstanceID: "mac", Addr: "t1"}
+	claudePath := "/Users/dev/.claude/projects/-Volumes-ExternalSSD-workspace-herdr-nsgo/perf.jsonl"
+
+	var uiRef *uiController
+
+	// Build 160 JSONL turns so we also verify viewport windowing keeps mounted cards bounded!
+	manyLines := make([]string, 0, 160)
+	for i := 1; i <= 160; i++ {
+		if i%2 == 1 {
+			manyLines = append(manyLines, `{"type":"user","uuid":"pu-`+string(rune('0'+i%10))+`-`+itoaTest(i)+`","message":{"role":"user","content":"turn-msg-`+itoaTest(i)+`"}}`)
+		} else {
+			manyLines = append(manyLines, `{"type":"assistant","uuid":"pa-`+itoaTest(i)+`","message":{"id":"pm-`+itoaTest(i)+`","model":"claude-opus-4-7","role":"assistant","content":[{"type":"text","text":"reply-msg-`+itoaTest(i)+`"}]}}`)
+		}
+	}
+
+	h := nsgotest.Start(t, func(cx *core.Scope) core.Node {
+		a, _ := testSeededApp(cx)
+		snaps := a.instances.Get()
+		snaps[1].Terminals[0].Foreground = &Foreground{
+			PID:  34488,
+			Name: "2.1.330",
+			Cwd:  "/Volumes/ExternalSSD/workspace/herdr-nsgo",
+			Argv: []string{"claude"},
+		}
+		a.SeedSnapshots(snaps)
+
+		fb := &fakeTranscriptBackend{
+			terms: map[TermKey]AggregatedTerminal{
+				claudeKey: {Key: claudeKey, Terminal: snaps[1].Terminals[0]},
+			},
+			files: map[string][]string{
+				"::/Users/dev/.claude/sessions/34488.json": {
+					`{"pid":34488,"sessionId":"perf","cwd":"/Volumes/ExternalSSD/workspace/herdr-nsgo"}`,
+				},
+				"::" + claudePath: manyLines,
+			},
+		}
+		a.transcriptResolver.SetHome("mac", "", "/Users/dev")
+		a.SetTranscriptBackend(fb)
+
+		node, ctrl := rootWithController(cx, a)
+		uiRef = ctrl
+		return node
+	}, nsgotest.Size(390, 844))
+
+	h.Press("id:session-row-mac::t1")
+	_ = uiRef.activeChat.Get().RefreshSync(t.Context())
+	h.Press("id:chat-source-pill")
+
+	// 1. Both chat-surface and vt-surface MUST stay mounted simultaneously (DisplayNone swap, zero remount!).
+	if len(h.QueryMounted("id:chat-surface")) != 1 || len(h.QueryMounted("id:vt-surface")) != 1 {
+		t.Fatalf("expected BOTH chat-surface and vt-surface kept mounted for 0ms switching, got chat=%d vt=%d",
+			len(h.QueryMounted("id:chat-surface")), len(h.QueryMounted("id:vt-surface")))
+	}
+
+	// 2. Viewport windowing: latest turn (160) is mounted, while turn 1 is held in memory unmounted until requested!
+	h.Find("text:/^reply-msg-160$/")
+	if len(h.QueryMounted("text:/^turn-msg-1$/")) != 0 {
+		t.Fatal("expected turn-msg-1 outside initial 36-item render window so switching stays instant")
+	}
+
+	// 3. Record TopHeader segmented pill bounds in Chat mode, switch to VT mode, and assert ZERO layout shift!
+	chatModePillBounds := h.Find("id:session-mode-chat").Bounds()
+	vtModePillBounds := h.Find("id:session-mode-vt").Bounds()
+
+	h.Press("id:session-mode-vt")
+	h.Find("id:vt-surface")
+	h.Find("id:session-fit-toggle")
+
+	// Chat surface must still be mounted (not destroyed!) while hidden!
+	if len(h.QueryMounted("id:chat-surface")) != 1 {
+		t.Fatal("switching to VT mode destroyed chat-surface instead of hiding via DisplayNone!")
+	}
+
+	afterChatPill := h.Find("id:session-mode-chat").Bounds()
+	afterVTPill := h.Find("id:session-mode-vt").Bounds()
+	if afterChatPill != chatModePillBounds || afterVTPill != vtModePillBounds {
+		t.Fatalf("TopHeader mode switcher shifted position/size on mode toggle! before=(%+v, %+v) after=(%+v, %+v)",
+			chatModePillBounds, vtModePillBounds, afterChatPill, afterVTPill)
+	}
+
+	// Switch back to Chat -> instant visibility flip, still zero header shift!
+	h.Press("id:session-mode-chat")
+	h.Find("id:chat-surface")
+}
+
+func itoaTest(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(buf[i:])
+}

@@ -8,6 +8,11 @@ import (
 	"github.com/nsgo-dev/nsgo/core"
 )
 
+const (
+	chatInitialVisibleItems = 36
+	chatVisibleStepItems    = 50
+)
+
 // RenderChatSession renders the Crisp Slate mobile-reflowed conversation view:
 // top pagination loader, right-aligned Teal user/hc bubbles, 3px left-rail Agent cards
 // with Markdown paragraphs/lists/code-copy blocks, collapsible thinking & tool capsules,
@@ -26,22 +31,66 @@ func RenderChatSession(
 		}
 	}
 
-	filteredItems := func() []ChatTurnItem {
-		all := chat.Items()
+	visibleLimit := core.NewSignal(cx, chatInitialVisibleItems)
+
+	// Memoize filtered + windowed slice per (rev, query, limit) so multiple reactive readers
+	// in the same render pass share one slice without redundant mutex locks or copies.
+	var (
+		cachedRev   uint64 = ^uint64(0)
+		cachedQuery string
+		cachedLimit int
+		cachedTotal int
+		cachedSlice []ChatTurnItem
+	)
+	computeWindow := func() (visible []ChatTurnItem, hiddenAbove int, totalFiltered int) {
+		var curRev uint64
+		if chat.rev != nil {
+			curRev = chat.rev.Get()
+		}
 		q := ""
 		if chat.searchQuery != nil {
 			q = strings.ToLower(strings.TrimSpace(chat.searchQuery.Get()))
 		}
-		if q == "" {
-			return all
+		limit := visibleLimit.Get()
+		if curRev == cachedRev && q == cachedQuery && limit == cachedLimit && cachedSlice != nil {
+			return cachedSlice, cachedTotal - len(cachedSlice), cachedTotal
 		}
-		var out []ChatTurnItem
-		for _, it := range all {
-			if chatItemMatchesQuery(it, q) {
-				out = append(out, it)
+
+		all := chat.Items()
+		var filtered []ChatTurnItem
+		if q == "" {
+			filtered = all
+		} else {
+			filtered = make([]ChatTurnItem, 0, len(all))
+			for _, it := range all {
+				if chatItemMatchesQuery(it, q) {
+					filtered = append(filtered, it)
+				}
 			}
 		}
-		return out
+		cachedTotal = len(filtered)
+		if q == "" && len(filtered) > limit {
+			cachedSlice = filtered[len(filtered)-limit:]
+		} else {
+			cachedSlice = filtered
+		}
+		cachedRev = curRev
+		cachedQuery = q
+		cachedLimit = limit
+		return cachedSlice, cachedTotal - len(cachedSlice), cachedTotal
+	}
+
+	filteredItems := func() []ChatTurnItem {
+		vis, _, _ := computeWindow()
+		return vis
+	}
+	hiddenLocalCount := func() int {
+		_, hid, _ := computeWindow()
+		return hid
+	}
+	totalFilteredCount := func() int {
+		_, _, tot := computeWindow()
+		return tot
 	}
 
 	return core.View{
@@ -122,23 +171,31 @@ func RenderChatSession(
 									}),
 								},
 							},
-							// Pagination loader for earlier JSONL lines
+							// Pagination loader: reveals buffered in-memory items in 0ms first, then fetches older remote JSONL lines
 							core.Show{
-								When: chat.HasOlder,
+								When: func() bool { return hiddenLocalCount() > 0 || chat.HasOlder() },
 								Then: func(cx *core.Scope) core.Node {
 									return ActionButtonFunc(cx, a, "chat-load-older-btn", func() string {
+										if hid := hiddenLocalCount(); hid > 0 {
+											return fmt.Sprintf("↑ 展开更早消息（已缓存 %d 条）", hid)
+										}
 										if chat.IsLoadingOlder() {
 											return "正在加载更早对话…"
 										}
 										return fmt.Sprintf("↑ 加载更早对话（剩余 %d 行）", chat.OlderRemaining())
 									}, ActionSecondary, func() {
+										if hiddenLocalCount() > 0 {
+											visibleLimit.Set(visibleLimit.Get() + chatVisibleStepItems)
+											return
+										}
+										visibleLimit.Set(visibleLimit.Get() + chatVisibleStepItems)
 										chat.LoadOlder()
 									})
 								},
 							},
 							// Empty / Loading guidance card
 							core.Show{
-								When: func() bool { return len(filteredItems()) == 0 },
+								When: func() bool { return totalFilteredCount() == 0 },
 								Then: func(cx *core.Scope) core.Node {
 									if chat.Source() == SourceLoading {
 										return EmptyStateCard(cx, a, "正在同步会话记录…", "正在定位并拉取远端会话日志，马上呈现。", "", "", nil)
@@ -875,13 +932,18 @@ func renderChatAssistantCard(
 							Gap:        core.Points(6),
 						},
 						Children: []core.Node{
-							HarnessIconBadge(cx, a, func() string {
-								it := itemFn()
-								if it.App != "" {
-									return it.App
-								}
-								return termFn().Terminal.AppName()
-							}),
+							core.View{
+								StyleFunc: func() core.Style {
+									pal := a.paletteOf(cx)
+									return core.Style{
+										FlexShrink:   0,
+										Width:        core.Pt(7),
+										Height:       core.Pt(7),
+										CornerRadius: 4,
+										Background:   pal.Accent,
+									}
+								},
+							},
 							core.Text{
 								MaxLines: 1,
 								ContentFunc: func() string {
