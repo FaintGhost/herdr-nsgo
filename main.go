@@ -263,6 +263,10 @@ func (u *uiController) setSessionMode(mode string) {
 	if mode != "chat" && mode != "vt" {
 		return
 	}
+	if u.sessionMode.Get() == mode {
+		return
+	}
+	playSelectionHaptic(u.app.cx)
 	cur := u.activeSession.Get()
 	if cur != (TermKey{}) {
 		u.sessionModes[cur] = mode
@@ -275,11 +279,12 @@ func (u *uiController) setSessionMode(mode string) {
 	}
 }
 
-// openSession attaches to key (in observe mode by default), pre-seeding from LRU FrameCache,
+// openSession attaches to key (in observe mode by default), pre-seeding from LRU FrameCache & SnapshotStore,
 // and initializes the root-scoped ChatSessionController.
 // Always binds SessionTerminal and ChatSessionController signals to the root app scope (u.app.cx),
 // never an ephemeral row/button child scope that gets disposed on navigation.
 func (u *uiController) openSession(_ *core.Scope, key TermKey) {
+	prevKey := u.activeSession.Get()
 	if prevChat := u.activeChat.Get(); prevChat != nil {
 		prevChat.Close()
 		u.activeChat.Set(nil)
@@ -287,6 +292,11 @@ func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 	if prev := u.activeTerm.Get(); prev != nil {
 		prev.Close()
 		u.activeTerm.Set(nil)
+		if prevKey != (TermKey{}) && u.app.frameCacheOn.Get() && u.app.cache != nil && u.app.snapshots != nil {
+			if snapBytes, ok := u.app.cache.Get(prevKey); ok && len(snapBytes) > 0 {
+				u.app.snapshots.SaveVT(prevKey, snapBytes)
+			}
+		}
 	}
 	u.activeSession.Set(key)
 
@@ -306,6 +316,12 @@ func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 	var cache *FrameCache
 	if u.app.frameCacheOn.Get() {
 		cache = u.app.cache
+		// Cold-start 0ms VT snapshot seed: if LRU memory cache doesn't have key yet, load persisted VT bytes!
+		if _, hasMem := cache.Get(key); !hasMem && u.app.snapshots != nil {
+			if rawVT, ok := u.app.snapshots.LoadVT(key); ok && len(rawVT) > 0 {
+				cache.Put(key, rawVT)
+			}
+		}
 	}
 	enableGhostty := rootCX != nil && !rootCX.Env().Simulated()
 	observe := u.app.observeDefault.Get()
@@ -318,6 +334,9 @@ func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 		u.app.transcriptResolver,
 		func() string { return st.Screen().PlainText() },
 	)
+	if u.app.frameCacheOn.Get() && u.app.snapshots != nil {
+		chatCtrl.SeedFromSnapshot(u.app.snapshots)
+	}
 
 	attachWithMode := func(obs bool, cols, rows int) {
 		gen := u.attachGen.Add(1)
@@ -429,9 +448,10 @@ func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 	attachWithMode(observe, 100, 32)
 }
 
-// closeSession releases the active VT attach stream, stops Chat tailing, and updates the LRU cache.
+// closeSession releases the active VT attach stream, stops Chat tailing, and updates the LRU & persistent snapshot caches.
 func (u *uiController) closeSession() {
 	u.attachGen.Add(1)
+	curKey := u.activeSession.Get()
 	if prevChat := u.activeChat.Get(); prevChat != nil {
 		prevChat.Close()
 		u.activeChat.Set(nil)
@@ -439,6 +459,11 @@ func (u *uiController) closeSession() {
 	if prev := u.activeTerm.Get(); prev != nil {
 		prev.Close()
 		u.activeTerm.Set(nil)
+		if curKey != (TermKey{}) && u.app.frameCacheOn.Get() && u.app.cache != nil && u.app.snapshots != nil {
+			if snapBytes, ok := u.app.cache.Get(curKey); ok && len(snapBytes) > 0 {
+				u.app.snapshots.SaveVT(curKey, snapBytes)
+			}
+		}
 	}
 	u.activeSession.Set(TermKey{})
 }

@@ -47,14 +47,23 @@ type MarkdownBlock struct {
 	Items []string
 }
 
-// ChatToolCall represents one tool invocation and its paired result summary.
+// ChatToolCall represents one tool invocation and its paired result summary (plus optional file diff).
 type ChatToolCall struct {
-	ID           string
-	Name         string
-	Target       string
-	InputSummary string
-	Output       string
-	IsError      bool
+	ID           string `json:"id,omitempty"`
+	Name         string `json:"name"`
+	Target       string `json:"target,omitempty"`
+	InputSummary string `json:"input_summary,omitempty"`
+	Output       string `json:"output,omitempty"`
+	IsError      bool   `json:"is_error,omitempty"`
+	DiffFile     string `json:"diff_file,omitempty"`
+	DiffOld      string `json:"diff_old,omitempty"`
+	DiffNew      string `json:"diff_new,omitempty"`
+	DiffPatch    string `json:"diff_patch,omitempty"`
+}
+
+// HasDiff reports whether this tool call carries a structured file modification diff.
+func (tc ChatToolCall) HasDiff() bool {
+	return tc.DiffPatch != "" || tc.DiffOld != "" || tc.DiffNew != ""
 }
 
 // ChatTurnItem is the immutable normalized view-model item rendered by screen_chat.go.
@@ -469,6 +478,194 @@ func extractToolTarget(name string, rawArgs any) (target, summary string) {
 	return target, summary
 }
 
+const maxExtractedDiffBytes = 24 * 1024
+
+// buildToolCall constructs a ChatToolCall with target, summary, and optional file-edit diff extracted from rawArgs.
+func buildToolCall(id, name string, rawArgs any) ChatToolCall {
+	target, summary := extractToolTarget(name, rawArgs)
+	tc := ChatToolCall{
+		ID:           id,
+		Name:         name,
+		Target:       target,
+		InputSummary: summary,
+	}
+	diffFile, diffOld, diffNew, diffPatch := extractToolDiff(name, rawArgs)
+	tc.DiffFile = diffFile
+	tc.DiffOld = diffOld
+	tc.DiffNew = diffNew
+	tc.DiffPatch = diffPatch
+	if tc.Target == "" && diffFile != "" {
+		tc.Target = filepath.Base(diffFile)
+	}
+	return tc
+}
+
+func extractToolDiff(name string, rawArgs any) (file, oldStr, newStr, patch string) {
+	lowerName := strings.ToLower(strings.TrimSpace(name))
+	if lowerName == "apply_patch" {
+		rawPatch := ""
+		switch v := rawArgs.(type) {
+		case string:
+			rawPatch = v
+		case json.RawMessage:
+			if json.Unmarshal(v, &rawPatch) != nil {
+				var pm map[string]any
+				if json.Unmarshal(v, &pm) == nil {
+					for _, k := range []string{"patch", "input", "diff", "cmd"} {
+						if sv, ok := pm[k].(string); ok && sv != "" {
+							rawPatch = sv
+							break
+						}
+					}
+				}
+			}
+		case map[string]any:
+			for _, k := range []string{"patch", "input", "diff", "cmd"} {
+				if sv, ok := v[k].(string); ok && sv != "" {
+					rawPatch = sv
+					break
+				}
+			}
+		}
+		if f, o, n, up := parseApplyPatchPayload(rawPatch); f != "" || up != "" || o != "" || n != "" {
+			return f, utf8SafePrefix(o, maxExtractedDiffBytes), utf8SafePrefix(n, maxExtractedDiffBytes), utf8SafePrefix(up, maxExtractedDiffBytes)
+		}
+	}
+
+	var m map[string]any
+	switch v := rawArgs.(type) {
+	case map[string]any:
+		m = v
+	case string:
+		_ = json.Unmarshal([]byte(v), &m)
+	case json.RawMessage:
+		if len(v) > 0 && json.Unmarshal(v, &m) != nil {
+			var inner string
+			if json.Unmarshal(v, &inner) == nil {
+				_ = json.Unmarshal([]byte(inner), &m)
+			}
+		}
+	}
+	if len(m) == 0 {
+		return "", "", "", ""
+	}
+
+	strField := func(keys ...string) (string, bool) {
+		for _, k := range keys {
+			if val, ok := m[k]; ok {
+				if sv, okStr := val.(string); okStr {
+					return sv, true
+				}
+			}
+		}
+		return "", false
+	}
+
+	file, _ = strField("file_path", "Path", "path", "TargetFile", "target_file")
+
+	// 1. Direct old -> new replacement tools (Claude Edit, Antigravity edit_file/replace_file_content, OMP edit).
+	oldVal, hasOld := strField("old_string", "Target", "TargetContent", "old_str", "oldText")
+	newVal, hasNew := strField("new_string", "Replacement", "ReplacementContent", "new_str", "newText")
+	if hasOld || hasNew {
+		return file, utf8SafePrefix(oldVal, maxExtractedDiffBytes), utf8SafePrefix(newVal, maxExtractedDiffBytes), ""
+	}
+
+	// 2. Multi-hunk edit arrays (MultiEdit / edits / ReplacementChunks).
+	for _, arrKey := range []string{"edits", "ReplacementChunks", "chunks"} {
+		if rawArr, ok := m[arrKey].([]any); ok && len(rawArr) > 0 {
+			var oldParts, newParts []string
+			for _, elem := range rawArr {
+				em, okMap := elem.(map[string]any)
+				if !okMap {
+					continue
+				}
+				var o, n string
+				for _, okk := range []string{"old_string", "TargetContent", "Target", "oldText"} {
+					if sv, okS := em[okk].(string); okS {
+						o = sv
+						break
+					}
+				}
+				for _, nkk := range []string{"new_string", "ReplacementContent", "Replacement", "newText"} {
+					if sv, okS := em[nkk].(string); okS {
+						n = sv
+						break
+					}
+				}
+				if o != "" || n != "" {
+					oldParts = append(oldParts, o)
+					newParts = append(newParts, n)
+				}
+			}
+			if len(oldParts) > 0 || len(newParts) > 0 {
+				return file,
+					utf8SafePrefix(strings.Join(oldParts, "\n…\n"), maxExtractedDiffBytes),
+					utf8SafePrefix(strings.Join(newParts, "\n…\n"), maxExtractedDiffBytes),
+					""
+			}
+		}
+	}
+
+	// 3. File write / creation tools (Write / write_file / create_file).
+	isWriteTool := lowerName == "write" || lowerName == "write_file" || lowerName == "create_file" || strings.HasSuffix(lowerName, "_write")
+	if isWriteTool {
+		if content, ok := strField("content", "Content", "CodeContent", "file_text"); ok && content != "" {
+			return file, "", utf8SafePrefix(content, maxExtractedDiffBytes), ""
+		}
+	}
+
+	// 4. Unified diff string field.
+	if p, ok := strField("patch", "diff"); ok && strings.Contains(p, "@@") {
+		return file, "", "", utf8SafePrefix(p, maxExtractedDiffBytes)
+	}
+	return "", "", "", ""
+}
+
+func parseApplyPatchPayload(raw string) (file, oldStr, newStr, unified string) {
+	raw = strings.TrimSpace(strings.ReplaceAll(raw, "\r\n", "\n"))
+	if raw == "" {
+		return "", "", "", ""
+	}
+	if strings.Contains(raw, "--- ") && strings.Contains(raw, "+++ ") && strings.Contains(raw, "@@") {
+		for _, ln := range strings.Split(raw, "\n") {
+			if strings.HasPrefix(ln, "+++ b/") {
+				file = strings.TrimSpace(strings.TrimPrefix(ln, "+++ b/"))
+				break
+			}
+		}
+		return file, "", "", raw
+	}
+	if !strings.Contains(raw, "*** ") {
+		return "", "", "", ""
+	}
+	var oldLines, newLines []string
+	for _, ln := range strings.Split(raw, "\n") {
+		switch {
+		case strings.HasPrefix(ln, "*** Update File:"), strings.HasPrefix(ln, "*** Add File:"), strings.HasPrefix(ln, "*** Delete File:"):
+			if file == "" {
+				if idx := strings.IndexByte(ln, ':'); idx >= 0 {
+					file = strings.TrimSpace(ln[idx+1:])
+				}
+			}
+		case strings.HasPrefix(ln, "***"):
+			continue
+		case strings.HasPrefix(ln, "@@"):
+			if len(oldLines) > 0 || len(newLines) > 0 {
+				oldLines = append(oldLines, "…")
+				newLines = append(newLines, "…")
+			}
+		case strings.HasPrefix(ln, "-"):
+			oldLines = append(oldLines, ln[1:])
+		case strings.HasPrefix(ln, "+"):
+			newLines = append(newLines, ln[1:])
+		case strings.HasPrefix(ln, " "):
+			oldLines = append(oldLines, ln[1:])
+			newLines = append(newLines, ln[1:])
+		}
+	}
+	return file, strings.Join(oldLines, "\n"), strings.Join(newLines, "\n"), ""
+}
+
 func singleLineClip(s string, maxRunes int) string {
 	s = strings.TrimSpace(strings.ReplaceAll(s, "\n", " "))
 	r := []rune(s)
@@ -672,13 +869,7 @@ func parseClaudeJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 						})
 					}
 				case "tool_use":
-					target, summary := extractToolTarget(b.Name, b.Input)
-					appendToolItem(&items, fmt.Sprintf("%s-tg-%d", msgID, absIdx), srcLine, ChatToolCall{
-						ID:           b.ID,
-						Name:         b.Name,
-						Target:       target,
-						InputSummary: summary,
-					}, toolIdx)
+					appendToolItem(&items, fmt.Sprintf("%s-tg-%d", msgID, absIdx), srcLine, buildToolCall(b.ID, b.Name, b.Input), toolIdx)
 				case "text":
 					txt := strings.TrimSpace(b.Text)
 					if txt == "" {
@@ -822,13 +1013,7 @@ func parsePiOmpJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 						})
 					}
 				case "toolCall":
-					target, summary := extractToolTarget(b.Name, b.Arguments)
-					appendToolItem(&items, fmt.Sprintf("%s-tg-%d", rowID, bi), srcLine, ChatToolCall{
-						ID:           b.ID,
-						Name:         b.Name,
-						Target:       target,
-						InputSummary: summary,
-					}, toolIdx)
+					appendToolItem(&items, fmt.Sprintf("%s-tg-%d", rowID, bi), srcLine, buildToolCall(b.ID, b.Name, b.Arguments), toolIdx)
 				case "text":
 					if txt := strings.TrimSpace(b.Text); txt != "" {
 						items = append(items, ChatTurnItem{
@@ -996,13 +1181,7 @@ func parseCodexJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 			if len(rawArgs) == 0 {
 				rawArgs = item.Input
 			}
-			target, summary := extractToolTarget(item.Name, rawArgs)
-			appendToolItem(&items, rowID, srcLine, ChatToolCall{
-				ID:           item.CallID,
-				Name:         item.Name,
-				Target:       target,
-				InputSummary: summary,
-			}, toolIdx)
+			appendToolItem(&items, rowID, srcLine, buildToolCall(item.CallID, item.Name, rawArgs), toolIdx)
 		case "function_call_output", "custom_tool_call_output":
 			outStr := extractCodexContentText(item.Output)
 			isErr := strings.Contains(outStr, "Exit code: 1") || strings.HasPrefix(strings.TrimSpace(outStr), "error:")
@@ -1117,13 +1296,7 @@ func parseAntigravityJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 				dummyMap := make(map[string][2]int)
 				for ti, tc := range row.ToolCalls {
 					callKey := fmt.Sprintf("%s-tc-%d", rowID, ti)
-					target, summary := extractToolTarget(tc.Name, tc.Args)
-					appendToolItem(&items, rowID+"-tg", srcLine, ChatToolCall{
-						ID:           callKey,
-						Name:         tc.Name,
-						Target:       target,
-						InputSummary: summary,
-					}, dummyMap)
+					appendToolItem(&items, rowID+"-tg", srcLine, buildToolCall(callKey, tc.Name, tc.Args), dummyMap)
 					pendingToolRefs = append(pendingToolRefs, dummyMap[callKey])
 				}
 			}

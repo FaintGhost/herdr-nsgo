@@ -1176,6 +1176,55 @@ func (s *VTScreen) PlainText() string {
 	return strings.TrimRight(strings.Join(lines, "\n"), "\n")
 }
 
+func isHerdrScrollbarRune(r rune) bool {
+	switch r {
+	case '│', '┃', '║', '▏', '▕', '█', '▌', '▐', '░', '▒', '▓':
+		return true
+	default:
+		return false
+	}
+}
+
+// StripHerdrScrollbar removes trailing right-edge TUI scrollbar characters (such as │, ┃, █, ░, ▒, ▓)
+// when copying multiline text from herdr panes, inspired by Moshi's stripHerdrScrollbarOnCopy.
+func StripHerdrScrollbar(text string) string {
+	if text == "" {
+		return ""
+	}
+	norm := strings.ReplaceAll(text, "\r\n", "\n")
+	lines := strings.Split(norm, "\n")
+	nonEmpty := 0
+	withBar := 0
+	for _, line := range lines {
+		trimmed := strings.TrimRight(line, " \t")
+		if trimmed == "" {
+			continue
+		}
+		nonEmpty++
+		r, _ := utf8.DecodeLastRuneInString(trimmed)
+		if isHerdrScrollbarRune(r) {
+			withBar++
+		}
+	}
+	// Only strip when at least 2 lines end with a scrollbar glyph and >= 60% of non-empty lines carry it
+	// (avoids touching normal prose or single-line pipes; table rows ending with ASCII '|' are never touched).
+	if withBar < 2 || nonEmpty == 0 || withBar*5 < nonEmpty*3 {
+		return norm
+	}
+	out := make([]string, len(lines))
+	for i, line := range lines {
+		trimmed := strings.TrimRight(line, " \t")
+		if trimmed != "" {
+			r, sz := utf8.DecodeLastRuneInString(trimmed)
+			if isHerdrScrollbarRune(r) {
+				trimmed = strings.TrimRight(trimmed[:len(trimmed)-sz], " \t")
+			}
+		}
+		out[i] = trimmed
+	}
+	return strings.Join(out, "\n")
+}
+
 // Search performs a case-insensitive search over scrollback + visible rows.
 func (s *VTScreen) Search(query string) []VTMatch {
 	q := strings.ToLower(strings.TrimSpace(query))

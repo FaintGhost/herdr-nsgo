@@ -74,9 +74,10 @@ func defaultSnippets() []Snippet {
 type App struct {
 	cx      *core.Scope
 	secrets SecretBackend
-	tofu    *TOFUStore
-	pool    *CorePool
-	cache   *FrameCache
+	tofu      *TOFUStore
+	pool      *CorePool
+	cache     *FrameCache
+	snapshots *SnapshotStore
 
 	// Primary v1.0 multi-instance signals
 	instances            *core.Signal[[]InstanceSnapshot]
@@ -124,6 +125,7 @@ func NewApp(cx *core.Scope) *App {
 		secrets:              NewSecretStore(cx),
 		tofu:                 NewStorageTOFUStore(cx),
 		cache:                NewFrameCache(24),
+		snapshots:            NewSnapshotStore(cx),
 		alerts:               newAlertTracker(),
 		transcriptResolver:   NewTranscriptResolver(),
 		instances:            core.NewSignalFunc(cx, []InstanceSnapshot(nil), nil),

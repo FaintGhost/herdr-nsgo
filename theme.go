@@ -49,7 +49,9 @@ type Palette struct {
 	Danger     core.Color
 	DangerSoft core.Color
 
-	Overlay core.Color
+	GlassSurface core.Color
+	GlassBorder  core.Color
+	Overlay      core.Color
 }
 
 // VTPalette holds the terminal canvas background, foreground, cursor, and 16-color ANSI table.
@@ -112,6 +114,8 @@ func LightPalette() Palette {
 		WarnSoft:      core.RGBA(0x9a4106, 0.10),
 		Danger:        core.RGB(0xc81e1e),
 		DangerSoft:    core.RGBA(0xc81e1e, 0.10),
+		GlassSurface:  core.RGBA(0xffffff, 0.78),
+		GlassBorder:   core.RGBA(0x111827, 0.11),
 		Overlay:       core.RGBA(0x111827, 0.36),
 	}
 }
@@ -136,6 +140,8 @@ func DarkPalette() Palette {
 		WarnSoft:      core.RGBA(0xf5a623, 0.14),
 		Danger:        core.RGB(0xf87171),
 		DangerSoft:    core.RGBA(0xf87171, 0.14),
+		GlassSurface:  core.RGBA(0x14191f, 0.78),
+		GlassBorder:   core.RGBA(0xeef2f6, 0.13),
 		Overlay:       core.RGBA(0x000000, 0.56),
 	}
 }

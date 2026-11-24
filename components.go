@@ -5,7 +5,47 @@ import (
 	"strings"
 
 	"github.com/nsgo-dev/nsgo/core"
+	"github.com/nsgo-dev/nsgo/ui"
 )
+
+// Moshi-inspired native 120fps spring presets (decoded from Hermes Reanimated worklets).
+var (
+	MoshiPressSpring = core.SpringConfig{Damping: 14, Stiffness: 320, Mass: 0.6}
+	MoshiSheetSpring = core.SpringConfig{Damping: 22, Stiffness: 240, Mass: 0.8}
+)
+
+func playSelectionHaptic(cx *core.Scope) {
+	if cx != nil && !cx.Env().Simulated() {
+		cx.PlayHaptic(core.HapticSelection)
+	}
+}
+
+func animateSpringLayout(cx *core.Scope) {
+	if cx != nil && !ui.ReduceMotion(cx) {
+		cx.AnimateLayout(core.LayoutSpringPreset)
+	}
+}
+
+func newPressScale(cx *core.Scope) *core.AnimatedValue {
+	if cx == nil || ui.ReduceMotion(cx) {
+		return nil
+	}
+	return core.NewAnimatedValue(cx, 1)
+}
+
+func pressSpringTo(cx *core.Scope, v *core.AnimatedValue, to float64) {
+	if cx == nil || v == nil {
+		return
+	}
+	ui.Spring(cx, v, to, MoshiPressSpring)
+}
+
+func pressAnimStyle(v *core.AnimatedValue) *core.AnimatedStyle {
+	if v == nil {
+		return nil
+	}
+	return &core.AnimatedStyle{Scale: v}
+}
 
 // AppName returns the detected agent/harness name from Status.App or Foreground.Name.
 func (t Terminal) AppName() string {
@@ -187,16 +227,22 @@ func ActionButton(cx *core.Scope, a *App, testID, text string, variant ActionVar
 	return ActionButtonFunc(cx, a, testID, func() string { return text }, variant, onPress)
 }
 
-// ActionButtonFunc renders a reactive-label ActionButton.
+// ActionButtonFunc renders a reactive-label ActionButton with native 120fps Moshi press spring & haptic feedback.
 func ActionButtonFunc(cx *core.Scope, a *App, testID string, textFn func() string, variant ActionVariant, onPress func()) core.Node {
+	scale := newPressScale(cx)
 	return core.View{
-		TestID:  testID,
-		Role:    core.RoleButton,
+		TestID:      testID,
+		Role:        core.RoleButton,
+		OnPressDown: func(core.PressEvent) { pressSpringTo(cx, scale, 0.97) },
+		OnPressUp:   func(core.PressEvent) { pressSpringTo(cx, scale, 1.0) },
 		OnPress: func(core.PressEvent) {
+			pressSpringTo(cx, scale, 1.0)
+			playSelectionHaptic(cx)
 			if onPress != nil {
 				onPress()
 			}
 		},
+		Style: core.Style{Animated: pressAnimStyle(scale)},
 		StyleFunc: func() core.Style {
 			pal := a.paletteOf(cx)
 			bg := pal.Accent
@@ -251,17 +297,23 @@ func ActionButtonFunc(cx *core.Scope, a *App, testID string, textFn func() strin
 	}
 }
 
-// IconButton renders a crisp 36x36 vector icon button (for TopHeader and Composer docks).
+// IconButton renders a crisp 36x36 vector icon button with native 120fps press spring & haptic feedback.
 func IconButton(cx *core.Scope, a *App, testID, label string, svg *core.SVG, primary bool, onPress func()) core.Node {
+	scale := newPressScale(cx)
 	return core.View{
-		TestID: testID,
-		Role:   core.RoleButton,
-		Label:  label,
+		TestID:      testID,
+		Role:        core.RoleButton,
+		Label:       label,
+		OnPressDown: func(core.PressEvent) { pressSpringTo(cx, scale, 0.94) },
+		OnPressUp:   func(core.PressEvent) { pressSpringTo(cx, scale, 1.0) },
 		OnPress: func(core.PressEvent) {
+			pressSpringTo(cx, scale, 1.0)
+			playSelectionHaptic(cx)
 			if onPress != nil {
 				onPress()
 			}
 		},
+		Style: core.Style{Animated: pressAnimStyle(scale)},
 		StyleFunc: func() core.Style {
 			pal := a.paletteOf(cx)
 			bg := pal.SurfaceRaised
@@ -304,16 +356,22 @@ func IconButton(cx *core.Scope, a *App, testID, label string, svg *core.SVG, pri
 	}
 }
 
-// FilterPill renders a selectable horizontal filter chip with optional reactive online dot.
+// FilterPill renders a selectable horizontal filter chip with optional reactive online dot and native press spring.
 func FilterPill(cx *core.Scope, a *App, testID string, labelFn func() string, activeFn func() bool, onlineFn func() bool, onPress func()) core.Node {
+	scale := newPressScale(cx)
 	return core.View{
-		TestID:  testID,
-		Role:    core.RoleButton,
+		TestID:      testID,
+		Role:        core.RoleButton,
+		OnPressDown: func(core.PressEvent) { pressSpringTo(cx, scale, 0.96) },
+		OnPressUp:   func(core.PressEvent) { pressSpringTo(cx, scale, 1.0) },
 		OnPress: func(core.PressEvent) {
+			pressSpringTo(cx, scale, 1.0)
+			playSelectionHaptic(cx)
 			if onPress != nil {
 				onPress()
 			}
 		},
+		Style: core.Style{Animated: pressAnimStyle(scale)},
 		StyleFunc: func() core.Style {
 			pal := a.paletteOf(cx)
 			active := activeFn()
@@ -405,17 +463,23 @@ func SectionHeader(cx *core.Scope, a *App, titleFn func() string, right core.Nod
 }
 
 // SessionRow renders a compact crisp-slate session list card with a 3px left status rail,
-// instance badge, cwd path, and last semantic status line.
+// instance badge, cwd path, last semantic status line, and Moshi-style 0.985 press spring.
 func SessionRow(cx *core.Scope, a *App, itemFn func() AggregatedTerminal, selectedFn func() bool, onOpen func(TermKey)) core.Node {
 	initial := itemFn()
+	scale := newPressScale(cx)
 	return core.View{
-		TestID: "session-row-" + initial.Key.String(),
-		Role:   core.RoleButton,
+		TestID:      "session-row-" + initial.Key.String(),
+		Role:        core.RoleButton,
+		OnPressDown: func(core.PressEvent) { pressSpringTo(cx, scale, 0.985) },
+		OnPressUp:   func(core.PressEvent) { pressSpringTo(cx, scale, 1.0) },
 		OnPress: func(core.PressEvent) {
+			pressSpringTo(cx, scale, 1.0)
+			playSelectionHaptic(cx)
 			if onOpen != nil {
 				onOpen(itemFn().Key)
 			}
 		},
+		Style: core.Style{Animated: pressAnimStyle(scale)},
 		StyleFunc: func() core.Style {
 			pal := a.paletteOf(cx)
 			bg := pal.Surface
@@ -724,27 +788,39 @@ func InlineApprovalCard(cx *core.Scope, a *App, itemFn func() AggregatedTerminal
 
 // KeycapItem defines one terminal keycap on the single-row keycap bar.
 type KeycapItem struct {
-	TestID  string
-	Label   string
-	Accent  bool
-	Danger  bool
-	Active  func() bool
-	OnPress func()
+	TestID    string
+	Label     string
+	LabelFunc func() string
+	Accent    bool
+	Danger    bool
+	Active    func() bool
+	OnPress   func()
 }
 
-// KeycapBar renders the single-row horizontal scrollable 34px keycap dock.
+// KeycapBar renders the single-row horizontal scrollable 34px keycap dock with tactile press spring.
 func KeycapBar(cx *core.Scope, a *App, items []KeycapItem) core.Node {
 	nodes := make([]core.Node, 0, len(items))
 	for _, it := range items {
 		item := it
+		scale := newPressScale(cx)
+		lblFn := item.LabelFunc
+		if lblFn == nil {
+			lbl := item.Label
+			lblFn = func() string { return lbl }
+		}
 		nodes = append(nodes, core.View{
-			TestID: item.TestID,
-			Role:   core.RoleButton,
+			TestID:      item.TestID,
+			Role:        core.RoleButton,
+			OnPressDown: func(core.PressEvent) { pressSpringTo(cx, scale, 0.94) },
+			OnPressUp:   func(core.PressEvent) { pressSpringTo(cx, scale, 1.0) },
 			OnPress: func(core.PressEvent) {
+				pressSpringTo(cx, scale, 1.0)
+				playSelectionHaptic(cx)
 				if item.OnPress != nil {
 					item.OnPress()
 				}
 			},
+			Style: core.Style{Animated: pressAnimStyle(scale)},
 			StyleFunc: func() core.Style {
 				pal := a.paletteOf(cx)
 				bg := pal.SurfaceRaised
@@ -771,7 +847,7 @@ func KeycapBar(cx *core.Scope, a *App, items []KeycapItem) core.Node {
 			},
 			Children: []core.Node{
 				core.Text{
-					Content: item.Label,
+					ContentFunc: lblFn,
 					StyleFunc: func() core.Style {
 						pal := a.paletteOf(cx)
 						fg := pal.Text
@@ -929,88 +1005,62 @@ func EmptyStateCard(cx *core.Scope, a *App, title, body, ctaTestID, ctaLabel str
 	}
 }
 
-// SheetModal renders a keyboard- and safe-area-aware bottom sheet overlay.
+// SheetModal renders a swipe-dismissable, keyboard- and safe-area-aware native NSGo ui.Sheet.
 func SheetModal(cx *core.Scope, a *App, testID, title, closeTestID string, onClose func(), body []core.Node) core.Node {
-	return core.View{
-		TestID: testID,
+	closeFn := func() {
+		if onClose != nil {
+			onClose()
+		}
+	}
+	return ui.Sheet{
+		Open:         func() bool { return true },
+		OnClose:      closeFn,
+		CloseOnSwipe: true,
+		Label:        title,
+		TestID:       testID,
 		StyleFunc: func() core.Style {
 			pal := a.paletteOf(cx)
 			return core.Style{
-				Position:       core.Absolute,
-				Top:            core.Pt(0),
-				Left:           core.Pt(0),
-				Right:          core.Pt(0),
-				Bottom:         core.Pt(0),
-				Background:     pal.Overlay,
-				JustifyContent: core.JustifyEnd,
-				AlignItems:     core.AlignCenter,
-				Padding:        core.All(Tokens.Space3),
-				PaddingEnv:     core.EnvEdges{Top: core.EnvSafeArea, Bottom: core.EnvKeyboard},
+				Width:      core.Pct(100),
+				MaxWidth:   core.Pt(580),
+				MaxHeight:  core.Pct(86),
+				AlignSelf:  core.AlignCenter,
+				Background: pal.Surface,
+				Borders:    core.Edges{Top: 1, Left: 1, Right: 1},
+				BorderColor: pal.Border,
+				Gap:        Tokens.Space3,
 			}
 		},
 		Children: []core.Node{
 			core.View{
-				StyleFunc: func() core.Style {
-					pal := a.paletteOf(cx)
-					return core.Style{
-						Width:        core.Pct(100),
-						MaxWidth:     core.Pt(560),
-						MaxHeight:    core.Pct(86),
-						Background:   pal.Surface,
-						CornerRadius: Tokens.RadiusSheet,
-						BorderWidth:  1,
-						BorderColor:  pal.Border,
-						Padding:      core.All(Tokens.Space4),
-						PaddingEnv:   core.EnvEdges{Bottom: core.EnvSafeArea},
-						Gap:          Tokens.Space3,
-					}
+				Style: core.Style{
+					Direction:      core.Row,
+					AlignItems:     core.AlignCenter,
+					JustifyContent: core.JustifySpaceBetween,
 				},
 				Children: []core.Node{
-					core.View{
-						Style: core.Style{AlignItems: core.AlignCenter},
-						Children: []core.Node{
-							core.View{
-								StyleFunc: func() core.Style {
-									pal := a.paletteOf(cx)
-									return core.Style{
-										Width:        core.Pt(36),
-										Height:       core.Pt(4),
-										CornerRadius: 2,
-										Background:   pal.Fill,
-									}
-								},
-							},
+					core.Text{
+						Content: title,
+						StyleFunc: func() core.Style {
+							pal := a.paletteOf(cx)
+							return core.Style{
+								FlexShrink: 1,
+								MinWidth:   core.Pt(0),
+								Color:      pal.Text,
+								FontSize:   Tokens.FontNav,
+								FontWeight: core.FontWeightBold,
+							}
 						},
 					},
+					ActionButton(cx, a, closeTestID, "关闭", ActionGhost, closeFn),
+				},
+			},
+			core.Scroll{
+				Style: core.Style{FlexShrink: 1, MinHeight: core.Pt(0)},
+				Children: []core.Node{
 					core.View{
-						Style: core.Style{
-							Direction:      core.Row,
-							AlignItems:     core.AlignCenter,
-							JustifyContent: core.JustifySpaceBetween,
-						},
-						Children: []core.Node{
-							core.Text{
-								Content: title,
-								StyleFunc: func() core.Style {
-									pal := a.paletteOf(cx)
-									return core.Style{
-										Color:      pal.Text,
-										FontSize:   Tokens.FontNav,
-										FontWeight: core.FontWeightBold,
-									}
-								},
-							},
-							ActionButton(cx, a, closeTestID, "关闭", ActionGhost, onClose),
-						},
-					},
-					core.Scroll{
-						Style: core.Style{FlexShrink: 1},
-						Children: []core.Node{
-							core.View{
-								Style:    core.Style{Gap: Tokens.Space3},
-								Children: body,
-							},
-						},
+						Style:    core.Style{Gap: Tokens.Space3, Padding: core.Edges{Bottom: Tokens.Space2}},
+						Children: body,
 					},
 				},
 			},

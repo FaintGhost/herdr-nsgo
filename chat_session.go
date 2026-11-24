@@ -605,7 +605,9 @@ type ChatSessionController struct {
 	key        TermKey
 	backend    TranscriptBackend
 	resolver   *TranscriptResolver
+	snapshots  *SnapshotStore
 	vtFallback func() string
+	scrollHook func(animated bool)
 
 	syncMu     sync.Mutex
 	loopCtx    context.Context
@@ -613,9 +615,10 @@ type ChatSessionController struct {
 	refreshing atomic.Bool
 	optSeq     atomic.Uint64
 
-	mu           sync.Mutex
-	closed       bool
-	source       TranscriptSource
+	mu             sync.Mutex
+	closed         bool
+	cachedSnapshot bool
+	source         TranscriptSource
 	resolvedPath string
 	format       TranscriptFormat
 	onMachine    string
@@ -658,12 +661,86 @@ func NewChatSessionController(
 		source:     SourceLoading,
 		expanded:   make(map[string]bool),
 	}
-	if cx != nil {
-		c.rev = core.NewSignal[uint64](cx, 0)
-		c.searchQuery = core.NewSignal[string](cx, "")
-		c.scrolledUp = core.NewSignal[bool](cx, false)
+		if cx != nil {
+			c.rev = core.NewSignal[uint64](cx, 0)
+			c.searchQuery = core.NewSignal[string](cx, "")
+			c.scrolledUp = core.NewSignal[bool](cx, false)
+		}
+		return c
 	}
-	return c
+
+// SeedFromSnapshot attaches store for persistent snapshot saving and immediately seeds
+// Frame-0 conversation items in 0ms when a previous snapshot exists for this TermKey.
+func (c *ChatSessionController) SeedFromSnapshot(store *SnapshotStore) bool {
+	if c == nil || store == nil {
+		return false
+	}
+	c.mu.Lock()
+	c.snapshots = store
+	c.mu.Unlock()
+
+	snap, ok := store.LoadChat(c.key)
+	if !ok || len(snap.Items) == 0 {
+		return false
+	}
+
+	c.mu.Lock()
+	if len(c.parsedItems) > 0 || c.lastLine > 0 {
+		c.mu.Unlock()
+		return false
+	}
+	src := snap.Source
+	if src == "" || src == SourceLoading {
+		src = SourceJSONL
+	}
+	c.source = src
+	c.cachedSnapshot = true
+	if snap.ResolvedPath != "" {
+		c.resolvedPath = snap.ResolvedPath
+		c.format = snap.Format
+		c.onMachine = snap.OnMachine
+	}
+	c.parsedItems = append([]ChatTurnItem(nil), snap.Items...)
+	c.rebuildMergedLocked()
+	c.mu.Unlock()
+	c.bumpRev(true)
+	return true
+}
+
+// IsCachedSnapshot reports whether the current items came from the local Frame-0 snapshot cache
+// while the live remote sync is still catching up.
+func (c *ChatSessionController) IsCachedSnapshot() bool {
+	if c.rev != nil {
+		_ = c.rev.Get()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cachedSnapshot
+}
+
+// SetScrollHook binds an external conversation viewport (such as chat.ConversationState.JumpToLatest)
+// so optimistic user sends and tail updates keep following the bottom smoothly.
+func (c *ChatSessionController) SetScrollHook(fn func(animated bool)) {
+	c.mu.Lock()
+	c.scrollHook = fn
+	c.mu.Unlock()
+}
+
+func (c *ChatSessionController) persistSnapshotLocked() {
+	if c.snapshots == nil || len(c.parsedItems) == 0 {
+		return
+	}
+	snap := ChatSnapshot{
+		Source:       c.source,
+		Format:       c.format,
+		ResolvedPath: c.resolvedPath,
+		OnMachine:    c.onMachine,
+		Items:        append([]ChatTurnItem(nil), c.parsedItems...),
+		UpdatedMS:    time.Now().UnixMilli(),
+	}
+	store := c.snapshots
+	key := c.key
+	go store.SaveChat(key, snap)
 }
 
 // StartLoop launches the initial sync and lightweight 1.5s working-only tail ticker.
@@ -751,6 +828,12 @@ func (c *ChatSessionController) bumpRev(scrollToEnd bool) {
 			c.rev.Set(c.rev.Get() + 1)
 			if scrollToEnd && (c.scrolledUp == nil || !c.scrolledUp.Get()) {
 				c.scrollRef.ScrollToEnd(false)
+				c.mu.Lock()
+				hook := c.scrollHook
+				c.mu.Unlock()
+				if hook != nil {
+					hook(false)
+				}
 			}
 		})
 	}
@@ -762,6 +845,12 @@ func (c *ChatSessionController) ScrollToBottom() {
 		c.scrolledUp.Set(false)
 	}
 	c.scrollRef.ScrollToEnd(true)
+	c.mu.Lock()
+	hook := c.scrollHook
+	c.mu.Unlock()
+	if hook != nil {
+		hook(true)
+	}
 }
 
 // Items returns a snapshot of the normalized, optimistic-merged conversation items.
@@ -1111,12 +1200,14 @@ func (c *ChatSessionController) loadInitialJSONLWindow(ctx context.Context, path
 	c.format = format
 	c.onMachine = on
 	c.source = SourceJSONL
+	c.cachedSnapshot = false
 	c.firstLine = win.First
 	c.lastLine = win.Last
 	c.totalLines = win.Lines
 	c.rawLines = chunkLines
 	c.parsedItems = parsed
 	c.rebuildMergedLocked()
+	c.persistSnapshotLocked()
 	c.mu.Unlock()
 	c.bumpRev(true)
 	return nil
@@ -1185,8 +1276,10 @@ func (c *ChatSessionController) tailJSONLFromLastLine(ctx context.Context, path 
 		c.lastLine = win.Last
 		c.totalLines = win.Lines
 		c.source = SourceJSONL
+		c.cachedSnapshot = false
 		c.parsedItems = ParseTranscriptLinesAt(format, c.rawLines, c.firstLine)
 		c.rebuildMergedLocked()
+		c.persistSnapshotLocked()
 		if len(c.mergedItems) > prevCount {
 			grew = true
 		}
@@ -1304,8 +1397,10 @@ func (c *ChatSessionController) applyVTFallback() {
 		return
 	}
 	c.source = SourceVTFallback
+	c.cachedSnapshot = false
 	c.parsedItems = parsed
 	c.rebuildMergedLocked()
+	c.persistSnapshotLocked()
 	c.mu.Unlock()
 	c.bumpRev(false)
 }

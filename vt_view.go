@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"runtime"
 	"strings"
@@ -39,17 +40,18 @@ type SessionTerminal struct {
 	revScheduled atomic.Bool
 
 	// UI signals (updated via cx.Post when cx != nil, or directly in tests).
-	cx          *core.Scope
-	rev         *core.Signal[uint64]
-	observeSig  *core.Signal[bool]
-	scrolledUp  *core.Signal[bool]
-	searchQuery *core.Signal[string]
-	searchIdx   *core.Signal[int]
-	diag        *core.Signal[string]
-	historyHint *core.Signal[string]
-	scrollRef   core.Ref
-	viewportW   float32
-	viewportH   float32
+	cx              *core.Scope
+	rev             *core.Signal[uint64]
+	observeSig      *core.Signal[bool]
+	rightClickArmed *core.Signal[bool]
+	scrolledUp      *core.Signal[bool]
+	searchQuery     *core.Signal[string]
+	searchIdx       *core.Signal[int]
+	diag            *core.Signal[string]
+	historyHint     *core.Signal[string]
+	scrollRef       core.Ref
+	viewportW       float32
+	viewportH       float32
 }
 
 // NewSessionTerminal creates a SessionTerminal for key, pre-seeding it from cache if available.
@@ -72,6 +74,7 @@ func NewSessionTerminal(cx *core.Scope, key TermKey, initialCols, initialRows in
 	if cx != nil {
 		st.rev = core.NewSignal[uint64](cx, 0)
 		st.observeSig = core.NewSignal[bool](cx, observeDefault)
+		st.rightClickArmed = core.NewSignal[bool](cx, false)
 		st.scrolledUp = core.NewSignal[bool](cx, false)
 		st.searchQuery = core.NewSignal[string](cx, "")
 		st.searchIdx = core.NewSignal[int](cx, 0)
@@ -109,6 +112,24 @@ func NewSessionTerminal(cx *core.Scope, key TermKey, initialCols, initialRows in
 
 	st.bumpRevImmediate()
 	return st
+}
+
+// ToggleRightClickArmed arms/disarms one-shot SGR mouse right-click on the VT canvas (Moshi's armRightClick).
+func (st *SessionTerminal) ToggleRightClickArmed() bool {
+	if st == nil || st.rightClickArmed == nil {
+		return false
+	}
+	next := !st.rightClickArmed.Get()
+	st.rightClickArmed.Set(next)
+	return next
+}
+
+// RightClickArmed reports whether the next tap on the VT canvas sends an SGR right-click.
+func (st *SessionTerminal) RightClickArmed() bool {
+	if st == nil || st.rightClickArmed == nil {
+		return false
+	}
+	return st.rightClickArmed.Get()
 }
 
 // SetDiag updates the subtle loading/diagnostic status shown while the VT screen has no bytes yet.
@@ -818,8 +839,43 @@ func RenderSessionTerminalVisible(
 					return core.Style{Background: vtPalFn().Bg}
 				},
 				Children: []core.Node{
-					core.Canvas{
-						TestID: "vt-canvas",
+					core.View{
+						OnPress: func(ev core.PressEvent) {
+							if !st.RightClickArmed() {
+								return
+							}
+							st.rightClickArmed.Set(false)
+							fs := getFontSize()
+							cellW := fs * 0.62
+							cellH := fs * 1.40
+							col := int((float32(ev.Position.X)-padX)/cellW) + 1
+							lineIdx := int((float32(ev.Position.Y) - padY) / cellH)
+							total := st.screen.TotalLines()
+							_, screenRows := st.screen.Size()
+							rendered := total
+							if rendered > maxVTCanvasRenderLines {
+								rendered = maxVTCanvasRenderLines
+							}
+							visibleStart := rendered - screenRows
+							if visibleStart < 0 {
+								visibleStart = 0
+							}
+							row := (lineIdx - visibleStart) + 1
+							if col < 1 {
+								col = 1
+							}
+							if row < 1 {
+								row = 1
+							}
+							if row > screenRows && screenRows > 0 {
+								row = screenRows
+							}
+							sgr := fmt.Sprintf("\x1b[<2;%d;%dM\x1b[<2;%d;%dm", col, row, col, row)
+							_ = st.SendInput([]byte(sgr), fs)
+						},
+						Children: []core.Node{
+							core.Canvas{
+								TestID: "vt-canvas",
 						StyleFunc: func() core.Style {
 							if !isVisible() {
 								return core.Style{
@@ -869,6 +925,8 @@ func RenderSessionTerminalVisible(
 								activeMatch = st.searchIdx.Get()
 							}
 							drawVTScreen(d, size, st.screen, palFn(), vtPalFn(), fs, cellW, cellH, padX, padY, query, activeMatch)
+						},
+					},
 						},
 					},
 				},
