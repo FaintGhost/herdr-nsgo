@@ -309,14 +309,21 @@ func TestLiveCoreChatSessionEndToEnd(t *testing.T) {
 			}
 		}
 		if k != "" {
-			if _, exists := byKind[k]; !exists {
+			if on, _ := SplitMachineAddr(tm.Address); on == "" {
 				if full, gerr := c.Get(ctx, tm.Address); gerr == nil {
 					tm = full
 				}
+			}
+			if _, exists := byKind[k]; !exists {
 				byKind[k] = tm
 			}
 		}
 		termMap[tm.Address] = tm
+	}
+
+	// Also explicitly exercise t19 if present (live dogfood Antigravity session).
+	if t19, ok := termMap["t19"]; ok && DetectHarnessKind(t19) == "antigravity" {
+		byKind["antigravity-t19"] = t19
 	}
 
 	lb := &liveClientBackend{client: c, terms: termMap}
@@ -332,7 +339,10 @@ func TestLiveCoreChatSessionEndToEnd(t *testing.T) {
 		}
 		src := ctrl.Source()
 		items := ctrl.Items()
-		t.Logf("live_session addr=%s harness=%s source=%s items=%d older_remaining=%d", tm.Address, kind, src, len(items), ctrl.OlderRemaining())
+		ctrl.mu.Lock()
+		rpath := ctrl.resolvedPath
+		ctrl.mu.Unlock()
+		t.Logf("live_session addr=%s harness=%s source=%s items=%d older_remaining=%d path=%s", tm.Address, kind, src, len(items), ctrl.OlderRemaining(), rpath)
 		if src == SourceJSONL {
 			resolvedJSONLCount++
 		}

@@ -14,7 +14,17 @@ import (
 	"github.com/nsgo-dev/nsgo/core"
 )
 
-const chatTailWindowLines = 250
+const (
+	chatTailWindowLines      = 250
+	chatFastInitialTailLines = 80
+)
+
+func initialTailWindowLines(format TranscriptFormat, on string) int {
+	if on != "" || format == FormatAntigravity {
+		return chatFastInitialTailLines
+	}
+	return chatTailWindowLines
+}
 
 // TranscriptSource describes where ChatSessionController's current items came from.
 type TranscriptSource string
@@ -525,14 +535,39 @@ func (r *TranscriptResolver) resolveCodex(ctx context.Context, instanceID, on st
 func (r *TranscriptResolver) resolveAntigravity(ctx context.Context, instanceID, on string, term Terminal, backend TranscriptBackend) (ResolvedTranscript, bool) {
 	sid := extractSessionIDFromTerm(term)
 	cwd := term.CurrentDir()
+	launchCwd := strings.TrimSpace(term.Cwd)
+	pidStr := ""
+	if p := terminalPID(term); p > 0 {
+		pidStr = fmt.Sprintf("%d", p)
+	}
 	er, err := backend.MachineExec(ctx, instanceID, ExecParams{
 		On:      on,
-		Timeout: 5.0,
+		Timeout: 6.0,
 		Env: map[string]string{
-			"HC_SID": sid,
-			"HC_CWD": cwd,
+			"HC_SID":        sid,
+			"HC_CWD":        cwd,
+			"HC_LAUNCH_CWD": launchCwd,
+			"HC_PID":        pidStr,
 		},
-		Line: `if [ -n "$HC_SID" ] && [ -f "$HOME/.gemini/antigravity-cli/brain/$HC_SID/.system_generated/logs/transcript.jsonl" ]; then printf "%s\n" "$HOME/.gemini/antigravity-cli/brain/$HC_SID/.system_generated/logs/transcript.jsonl"; else for f in $(ls -1t "$HOME/.gemini/antigravity-cli/brain"/*/.system_generated/logs/transcript.jsonl 2>/dev/null | head -n 12); do if [ -z "$HC_CWD" ] || head -n 5 "$f" | grep -Fq "$HC_CWD"; then printf "%s\n" "$f"; break; fi; done; fi`,
+		Line: `brain="$HOME/.gemini/antigravity-cli/brain"; found=""; ` +
+			`if [ -n "$HC_SID" ] && [ -f "$brain/$HC_SID/.system_generated/logs/transcript.jsonl" ]; then found="$brain/$HC_SID/.system_generated/logs/transcript.jsonl"; fi; ` +
+			`if [ -z "$found" ] && [ -n "$HC_PID" ] && command -v lsof >/dev/null 2>&1; then ` +
+			`  cands=""; for cid in $(lsof -Fn -p "$HC_PID" 2>/dev/null | sed -En 's#^n.*/(presence|conversations|brain)/([0-9a-fA-F-]{8,}).*#\2#p' | sort -u); do ` +
+			`    tf="$brain/$cid/.system_generated/logs/transcript.jsonl"; [ -f "$tf" ] && cands="$cands $tf"; ` +
+			`  done; ` +
+			`  if [ -n "$cands" ]; then ` +
+			`    for f in $(ls -1t $cands 2>/dev/null); do head -n 1 "$f" | grep -Fq '"USER_EXPLICIT"' && { found="$f"; break; }; done; ` +
+			`    [ -z "$found" ] && found=$(ls -1t $cands 2>/dev/null | head -n 1); ` +
+			`  fi; ` +
+			`fi; ` +
+			`if [ -z "$found" ]; then ` +
+			`  list=$(ls -1t "$brain"/*/.system_generated/logs/transcript.jsonl 2>/dev/null | head -n 20); ` +
+			`  if [ -n "$HC_CWD" ]; then for f in $list; do head -n 1 "$f" | grep -Fq '"USER_EXPLICIT"' && grep -Fq "$HC_CWD" "$f" && { found="$f"; break; }; done; fi; ` +
+			`  if [ -z "$found" ] && [ -n "$HC_LAUNCH_CWD" ]; then for f in $list; do head -n 1 "$f" | grep -Fq '"USER_EXPLICIT"' && grep -Fq "$HC_LAUNCH_CWD" "$f" && { found="$f"; break; }; done; fi; ` +
+			`  if [ -z "$found" ]; then for f in $list; do head -n 1 "$f" | grep -Fq '"USER_EXPLICIT"' && { found="$f"; break; }; done; fi; ` +
+			`  if [ -z "$found" ]; then for f in $list; do if [ -z "$HC_CWD" ] || grep -Fq "$HC_CWD" "$f"; then found="$f"; break; fi; done; fi; ` +
+			`fi; ` +
+			`[ -n "$found" ] && printf "%s\n" "$found"`,
 	})
 	if err != nil {
 		return ResolvedTranscript{}, false
@@ -899,7 +934,7 @@ func (c *ChatSessionController) RefreshAsync() {
 	}
 	go func() {
 		defer c.refreshing.Store(false)
-		ctx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
+		ctx, cancel := context.WithTimeout(parentCtx, 25*time.Second)
 		defer cancel()
 		_ = c.RefreshSync(ctx)
 	}()
@@ -935,10 +970,18 @@ func (c *ChatSessionController) RefreshSync(ctx context.Context) error {
 				curFmt = res.Format
 				curOn = res.On
 				hasResolved = true
+				c.mu.Lock()
+				c.resolvedPath = curPath
+				c.format = curFmt
+				c.onMachine = curOn
+				c.mu.Unlock()
 			}
 		}
 	}
-	if c.isClosed() || ctx.Err() != nil {
+	if c.isClosed() {
+		return ctx.Err()
+	}
+	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 
@@ -957,6 +1000,9 @@ func (c *ChatSessionController) RefreshSync(ctx context.Context) error {
 func (c *ChatSessionController) readWindowAdaptive(ctx context.Context, path, on string, endLine, wantLines int) (FileReadResult, error) {
 	limit := wantLines
 	for {
+		if ctx.Err() != nil {
+			return FileReadResult{}, ctx.Err()
+		}
 		start := endLine - limit + 1
 		if start < 1 {
 			start = 1
@@ -971,6 +1017,9 @@ func (c *ChatSessionController) readWindowAdaptive(ctx context.Context, path, on
 		if err == nil {
 			return win, nil
 		}
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			return FileReadResult{}, err
+		}
 		var rpcErr *RPCError
 		if errors.As(err, &rpcErr) && (rpcErr.Kind() == "not_found" || rpcErr.Kind() == "invalid_params") {
 			return FileReadResult{}, err
@@ -979,6 +1028,20 @@ func (c *ChatSessionController) readWindowAdaptive(ctx context.Context, path, on
 			return FileReadResult{}, err
 		}
 		limit /= 2
+	}
+}
+
+func isTransientReadErr(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+}
+
+func (c *ChatSessionController) invalidateResolvedOnHardErr(err error) {
+	var rpcErr *RPCError
+	if errors.As(err, &rpcErr) && rpcErr.Kind() == "not_found" {
+		c.resolver.Invalidate(c.key)
+		c.mu.Lock()
+		c.resolvedPath = ""
+		c.mu.Unlock()
 	}
 }
 
@@ -1006,9 +1069,11 @@ func (c *ChatSessionController) loadInitialJSONLWindow(ctx context.Context, path
 			c.bumpRev(false)
 			return nil
 		}
-		c.resolver.Invalidate(c.key)
-		c.applyVTFallback()
-		return nil
+		c.invalidateResolvedOnHardErr(err)
+		if !isTransientReadErr(err) {
+			c.applyVTFallback()
+		}
+		return err
 	}
 
 	total := probe.Lines
@@ -1029,11 +1094,13 @@ func (c *ChatSessionController) loadInitialJSONLWindow(ctx context.Context, path
 		return nil
 	}
 
-	win, err := c.readWindowAdaptive(ctx, path, on, total, chatTailWindowLines)
+	win, err := c.readWindowAdaptive(ctx, path, on, total, initialTailWindowLines(format, on))
 	if err != nil {
-		c.resolver.Invalidate(c.key)
-		c.applyVTFallback()
-		return nil
+		c.invalidateResolvedOnHardErr(err)
+		if !isTransientReadErr(err) {
+			c.applyVTFallback()
+		}
+		return err
 	}
 
 	chunkLines := splitJSONLLines(win.Text)

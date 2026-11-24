@@ -193,13 +193,16 @@ func RenderChatSession(
 									})
 								},
 							},
-							// Empty / Loading guidance card
+							// Empty / Loading guidance card (two distinct reactive conditions so leaving SourceLoading with 0 items ALWAYS updates!)
 							core.Show{
-								When: func() bool { return totalFilteredCount() == 0 },
+								When: func() bool { return totalFilteredCount() == 0 && chat.Source() == SourceLoading },
 								Then: func(cx *core.Scope) core.Node {
-									if chat.Source() == SourceLoading {
-										return EmptyStateCard(cx, a, "正在同步会话记录…", "正在定位并拉取远端会话日志，马上呈现。", "", "", nil)
-									}
+									return EmptyStateCard(cx, a, "正在同步会话记录…", "正在定位并拉取远端会话日志，马上呈现。", "", "", nil)
+								},
+							},
+							core.Show{
+								When: func() bool { return totalFilteredCount() == 0 && chat.Source() != SourceLoading },
+								Then: func(cx *core.Scope) core.Node {
 									return EmptyStateCard(
 										cx,
 										a,

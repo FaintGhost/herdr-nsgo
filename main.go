@@ -333,14 +333,18 @@ func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 			rows = 32
 		}
 		st.SetDiag("正在连接 " + key.Addr + "…")
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		initHist := 2000
+		if u.sessionMode.Get() == "chat" {
+			initHist = 250
+		}
+		go func(hist int) {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			stream, res, err := client.Attach(ctx, AttachParams{
 				Terminal:            key.Addr,
 				Observe:             obs,
 				ResizeNotifications: true,
-				History:             2000,
+				History:             hist,
 				Cols:                cols,
 				Rows:                rows,
 			})
@@ -382,7 +386,7 @@ func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 					u.app.post(func() { st.ScrollToBottom() })
 				}
 			})
-		}()
+		}(initHist)
 	}
 
 	var historyDepth atomic.Int32

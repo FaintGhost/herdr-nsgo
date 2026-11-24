@@ -29,6 +29,10 @@ func (c *conn) Close() error {
 	return err
 }
 
+func sshConnectCommand() string {
+	return `sh -c 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; p=$(command -v hc || command -v herdr-core) || { echo "hc / herdr-core is not installed here" >&2; exit 127; }; exec "$p" connect'`
+}
+
 // dialSSH runs `hc connect` on the far side using TOFU host key pinning.
 func dialSSH(h Host, tofu *TOFUStore) (io.ReadWriteCloser, error) {
 	auth, err := authFor(h)
@@ -63,7 +67,7 @@ func dialSSH(h Host, tofu *TOFUStore) (io.ReadWriteCloser, error) {
 		client.Close()
 		return nil, err
 	}
-	if err := sess.Start("hc connect"); err != nil {
+	if err := sess.Start(sshConnectCommand()); err != nil {
 		sess.Close()
 		client.Close()
 		return nil, fmt.Errorf("running `hc connect` on the host: %w", err)
