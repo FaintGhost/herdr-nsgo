@@ -5,9 +5,11 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 type fakeTranscriptBackend struct {
@@ -239,4 +241,105 @@ func TestChatSessionResolverPaginationTailAndOptimisticDedup(t *testing.T) {
 	if vtCtrl.Source() != SourceVTFallback || len(vtCtrl.Items()) != 2 {
 		t.Fatalf("expected SourceVTFallback with 2 items, got source=%v items=%+v", vtCtrl.Source(), vtCtrl.Items())
 	}
+}
+
+type liveClientBackend struct {
+	client *Client
+	terms  map[string]Terminal
+}
+
+func (l *liveClientBackend) FindTerminal(key TermKey) (AggregatedTerminal, bool) {
+	t, ok := l.terms[key.Addr]
+	if !ok {
+		return AggregatedTerminal{}, false
+	}
+	return AggregatedTerminal{Key: key, Terminal: t}, true
+}
+
+func (l *liveClientBackend) FileRead(ctx context.Context, _ string, p FileReadParams) (FileReadResult, error) {
+	return l.client.FileRead(ctx, p)
+}
+
+func (l *liveClientBackend) MachineExec(ctx context.Context, _ string, p ExecParams) (ExecResult, error) {
+	return l.client.MachineExec(ctx, p)
+}
+
+func (l *liveClientBackend) ReadTerminal(ctx context.Context, key TermKey, lines int) (ReadResult, error) {
+	return l.client.Read(ctx, key.Addr, lines)
+}
+
+// TestLiveCoreChatSessionEndToEnd exercises real framed RPC + TranscriptResolver + ChatSessionController
+// against the live local herdr-core (and its relayed remote machines) when hc is on PATH.
+func TestLiveCoreChatSessionEndToEnd(t *testing.T) {
+	if _, err := exec.LookPath("hc"); err != nil {
+		t.Skip("hc is not on PATH")
+	}
+	rw, err := dialLocal()
+	if err != nil {
+		t.Fatalf("dialLocal: %v", err)
+	}
+	c := NewClient(rw)
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	if _, err := c.HelloFramed(ctx); err != nil {
+		t.Fatalf("HelloFramed: %v", err)
+	}
+	ls, err := c.List(ctx, false)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	termMap := make(map[string]Terminal, len(ls.Terminals))
+	byKind := make(map[string]Terminal)
+	for _, tm := range ls.Terminals {
+		if tm.Finished() {
+			continue
+		}
+		k := DetectHarnessKind(tm)
+		if k == "" {
+			// Try fetching full record only for local terminals where foreground argv might reveal the harness.
+			if on, _ := SplitMachineAddr(tm.Address); on == "" {
+				if full, gerr := c.Get(ctx, tm.Address); gerr == nil {
+					tm = full
+					k = DetectHarnessKind(tm)
+				}
+			}
+		}
+		if k != "" {
+			if _, exists := byKind[k]; !exists {
+				if full, gerr := c.Get(ctx, tm.Address); gerr == nil {
+					tm = full
+				}
+				byKind[k] = tm
+			}
+		}
+		termMap[tm.Address] = tm
+	}
+
+	lb := &liveClientBackend{client: c, terms: termMap}
+	resolver := NewTranscriptResolver()
+	resolvedJSONLCount := 0
+
+	for kind, tm := range byKind {
+		key := TermKey{InstanceID: "local", Addr: tm.Address}
+		ctrl := NewChatSessionController(nil, key, lb, resolver, nil)
+		if err := ctrl.RefreshSync(ctx); err != nil {
+			ctrl.Close()
+			t.Fatalf("live RefreshSync %s (%s): %v", tm.Address, kind, err)
+		}
+		src := ctrl.Source()
+		items := ctrl.Items()
+		t.Logf("live_session addr=%s harness=%s source=%s items=%d older_remaining=%d", tm.Address, kind, src, len(items), ctrl.OlderRemaining())
+		if src == SourceJSONL {
+			resolvedJSONLCount++
+		}
+		ctrl.Close()
+	}
+	if len(byKind) > 0 && resolvedJSONLCount == 0 {
+		t.Fatalf("expected at least 1 live agent session to resolve native JSONL, got 0 out of %d", len(byKind))
+	}
+	t.Logf("live_e2e_summary agent_kinds=%d jsonl_resolved=%d", len(byKind), resolvedJSONLCount)
 }
