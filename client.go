@@ -492,6 +492,26 @@ func (c *Client) Read(ctx context.Context, addr string, lines int) (ReadResult, 
 	return out, err
 }
 
+// FileRead reads lines from a remote file on this core or a federated machine (p.On).
+func (c *Client) FileRead(ctx context.Context, p FileReadParams) (FileReadResult, error) {
+	var out FileReadResult
+	err := c.Call(ctx, "file.read", p, &out)
+	return out, err
+}
+
+// MachineExec executes a bounded command on this core or a federated machine (p.On).
+// Timeout defaults to 5.0 seconds (capped at 600s per herdr-core OpenRPC schema).
+func (c *Client) MachineExec(ctx context.Context, p ExecParams) (ExecResult, error) {
+	if p.Timeout <= 0 {
+		p.Timeout = 5.0
+	} else if p.Timeout > 600 {
+		p.Timeout = 600
+	}
+	var out ExecResult
+	err := c.Call(ctx, "machine.exec", p, &out)
+	return out, err
+}
+
 // Attach opens a real-time raw VT byte stream on a framed connection.
 func (c *Client) Attach(ctx context.Context, p AttachParams) (*AttachStream, AttachResult, error) {
 	if !c.framed.Load() {

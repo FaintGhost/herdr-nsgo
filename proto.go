@@ -1,6 +1,10 @@
 package main
 
-import "encoding/json"
+import (
+	"encoding/base64"
+	"encoding/json"
+	"strings"
+)
 
 // Status is the program's own status record (OSC 7501): its words, untranslated.
 type Status struct {
@@ -14,14 +18,17 @@ type Status struct {
 
 // Foreground describes the foreground process inside a terminal.
 type Foreground struct {
-	PID  uint32 `json:"pid"`
-	Name string `json:"name"`
-	Cwd  string `json:"cwd"`
+	PID  uint32   `json:"pid"`
+	Name string   `json:"name"`
+	Cwd  string   `json:"cwd"`
+	Argv []string `json:"argv,omitempty"`
 }
 
 // Terminal is one terminal as terminal.list, terminal.get, and terminal.run return it.
 type Terminal struct {
 	Address    string            `json:"address"`
+	Argv       []string          `json:"argv,omitempty"`
+	PID        *uint32           `json:"pid,omitempty"`
 	Name       string            `json:"name"`
 	Title      string            `json:"title"`
 	State      string            `json:"state"`
@@ -40,6 +47,15 @@ type Terminal struct {
 	Labels     map[string]string `json:"labels"`
 	Reason     *string           `json:"reason"`
 	Template   *string           `json:"template"`
+}
+
+// SplitMachineAddr splits a federated terminal address ("kr/t12") into ("kr", "t12"),
+// or ("", "t9") for a local terminal on the connected core.
+func SplitMachineAddr(addr string) (on, local string) {
+	if prefix, sub, ok := strings.Cut(addr, "/"); ok && prefix != "" && sub != "" {
+		return prefix, sub
+	}
+	return "", addr
 }
 
 // Label is what a row shows: the caller's name, else the title, else the address.
@@ -250,6 +266,69 @@ type TemplatesResult struct {
 type PutResult struct {
 	Path  string `json:"path"`
 	Bytes int    `json:"bytes"`
+}
+
+// FileReadParams configures file.read (read-only line window on core or federated machine).
+type FileReadParams struct {
+	Path   string `json:"path"`
+	Offset int    `json:"offset,omitempty"` // 1-based first line
+	Limit  int    `json:"limit,omitempty"`
+	On     string `json:"on,omitempty"`
+	Cwd    string `json:"cwd,omitempty"`
+}
+
+// FileReadResult is file.read's reply.
+type FileReadResult struct {
+	Text  string `json:"text"`
+	First int    `json:"first"`
+	Last  int    `json:"last"`
+	Lines int    `json:"lines"`
+}
+
+// ExecParams configures machine.exec (short read-only discovery commands; Timeout is in seconds).
+type ExecParams struct {
+	Argv    []string          `json:"argv,omitempty"`
+	Line    string            `json:"line,omitempty"`
+	On      string            `json:"on,omitempty"`
+	Cwd     string            `json:"cwd,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+	Input   string            `json:"input,omitempty"`
+	Timeout float64           `json:"timeout,omitempty"`
+}
+
+// ExecResult is machine.exec's reply (Stdout and Stderr are Base64-encoded).
+type ExecResult struct {
+	Code      *int32 `json:"code"`
+	Signal    *int32 `json:"signal"`
+	Stdout    string `json:"stdout"`
+	Stderr    string `json:"stderr"`
+	MS        uint64 `json:"ms"`
+	TimedOut  bool   `json:"timed_out"`
+	Truncated bool   `json:"truncated"`
+}
+
+// StdoutText decodes the Base64 stdout payload from machine.exec.
+func (r ExecResult) StdoutText() string {
+	if r.Stdout == "" {
+		return ""
+	}
+	b, err := base64.StdEncoding.DecodeString(r.Stdout)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// StderrText decodes the Base64 stderr payload from machine.exec.
+func (r ExecResult) StderrText() string {
+	if r.Stderr == "" {
+		return ""
+	}
+	b, err := base64.StdEncoding.DecodeString(r.Stderr)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 // Host is a saved way to reach a core (kept compatible with v0.1.0 fields).

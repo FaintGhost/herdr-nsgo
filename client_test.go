@@ -1,13 +1,158 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestClientFileReadMachineExecAndSplitAddr(t *testing.T) {
+	if on, local := SplitMachineAddr("kr/t12"); on != "kr" || local != "t12" {
+		t.Fatalf("SplitMachineAddr(kr/t12) = (%q, %q), want (kr, t12)", on, local)
+	}
+	if on, local := SplitMachineAddr("t9"); on != "" || local != "t9" {
+		t.Fatalf("SplitMachineAddr(t9) = (%q, %q), want ('', t9)", on, local)
+	}
+
+	// Verify Terminal.Argv, Terminal.PID, Foreground.Argv JSON unmarshaling.
+	var term Terminal
+	rawTerm := `{"address":"kr/t12","argv":["sh","-c","omp -r abc"],"pid":1872804,"cwd":"/root","state":"live","created_ms":1,"cols":80,"rows":24,"labels":{},"foreground":{"pid":1872804,"name":"sh","cwd":"/root","argv":["sh","-c","omp -r abc"]}}`
+	if err := json.Unmarshal([]byte(rawTerm), &term); err != nil {
+		t.Fatalf("unmarshal terminal: %v", err)
+	}
+	if len(term.Argv) != 3 || term.PID == nil || *term.PID != 1872804 || term.Foreground == nil || len(term.Foreground.Argv) != 3 {
+		t.Fatalf("unexpected Terminal/Foreground argv or pid: %+v / %+v", term, term.Foreground)
+	}
+
+	// Verify FileRead & MachineExec JSON-RPC wire contract over a pipe server.
+	cConn, sConn := net.Pipe()
+	defer cConn.Close()
+	defer sConn.Close()
+
+	go func() {
+		br := bufio.NewReader(sConn)
+		enc := json.NewEncoder(sConn)
+		for i := 0; i < 3; i++ {
+			line, err := br.ReadBytes('\n')
+			if err != nil {
+				return
+			}
+			var req struct {
+				ID     int64                  `json:"id"`
+				Method string                 `json:"method"`
+				Params map[string]interface{} `json:"params"`
+			}
+			if err := json.Unmarshal(line, &req); err != nil {
+				return
+			}
+			switch req.Method {
+			case "file.read":
+				off, _ := req.Params["offset"].(float64)
+				if off > 10 {
+					_ = enc.Encode(map[string]any{
+						"jsonrpc": "2.0",
+						"id":      req.ID,
+						"error": map[string]any{
+							"code":    -32602,
+							"message": "offset 50: the file has 10 lines",
+							"data":    map[string]any{"kind": "invalid_params"},
+						},
+					})
+					continue
+				}
+				if req.Params["on"] != "kr" || req.Params["path"] != "/root/.omp/test.jsonl" {
+					_ = enc.Encode(map[string]any{
+						"jsonrpc": "2.0",
+						"id":      req.ID,
+						"error":   map[string]any{"code": -32602, "message": "bad params"},
+					})
+					continue
+				}
+				_ = enc.Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req.ID,
+					"result": map[string]any{
+						"text":  "{\"type\":\"session\"}\n",
+						"first": 1,
+						"last":  1,
+						"lines": 10,
+					},
+				})
+			case "machine.exec":
+				to, _ := req.Params["timeout"].(float64)
+				// Must be seconds (default 5.0), NEVER milliseconds (>600 rejected by herdr-core)!
+				if to <= 0 || to > 600 {
+					_ = enc.Encode(map[string]any{
+						"jsonrpc": "2.0",
+						"id":      req.ID,
+						"error":   map[string]any{"code": -32602, "message": "bad timeout seconds"},
+					})
+					continue
+				}
+				_ = enc.Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req.ID,
+					"result": map[string]any{
+						"code":      0,
+						"stdout":    base64.StdEncoding.EncodeToString([]byte("/root/.omp/found.jsonl\n")),
+						"stderr":    base64.StdEncoding.EncodeToString([]byte("")),
+						"ms":        12,
+						"timed_out": false,
+						"truncated": false,
+					},
+				})
+			}
+		}
+	}()
+
+	client := NewClient(cConn)
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	fr, err := client.FileRead(ctx, FileReadParams{
+		Path:   "/root/.omp/test.jsonl",
+		Offset: 1,
+		Limit:  5,
+		On:     "kr",
+	})
+	if err != nil {
+		t.Fatalf("FileRead failed: %v", err)
+	}
+	if fr.First != 1 || fr.Last != 1 || fr.Lines != 10 || !strings.Contains(fr.Text, `"session"`) {
+		t.Fatalf("unexpected FileReadResult: %+v", fr)
+	}
+
+	_, err = client.FileRead(ctx, FileReadParams{
+		Path:   "/root/.omp/test.jsonl",
+		Offset: 50,
+		Limit:  5,
+		On:     "kr",
+	})
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) || rpcErr.Kind() != "invalid_params" {
+		t.Fatalf("expected invalid_params RPCError on offset>lines, got %v", err)
+	}
+
+	er, err := client.MachineExec(ctx, ExecParams{
+		Line: "ls /root/.omp/*.jsonl",
+		On:   "kr",
+	})
+	if err != nil {
+		t.Fatalf("MachineExec failed: %v", err)
+	}
+	if er.Code == nil || *er.Code != 0 || strings.TrimSpace(er.StdoutText()) != "/root/.omp/found.jsonl" {
+		t.Fatalf("unexpected ExecResult: %+v stdout=%q", er, er.StdoutText())
+	}
+}
 
 // TestClientAgainstLocalCore speaks the real protocol with the hc on this
 // machine, so the wire format is checked against a core, not a stub.
