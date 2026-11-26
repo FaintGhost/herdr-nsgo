@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path"
 	"regexp"
 	"strings"
 	"sync"
@@ -20,6 +21,9 @@ const (
 )
 
 func initialTailWindowLines(format TranscriptFormat, on string) int {
+	if format == FormatPi && on != "" {
+		return 32
+	}
 	if on != "" || format == FormatAntigravity {
 		return chatFastInitialTailLines
 	}
@@ -41,7 +45,7 @@ func (s TranscriptSource) Label() string {
 	case SourceJSONL:
 		return "JSONL"
 	case SourceVTFallback:
-		return "终端回退"
+		return "终端快照"
 	default:
 		return "同步中"
 	}
@@ -49,9 +53,10 @@ func (s TranscriptSource) Label() string {
 
 // ResolvedTranscript points to a discovered remote harness JSONL log file.
 type ResolvedTranscript struct {
-	Path   string
-	Format TranscriptFormat
-	On     string
+	Path       string
+	Format     TranscriptFormat
+	On         string
+	KnownLines int // populated when existence probe already returned total line count
 }
 
 // TranscriptBackend abstracts read-only RPC operations needed by TranscriptResolver and ChatSessionController.
@@ -144,17 +149,20 @@ func (b *appTranscriptBackend) ReadTerminal(ctx context.Context, key TermKey, li
 }
 
 type cachedTranscriptEntry struct {
-	resolved ResolvedTranscript
-	fgPID    uint32
+	resolved   ResolvedTranscript
+	fgPID      uint32
+	title      string
+	resolvedAt time.Time
 }
 
 // TranscriptResolver locates remote Claude Code, OMP/Pi, Codex, and Antigravity JSONL logs
 // and caches resolved paths per TermKey so periodic tailing never spawns shell processes.
 type TranscriptResolver struct {
-	mu       sync.Mutex
-	byKey    map[TermKey]cachedTranscriptEntry
-	missAt   map[TermKey]time.Time
-	homeDirs map[string]string // instanceID+"::"+on -> remote $HOME
+	mu        sync.Mutex
+	byKey     map[TermKey]cachedTranscriptEntry
+	missAt    map[TermKey]time.Time
+	homeDirs  map[string]string // instanceID+"::"+on -> remote $HOME
+	snapshots *SnapshotStore
 }
 
 func NewTranscriptResolver() *TranscriptResolver {
@@ -165,11 +173,36 @@ func NewTranscriptResolver() *TranscriptResolver {
 	}
 }
 
+// SetSnapshotStore binds persistent storage so remote $HOME directories survive cold restarts.
+func (r *TranscriptResolver) SetSnapshotStore(store *SnapshotStore) {
+	if r == nil || store == nil {
+		return
+	}
+	persisted := store.AllHomeDirs()
+	r.mu.Lock()
+	r.snapshots = store
+	for k, v := range persisted {
+		if r.homeDirs[k] == "" && v != "" {
+			r.homeDirs[k] = v
+		}
+	}
+	r.mu.Unlock()
+}
+
 // SetHome pre-seeds or updates the cached remote home directory for (instanceID, on).
 func (r *TranscriptResolver) SetHome(instanceID, on, home string) {
+	clean := strings.TrimRight(strings.TrimSpace(home), "/")
+	if clean == "" {
+		return
+	}
+	cacheKey := instanceID + "::" + on
 	r.mu.Lock()
-	r.homeDirs[instanceID+"::"+on] = strings.TrimRight(strings.TrimSpace(home), "/")
+	r.homeDirs[cacheKey] = clean
+	store := r.snapshots
 	r.mu.Unlock()
+	if store != nil {
+		store.SaveHomeDir(cacheKey, clean)
+	}
 }
 
 // Invalidate clears any cached path for key (e.g. when a file is rotated or deleted).
@@ -313,10 +346,13 @@ func (r *TranscriptResolver) Resolve(ctx context.Context, key TermKey, term Term
 		return ResolvedTranscript{}, false
 	}
 	curPID := terminalPID(term)
+	curTitle := strings.TrimSpace(term.Title)
 
 	r.mu.Lock()
 	if hit, ok := r.byKey[key]; ok {
-		if curPID == 0 || hit.fgPID == 0 || hit.fgPID == curPID {
+		samePID := curPID == 0 || hit.fgPID == 0 || hit.fgPID == curPID
+		sameTitle := curTitle == "" || hit.title == "" || hit.title == curTitle
+		if samePID && sameTitle {
 			r.mu.Unlock()
 			return hit.resolved, true
 		}
@@ -344,7 +380,7 @@ func (r *TranscriptResolver) Resolve(ctx context.Context, key TermKey, term Term
 
 	r.mu.Lock()
 	if ok && resolved.Path != "" {
-		r.byKey[key] = cachedTranscriptEntry{resolved: resolved, fgPID: curPID}
+		r.byKey[key] = cachedTranscriptEntry{resolved: resolved, fgPID: curPID, title: curTitle, resolvedAt: time.Now()}
 		delete(r.missAt, key)
 	} else {
 		r.missAt[key] = time.Now()
@@ -353,24 +389,61 @@ func (r *TranscriptResolver) Resolve(ctx context.Context, key TermKey, term Term
 	return resolved, ok
 }
 
-func (r *TranscriptResolver) fileExists(ctx context.Context, backend TranscriptBackend, instanceID, on, path string) bool {
-	if path == "" {
-		return false
+// ResolveLatestForStale bypasses stale PID/cache entries to find the most recently modified JSONL file
+// when an active working session stops growing its previously resolved file (e.g. after Claude `/clear` or `/resume`).
+func (r *TranscriptResolver) ResolveLatestForStale(ctx context.Context, key TermKey, term Terminal, backend TranscriptBackend) (ResolvedTranscript, bool) {
+	kind := DetectHarnessKind(term)
+	if kind == "" || kind == "other-agent" || backend == nil {
+		return ResolvedTranscript{}, false
 	}
-	_, err := backend.FileRead(ctx, instanceID, FileReadParams{
+	r.Invalidate(key)
+	on, _ := SplitMachineAddr(key.Addr)
+	if kind == "claude" {
+		slug := claudeProjectSlug(term.CurrentDir())
+		sid := extractSessionIDFromTerm(term)
+		if slug != "" || sid != "" {
+			er, err := backend.MachineExec(ctx, key.InstanceID, ExecParams{
+				On:      on,
+				Timeout: 5.0,
+				Env: map[string]string{
+					"HC_SID":  sid,
+					"HC_SLUG": slug,
+				},
+				Line: `found=""; if [ -n "$HC_SLUG" ]; then found=$(ls -1t "$HOME/.claude/projects/$HC_SLUG"/*.jsonl 2>/dev/null | head -n 1); fi; if [ -z "$found" ] && [ -n "$HC_SID" ]; then found=$(ls -1t "$HOME/.claude/projects"/*/*"$HC_SID"*.jsonl 2>/dev/null | head -n 1); fi; printf "%s\n" "$found"`,
+			})
+			if err == nil {
+				if found := firstOutputLine(er.StdoutText()); found != "" {
+					res := ResolvedTranscript{Path: found, Format: FormatClaude, On: on}
+					r.mu.Lock()
+					r.byKey[key] = cachedTranscriptEntry{resolved: res, fgPID: terminalPID(term), title: strings.TrimSpace(term.Title), resolvedAt: time.Now()}
+					delete(r.missAt, key)
+					r.mu.Unlock()
+					return res, true
+				}
+			}
+		}
+	}
+	return r.Resolve(ctx, key, term, backend)
+}
+
+func (r *TranscriptResolver) probeFileLines(ctx context.Context, backend TranscriptBackend, instanceID, on, path string) (int, bool) {
+	if path == "" {
+		return 0, false
+	}
+	fr, err := backend.FileRead(ctx, instanceID, FileReadParams{
 		Path:   path,
 		Offset: 1,
 		Limit:  1,
 		On:     on,
 	})
 	if err == nil {
-		return true
+		return fr.Lines, true
 	}
 	var rpcErr *RPCError
 	if errors.As(err, &rpcErr) && rpcErr.Kind() == "invalid_params" && strings.Contains(rpcErr.Message, "the file has 0 lines") {
-		return true
+		return 0, true
 	}
-	return false
+	return 0, false
 }
 
 func (r *TranscriptResolver) resolveClaude(ctx context.Context, instanceID, on string, pids []uint32, term Terminal, backend TranscriptBackend) (ResolvedTranscript, bool) {
@@ -409,8 +482,8 @@ func (r *TranscriptResolver) resolveClaude(ctx context.Context, instanceID, on s
 		} else {
 			jsonlPath = fmt.Sprintf(".claude/projects/%s/%s.jsonl", slug, meta.SessionID)
 		}
-		if r.fileExists(ctx, backend, instanceID, on, jsonlPath) {
-			return ResolvedTranscript{Path: jsonlPath, Format: FormatClaude, On: on}, true
+		if lines, ok := r.probeFileLines(ctx, backend, instanceID, on, jsonlPath); ok {
+			return ResolvedTranscript{Path: jsonlPath, Format: FormatClaude, On: on, KnownLines: lines}, true
 		}
 		return ResolvedTranscript{}, false
 	}
@@ -447,8 +520,8 @@ func (r *TranscriptResolver) resolveClaude(ctx context.Context, instanceID, on s
 	}
 	if sid != "" && slug != "" && home != "" {
 		direct := fmt.Sprintf("%s/.claude/projects/%s/%s.jsonl", home, slug, sid)
-		if r.fileExists(ctx, backend, instanceID, on, direct) {
-			return ResolvedTranscript{Path: direct, Format: FormatClaude, On: on}, true
+		if lines, ok := r.probeFileLines(ctx, backend, instanceID, on, direct); ok {
+			return ResolvedTranscript{Path: direct, Format: FormatClaude, On: on, KnownLines: lines}, true
 		}
 	}
 
@@ -472,6 +545,10 @@ func (r *TranscriptResolver) resolveClaude(ctx context.Context, instanceID, on s
 }
 
 func (r *TranscriptResolver) resolvePiOmp(ctx context.Context, instanceID, on, kind string, term Terminal, backend TranscriptBackend) (ResolvedTranscript, bool) {
+	format := FormatPiOmp
+	if kind == "pi" {
+		format = FormatPi
+	}
 	sid := extractSessionIDFromTerm(term)
 	if strings.HasSuffix(sid, ".jsonl") {
 		cand := sid
@@ -479,34 +556,40 @@ func (r *TranscriptResolver) resolvePiOmp(ctx context.Context, instanceID, on, k
 			if h := r.resolveHome(ctx, backend, instanceID, on); h != "" {
 				cand = h + cand[1:]
 			}
+		} else if !path.IsAbs(cand) && term.CurrentDir() != "" {
+			cand = path.Join(term.CurrentDir(), cand)
 		}
-		if r.fileExists(ctx, backend, instanceID, on, cand) {
-			return ResolvedTranscript{Path: cand, Format: FormatPiOmp, On: on}, true
+		if lines, ok := r.probeFileLines(ctx, backend, instanceID, on, cand); ok {
+			return ResolvedTranscript{Path: cand, Format: format, On: on, KnownLines: lines}, true
 		}
+		return ResolvedTranscript{}, false
 	}
-	slug := strings.Trim(reNonAlnum.ReplaceAllString(term.CurrentDir(), "-"), "-")
-	primaryDir := ".omp"
-	secondaryDir := ".pi"
+	cwd := term.CurrentDir()
+	slug := "-" + strings.Trim(reNonAlnum.ReplaceAllString(cwd, "-"), "-")
+	agentDir := ".omp"
 	if kind == "pi" {
-		primaryDir = ".pi"
-		secondaryDir = ".omp"
+		agentDir = ".pi"
+		slug = "--" + strings.NewReplacer("/", "-", "\\", "-", ":", "-").Replace(strings.TrimLeft(cwd, "/\\")) + "--"
+	}
+	if cwd == "" && sid == "" {
+		return ResolvedTranscript{}, false
 	}
 	er, err := backend.MachineExec(ctx, instanceID, ExecParams{
 		On:      on,
 		Timeout: 5.0,
-		Env: map[string]string{
-			"HC_SID":  sid,
-			"HC_SLUG": slug,
-			"HC_P":    primaryDir,
-			"HC_S":    secondaryDir,
-		},
-		Line: `found=""; if [ -n "$HC_SID" ]; then found=$(ls -1t "$HOME/$HC_P/agent/sessions"/*/*"$HC_SID"*.jsonl "$HOME/$HC_S/agent/sessions"/*/*"$HC_SID"*.jsonl 2>/dev/null | head -n 1); fi; if [ -z "$found" ] && [ -n "$HC_SLUG" ]; then found=$(ls -1t "$HOME/$HC_P/agent/sessions"/*"$HC_SLUG"*/*.jsonl "$HOME/$HC_S/agent/sessions"/*"$HC_SLUG"*/*.jsonl 2>/dev/null | head -n 1); fi; if [ -z "$found" ]; then found=$(ls -1t "$HOME/$HC_P/agent/sessions"/*/*.jsonl "$HOME/$HC_S/agent/sessions"/*/*.jsonl 2>/dev/null | head -n 1); fi; printf "%s\n" "$found"`,
+		Env:     map[string]string{"HC_SID": sid, "HC_SLUG": slug, "HC_AGENT": agentDir},
+		Line: `root="$HOME/$HC_AGENT/agent/sessions"
+if [ -n "$HC_SID" ]; then
+  ls -1t "$root"/*/*"_$HC_SID"*.jsonl 2>/dev/null | head -n 1
+else
+  ls -1t "$root/$HC_SLUG"/*.jsonl 2>/dev/null | head -n 1
+fi`,
 	})
 	if err != nil {
 		return ResolvedTranscript{}, false
 	}
 	if found := firstOutputLine(er.StdoutText()); found != "" {
-		return ResolvedTranscript{Path: found, Format: FormatPiOmp, On: on}, true
+		return ResolvedTranscript{Path: found, Format: format, On: on}, true
 	}
 	return ResolvedTranscript{}, false
 }
@@ -594,6 +677,7 @@ func firstOutputLine(s string) string {
 type optimisticMsg struct {
 	id        string
 	text      string
+	mode      string
 	afterLine int // only reconciles against JSONL items with SourceLine > afterLine
 }
 
@@ -613,24 +697,35 @@ type ChatSessionController struct {
 	loopCtx    context.Context
 	cancel     context.CancelFunc
 	refreshing atomic.Bool
+	manualSync atomic.Bool
 	optSeq     atomic.Uint64
 
-	mu             sync.Mutex
-	closed         bool
-	cachedSnapshot bool
-	source         TranscriptSource
-	resolvedPath string
-	format       TranscriptFormat
-	onMachine    string
-	firstLine    int
-	lastLine     int
-	totalLines   int
-	rawLines     []string
-	parsedItems  []ChatTurnItem
-	optimistic   []optimisticMsg
-	mergedItems  []ChatTurnItem
-	expanded     map[string]bool
-	loadingOlder bool
+	mu                 sync.Mutex
+	closed             bool
+	cachedSnapshot     bool
+	source             TranscriptSource
+	resolvedPath       string
+	format             TranscriptFormat
+	onMachine          string
+	knownLines         int
+	firstLine          int
+	lastLine           int
+	totalLines         int
+	rawLines           []string
+	parsedItems        []ChatTurnItem
+	contextUsage       ContextUsage
+	commandsLoaded     time.Time
+	commandsLoading    bool
+	discoveredCommands []slashEntry
+	piSkills           []slashEntry
+	pendingReply       pendingChatReply
+	deliveryModes      map[string]string
+	optimistic         []optimisticMsg
+	mergedItems        []ChatTurnItem
+	expanded           map[string]bool
+	loadingOlder       bool
+	staleWorkingPolls  int
+	lastStaleRecheck   time.Time
 
 	// Root-scope reactive signals (non-nil when cx != nil).
 	rev         *core.Signal[uint64]
@@ -661,17 +756,17 @@ func NewChatSessionController(
 		source:     SourceLoading,
 		expanded:   make(map[string]bool),
 	}
-		if cx != nil {
-			c.rev = core.NewSignal[uint64](cx, 0)
-			c.searchQuery = core.NewSignal[string](cx, "")
-			c.scrolledUp = core.NewSignal[bool](cx, false)
-		}
-		return c
+	if cx != nil {
+		c.rev = core.NewSignal[uint64](cx, 0)
+		c.searchQuery = core.NewSignal[string](cx, "")
+		c.scrolledUp = core.NewSignal[bool](cx, false)
 	}
+	return c
+}
 
 // SeedFromSnapshot attaches store for persistent snapshot saving and immediately seeds
 // Frame-0 conversation items in 0ms when a previous snapshot exists for this TermKey.
-func (c *ChatSessionController) SeedFromSnapshot(store *SnapshotStore) bool {
+func (c *ChatSessionController) SeedFromSnapshot(store *SnapshotStore, live *Terminal) bool {
 	if c == nil || store == nil {
 		return false
 	}
@@ -689,22 +784,258 @@ func (c *ChatSessionController) SeedFromSnapshot(store *SnapshotStore) bool {
 		c.mu.Unlock()
 		return false
 	}
+	// Always let live Resolve verify the active JSONL path on open so `/clear` or `/resume`
+	// in the same terminal pane never stays pinned to an old session file!
+	c.resolver.Invalidate(c.key)
 	src := snap.Source
+	// A live turn or a newer status means this snapshot can open the reader
+	// hundreds of lines behind. Leave the history placeholder up until the tail arrives.
+	if live != nil && (live.StateWord() == "working" || live.StatusMS != nil && *live.StatusMS > uint64(max(0, snap.UpdatedMS))) {
+		c.mu.Unlock()
+		return false
+	}
 	if src == "" || src == SourceLoading {
 		src = SourceJSONL
 	}
 	c.source = src
 	c.cachedSnapshot = true
-	if snap.ResolvedPath != "" {
-		c.resolvedPath = snap.ResolvedPath
-		c.format = snap.Format
-		c.onMachine = snap.OnMachine
-	}
 	c.parsedItems = append([]ChatTurnItem(nil), snap.Items...)
 	c.rebuildMergedLocked()
 	c.mu.Unlock()
 	c.bumpRev(true)
 	return true
+}
+
+// prefetchedTranscript holds a background-fetched JSONL tail ready for 0ms UI-thread hydration.
+type prefetchedTranscript struct {
+	Key          TermKey
+	ResolvedPath string
+	Format       TranscriptFormat
+	OnMachine    string
+	FirstLine    int
+	LastLine     int
+	TotalLines   int
+	RawLines     []string
+	ParsedItems  []ChatTurnItem
+	ContextUsage ContextUsage
+	PiSkills     []slashEntry
+	FetchedAt    time.Time
+}
+
+// PrefetchTranscript resolves and fetches the latest JSONL tail off the UI thread so tapping
+// a child sub-session or returning to a parent opens in 0ms without touching UI signals.
+func PrefetchTranscript(
+	ctx context.Context,
+	key TermKey,
+	term Terminal,
+	backend TranscriptBackend,
+	resolver *TranscriptResolver,
+	snapshots *SnapshotStore,
+) (prefetchedTranscript, bool) {
+	if backend == nil || resolver == nil {
+		return prefetchedTranscript{}, false
+	}
+	res, found := resolver.Resolve(ctx, key, term, backend)
+	if !found || res.Path == "" {
+		return prefetchedTranscript{}, false
+	}
+	total := res.KnownLines
+	if total <= 0 {
+		probe, err := backend.FileRead(ctx, key.InstanceID, FileReadParams{
+			Path:   res.Path,
+			Offset: 1,
+			Limit:  1,
+			On:     res.On,
+		})
+		if err != nil || probe.Lines <= 0 {
+			return prefetchedTranscript{}, false
+		}
+		total = probe.Lines
+	}
+	want := initialTailWindowLines(res.Format, res.On)
+	start := total - want + 1
+	if start < 1 {
+		start = 1
+	}
+	win, err := backend.FileRead(ctx, key.InstanceID, FileReadParams{
+		Path:   res.Path,
+		Offset: start,
+		Limit:  total - start + 1,
+		On:     res.On,
+	})
+	if err != nil {
+		return prefetchedTranscript{}, false
+	}
+	chunkLines := splitJSONLLines(win.Text)
+	parsed := ParseTranscriptLinesAt(res.Format, chunkLines, win.First)
+	usage := ParseTranscriptUsage(res.Format, chunkLines)
+	var skills []slashEntry
+	if res.Format == FormatPi {
+		skills = piSkillManifest(chunkLines)
+	}
+	if snapshots != nil && len(parsed) > 0 {
+		snapshots.SaveChat(key, ChatSnapshot{
+			Source:       SourceJSONL,
+			Format:       res.Format,
+			ResolvedPath: res.Path,
+			OnMachine:    res.On,
+			LastLine:     win.Last,
+			Items:        append([]ChatTurnItem(nil), parsed...),
+			UpdatedMS:    time.Now().UnixMilli(),
+		})
+	}
+	return prefetchedTranscript{
+		Key:          key,
+		ResolvedPath: res.Path,
+		Format:       res.Format,
+		OnMachine:    res.On,
+		FirstLine:    win.First,
+		LastLine:     win.Last,
+		TotalLines:   win.Lines,
+		RawLines:     chunkLines,
+		ParsedItems:  parsed,
+		ContextUsage: usage,
+		PiSkills:     skills,
+		FetchedAt:    time.Now(),
+	}, true
+}
+
+// HydratePrefetch immediately populates a fresh controller from a live background prefetch in 0ms.
+func (c *ChatSessionController) HydratePrefetch(p prefetchedTranscript) bool {
+	if c == nil || p.ResolvedPath == "" || p.LastLine <= 0 {
+		return false
+	}
+	c.mu.Lock()
+	if c.closed || c.lastLine > 0 {
+		c.mu.Unlock()
+		return false
+	}
+	c.resolvedPath = p.ResolvedPath
+	c.format = p.Format
+	c.onMachine = p.OnMachine
+	c.source = SourceJSONL
+	c.cachedSnapshot = false
+	c.firstLine = p.FirstLine
+	c.lastLine = p.LastLine
+	c.totalLines = p.TotalLines
+	c.rawLines = append([]string(nil), p.RawLines...)
+	c.parsedItems = append([]ChatTurnItem(nil), p.ParsedItems...)
+	c.contextUsage = p.ContextUsage
+	if len(p.PiSkills) > 0 {
+		c.piSkills = p.PiSkills
+	}
+	c.rebuildMergedLocked()
+	c.mu.Unlock()
+	c.bumpRev(true)
+	return true
+}
+
+// SetVTFallback re-binds the VT fallback source when reusing a warm cached controller.
+func (c *ChatSessionController) SetVTFallback(fn func() string) {
+	c.mu.Lock()
+	c.vtFallback = fn
+	c.mu.Unlock()
+}
+
+// PauseLoop stops background polling while keeping parsed items and cursor warm in memory.
+func (c *ChatSessionController) PauseLoop() {
+	c.mu.Lock()
+	cancel := c.cancel
+	c.cancel = nil
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// ResumeLoop resumes incremental tailing on a warm cached controller.
+func (c *ChatSessionController) ResumeLoop() {
+	c.StartLoop()
+}
+
+// ContextUsage returns the latest parsed token footprint for this session.
+func (c *ChatSessionController) ContextUsage() ContextUsage {
+	if c.rev != nil {
+		_ = c.rev.Get()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.contextUsage
+}
+
+// IsActivelySyncing reports whether the UI should render an animated sync indicator
+// (initial load, cached snapshot catchup, or explicit user/resume refresh).
+func (c *ChatSessionController) IsActivelySyncing() bool {
+	if c.rev != nil {
+		_ = c.rev.Get()
+	}
+	if c.manualSync.Load() {
+		return true
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.source == SourceLoading || c.cachedSnapshot
+}
+
+// ManualRefreshAsync triggers a user-visible animated refresh and re-verifies the active JSONL path
+// in case the agent rotated to a new transcript (e.g. after `/clear` or `/resume`).
+func (c *ChatSessionController) ManualRefreshAsync() {
+	if c.isClosed() {
+		return
+	}
+	c.manualSync.Store(true)
+	c.bumpRev(false)
+	if !c.refreshing.CompareAndSwap(false, true) {
+		return
+	}
+	c.mu.Lock()
+	parentCtx := c.loopCtx
+	c.mu.Unlock()
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	go func() {
+		defer func() {
+			c.refreshing.Store(false)
+			c.manualSync.Store(false)
+			c.bumpRev(false)
+		}()
+		ctx, cancel := context.WithTimeout(parentCtx, 25*time.Second)
+		defer cancel()
+		c.recheckLatestPathIfChanged(ctx)
+		_ = c.RefreshSync(ctx)
+	}()
+}
+
+// recheckLatestPathIfChanged switches to a newer transcript file if the harness rotated sessions (e.g. `/clear`).
+func (c *ChatSessionController) recheckLatestPathIfChanged(ctx context.Context) bool {
+	if c.backend == nil || c.resolver == nil || c.isClosed() {
+		return false
+	}
+	at, ok := c.backend.FindTerminal(c.key)
+	if !ok {
+		return false
+	}
+	res, found := c.resolver.ResolveLatestForStale(ctx, c.key, at.Terminal, c.backend)
+	if !found || res.Path == "" {
+		return false
+	}
+	c.mu.Lock()
+	switched := res.Path != c.resolvedPath || res.On != c.onMachine
+	if switched {
+		c.resolvedPath = res.Path
+		c.format = res.Format
+		c.onMachine = res.On
+		c.knownLines = res.KnownLines
+		c.firstLine = 0
+		c.lastLine = 0
+		c.totalLines = 0
+		c.rawLines = nil
+		c.staleWorkingPolls = 0
+	}
+	c.lastStaleRecheck = time.Now()
+	c.mu.Unlock()
+	return switched
 }
 
 // IsCachedSnapshot reports whether the current items came from the local Frame-0 snapshot cache
@@ -735,6 +1066,7 @@ func (c *ChatSessionController) persistSnapshotLocked() {
 		Format:       c.format,
 		ResolvedPath: c.resolvedPath,
 		OnMachine:    c.onMachine,
+		LastLine:     c.lastLine,
 		Items:        append([]ChatTurnItem(nil), c.parsedItems...),
 		UpdatedMS:    time.Now().UnixMilli(),
 	}
@@ -781,16 +1113,30 @@ func (c *ChatSessionController) shouldPollWorking() bool {
 		c.mu.Unlock()
 		return false
 	}
-	hasOpt := len(c.optimistic) > 0
+	pending := c.pendingReply
+	if pending.id != "" && time.Since(pending.since) > 5*time.Minute {
+		c.pendingReply = pendingChatReply{}
+	}
+	hasOpt := len(c.optimistic) > 0 || c.pendingReply.id != ""
 	src := c.source
+	cached := c.cachedSnapshot
+	expired := pending.id != c.pendingReply.id
 	c.mu.Unlock()
+	if expired {
+		c.bumpRev(false)
+	}
 
-	if hasOpt || src == SourceLoading {
+	if hasOpt || cached || src == SourceLoading {
 		return true
 	}
 	if c.backend != nil {
 		if at, ok := c.backend.FindTerminal(c.key); ok {
 			st := at.Terminal.StateWord()
+			// Some Pi sessions only publish terminal liveness. Their JSONL can grow
+			// after an intermediate assistant message without a working event.
+			if src == SourceJSONL && at.Terminal.Status == nil && !at.Terminal.Finished() && DetectHarnessKind(at.Terminal) != "" {
+				return true
+			}
 			return st == "working" || st == "blocked"
 		}
 	}
@@ -925,6 +1271,10 @@ func (c *ChatSessionController) ToggleExpanded(id string) {
 // (recording its baseline file line so earlier identical prompts never eat it),
 // returning an ID that RemoveOptimistic can roll back if terminal.send fails.
 func (c *ChatSessionController) AddOptimisticUser(text string) string {
+	return c.beginChatSend(text, "")
+}
+
+func (c *ChatSessionController) beginChatSend(text, mode string) string {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
 		return ""
@@ -932,7 +1282,9 @@ func (c *ChatSessionController) AddOptimisticUser(text string) string {
 	seq := c.optSeq.Add(1)
 	id := fmt.Sprintf("opt-%d", seq)
 	c.mu.Lock()
+	c.pendingReply = pendingChatReply{id: id, phase: "正在发送", since: time.Now()}
 	c.optimistic = append(c.optimistic, optimisticMsg{
+		mode:      mode,
 		id:        id,
 		text:      trimmed,
 		afterLine: c.lastLine,
@@ -950,7 +1302,10 @@ func (c *ChatSessionController) RemoveOptimistic(id string) {
 	}
 	c.mu.Lock()
 	kept := c.optimistic[:0]
-	changed := false
+	changed := c.pendingReply.id == id
+	if changed {
+		c.pendingReply = pendingChatReply{}
+	}
 	for _, opt := range c.optimistic {
 		if opt.id == id {
 			changed = true
@@ -986,6 +1341,16 @@ func (c *ChatSessionController) rebuildMergedLocked() {
 				if c.source == SourceJSONL && it.SourceLine <= opt.afterLine {
 					continue
 				}
+				if opt.mode != "" {
+					if c.deliveryModes == nil {
+						c.deliveryModes = make(map[string]string)
+					}
+					c.deliveryModes[it.ID] = opt.mode
+				}
+				if c.pendingReply.id == opt.id {
+					c.pendingReply.userID = it.ID
+					c.pendingReply.phase = "Agent 已收到，等待回复"
+				}
 				usedIdx[i] = true
 				matched = true
 				break
@@ -999,12 +1364,35 @@ func (c *ChatSessionController) rebuildMergedLocked() {
 
 	merged := make([]ChatTurnItem, 0, len(c.parsedItems)+len(c.optimistic))
 	merged = append(merged, c.parsedItems...)
+	seenUser := false
+	for i := range merged {
+		it := &merged[i]
+		it.DeliveryMode = c.deliveryModes[it.ID]
+		if c.pendingReply.id == "" {
+			continue
+		}
+		if it.ID == c.pendingReply.userID {
+			seenUser = true
+			continue
+		}
+		if seenUser {
+			switch it.Role {
+			case RoleThinking:
+				c.pendingReply.phase = "正在思考"
+			case RoleToolGroup:
+				c.pendingReply.phase = "正在使用工具"
+			case RoleAssistant:
+				c.pendingReply = pendingChatReply{}
+			}
+		}
+	}
 	for _, opt := range c.optimistic {
 		merged = append(merged, ChatTurnItem{
-			ID:         opt.id,
-			Role:       RoleUser,
-			Text:       opt.text,
-			Optimistic: true,
+			ID:           opt.id,
+			Role:         RoleUser,
+			Text:         opt.text,
+			DeliveryMode: opt.mode,
+			Optimistic:   true,
 		})
 	}
 	c.mergedItems = merged
@@ -1063,6 +1451,9 @@ func (c *ChatSessionController) RefreshSync(ctx context.Context) error {
 				c.resolvedPath = curPath
 				c.format = curFmt
 				c.onMachine = curOn
+				if res.KnownLines > 0 {
+					c.knownLines = res.KnownLines
+				}
 				c.mu.Unlock()
 			}
 		}
@@ -1135,43 +1526,52 @@ func (c *ChatSessionController) invalidateResolvedOnHardErr(err error) {
 }
 
 func (c *ChatSessionController) loadInitialJSONLWindow(ctx context.Context, path string, format TranscriptFormat, on string) error {
-	probe, err := c.backend.FileRead(ctx, c.key.InstanceID, FileReadParams{
-		Path:   path,
-		Offset: 1,
-		Limit:  1,
-		On:     on,
-	})
-	if err != nil {
-		if isEmptyFileOffsetErr(err) {
-			c.mu.Lock()
-			c.resolvedPath = path
-			c.format = format
-			c.onMachine = on
-			c.source = SourceJSONL
-			c.firstLine = 0
-			c.lastLine = 0
-			c.totalLines = 0
-			c.rawLines = nil
-			c.parsedItems = nil
-			c.rebuildMergedLocked()
-			c.mu.Unlock()
-			c.bumpRev(false)
-			return nil
+	c.mu.Lock()
+	total := c.knownLines
+	c.knownLines = 0
+	c.mu.Unlock()
+
+	if total <= 0 {
+		probe, err := c.backend.FileRead(ctx, c.key.InstanceID, FileReadParams{
+			Path:   path,
+			Offset: 1,
+			Limit:  1,
+			On:     on,
+		})
+		if err != nil {
+			if isEmptyFileOffsetErr(err) {
+				c.mu.Lock()
+				c.resolvedPath = path
+				c.format = format
+				c.onMachine = on
+				c.source = SourceJSONL
+				c.cachedSnapshot = false
+				c.firstLine = 0
+				c.lastLine = 0
+				c.totalLines = 0
+				c.rawLines = nil
+				c.parsedItems = nil
+				c.rebuildMergedLocked()
+				c.mu.Unlock()
+				c.bumpRev(false)
+				return nil
+			}
+			c.invalidateResolvedOnHardErr(err)
+			if !isTransientReadErr(err) {
+				c.applyVTFallback()
+			}
+			return err
 		}
-		c.invalidateResolvedOnHardErr(err)
-		if !isTransientReadErr(err) {
-			c.applyVTFallback()
-		}
-		return err
+		total = probe.Lines
 	}
 
-	total := probe.Lines
 	if total <= 0 {
 		c.mu.Lock()
 		c.resolvedPath = path
 		c.format = format
 		c.onMachine = on
 		c.source = SourceJSONL
+		c.cachedSnapshot = false
 		c.firstLine = 0
 		c.lastLine = 0
 		c.totalLines = 0
@@ -1194,8 +1594,22 @@ func (c *ChatSessionController) loadInitialJSONLWindow(ctx context.Context, path
 
 	chunkLines := splitJSONLLines(win.Text)
 	parsed := ParseTranscriptLinesAt(format, chunkLines, win.First)
+	if format == FormatPi && on != "" && win.First > 1 && len(parsed) == 0 {
+		// Long runs of metadata can fill the small first read without a displayable turn.
+		if wider, err := c.readWindowAdaptive(ctx, path, on, total, chatFastInitialTailLines); err == nil {
+			win = wider
+			chunkLines = splitJSONLLines(win.Text)
+			parsed = ParseTranscriptLinesAt(format, chunkLines, win.First)
+		}
+	}
+	usage := ParseTranscriptUsage(format, chunkLines)
+	var skills []slashEntry
+	if format == FormatPi {
+		skills = piSkillManifest(chunkLines)
+	}
 
 	c.mu.Lock()
+	c.piSkills = skills
 	c.resolvedPath = path
 	c.format = format
 	c.onMachine = on
@@ -1206,10 +1620,26 @@ func (c *ChatSessionController) loadInitialJSONLWindow(ctx context.Context, path
 	c.totalLines = win.Lines
 	c.rawLines = chunkLines
 	c.parsedItems = parsed
+	if usage.Valid() {
+		c.contextUsage = usage
+	}
 	c.rebuildMergedLocked()
 	c.persistSnapshotLocked()
 	c.mu.Unlock()
 	c.bumpRev(true)
+	// The skill manifest is often a large system message. Publish the visible
+	// tail before reading it over a relay.
+	if format == FormatPi && skills == nil && win.First > 1 {
+		header, err := c.backend.FileRead(ctx, c.key.InstanceID, FileReadParams{Path: path, On: on, Offset: 1, Limit: min(16, win.First-1)})
+		if err == nil {
+			if found := piSkillManifest(splitJSONLLines(header.Text)); found != nil {
+				c.mu.Lock()
+				c.piSkills = found
+				c.mu.Unlock()
+				c.bumpRev(false)
+			}
+		}
+	}
 	return nil
 }
 
@@ -1217,17 +1647,23 @@ func (c *ChatSessionController) tailJSONLFromLastLine(ctx context.Context, path 
 	curOffset := lastLine
 	anyChanged := false
 	grew := false
+	hitSameTail := false
 
-	// Loop up to 8 batches (up to ~1600 lines) so large multi-tool bursts finish catching up in one sync!
-	for batch := 0; batch < 8; batch++ {
-		win, err := c.backend.FileRead(ctx, c.key.InstanceID, FileReadParams{
-			Path:   path,
-			Offset: curOffset,
-			Limit:  201,
-			On:     on,
-		})
-		if err != nil {
-			// Because curOffset == lastLine >= 1, "offset N: the file has M lines" means M < curOffset (file truncated/rotated)!
+	// Read forward adaptively (halving limit on 8 MiB response caps so oversized screenshots/tool dumps never stall tailing!).
+	for batch := 0; batch < 4; batch++ {
+		limit := 121
+		var win FileReadResult
+		var err error
+		for {
+			win, err = c.backend.FileRead(ctx, c.key.InstanceID, FileReadParams{
+				Path:   path,
+				Offset: curOffset,
+				Limit:  limit,
+				On:     on,
+			})
+			if err == nil {
+				break
+			}
 			if isOffsetPastEOF(err, curOffset) {
 				c.mu.Lock()
 				c.lastLine = 0
@@ -1242,13 +1678,30 @@ func (c *ChatSessionController) tailJSONLFromLastLine(ctx context.Context, path 
 				c.lastLine = 0
 				c.mu.Unlock()
 				c.applyVTFallback()
+				return nil
 			}
+			if isTransientReadErr(err) || limit <= 10 || (errors.As(err, &rpcErr) && rpcErr.Kind() == "invalid_params") {
+				break
+			}
+			limit /= 2
+		}
+		if err != nil {
 			break
 		}
 
 		if win.Lines < curOffset {
 			c.mu.Lock()
 			c.lastLine = 0
+			c.mu.Unlock()
+			return c.loadInitialJSONLWindow(ctx, path, format, on)
+		}
+
+		// If the file jumped far ahead (>400 lines) while we were away, skip multi-batch catchup
+		// and jump straight to the latest tail window in 1 single RTT!
+		if win.Lines-curOffset > 400 {
+			c.mu.Lock()
+			c.lastLine = 0
+			c.knownLines = win.Lines
 			c.mu.Unlock()
 			return c.loadInitialJSONLWindow(ctx, path, format, on)
 		}
@@ -1263,6 +1716,11 @@ func (c *ChatSessionController) tailJSONLFromLastLine(ctx context.Context, path 
 		if len(c.rawLines) > 0 && win.First == c.lastLine {
 			sameTail := len(chunk) == 1 && c.rawLines[len(c.rawLines)-1] == chunk[0] && win.Lines == c.totalLines
 			if sameTail {
+				hitSameTail = true
+				if c.cachedSnapshot {
+					c.cachedSnapshot = false
+					anyChanged = true
+				}
 				c.mu.Unlock()
 				break
 			}
@@ -1273,11 +1731,20 @@ func (c *ChatSessionController) tailJSONLFromLastLine(ctx context.Context, path 
 		} else if win.First > c.lastLine {
 			c.rawLines = append(c.rawLines, chunk...)
 		}
+		if format == FormatPi {
+			if skills := piSkillManifest(chunk); skills != nil {
+				c.piSkills = skills
+			}
+		}
 		c.lastLine = win.Last
 		c.totalLines = win.Lines
 		c.source = SourceJSONL
 		c.cachedSnapshot = false
+		c.staleWorkingPolls = 0
 		c.parsedItems = ParseTranscriptLinesAt(format, c.rawLines, c.firstLine)
+		if usage := ParseTranscriptUsage(format, c.rawLines); usage.Valid() {
+			c.contextUsage = usage
+		}
 		c.rebuildMergedLocked()
 		c.persistSnapshotLocked()
 		if len(c.mergedItems) > prevCount {
@@ -1294,6 +1761,23 @@ func (c *ChatSessionController) tailJSONLFromLastLine(ctx context.Context, path 
 
 	if anyChanged {
 		c.bumpRev(grew)
+	}
+
+	// Self-healing stale-file detection: if the agent is actively "working" yet the current JSONL
+	// produced zero new lines for 2 consecutive polls, check whether `/clear` or `/resume` rotated to a newer file!
+	if hitSameTail && !grew && c.backend != nil {
+		if at, ok := c.backend.FindTerminal(c.key); ok && at.Terminal.StateWord() == "working" {
+			c.mu.Lock()
+			c.staleWorkingPolls++
+			shouldRecheck := c.staleWorkingPolls >= 2 && time.Since(c.lastStaleRecheck) >= 4*time.Second
+			c.mu.Unlock()
+			if shouldRecheck && c.recheckLatestPathIfChanged(ctx) {
+				c.mu.Lock()
+				newPath, newFmt, newOn := c.resolvedPath, c.format, c.onMachine
+				c.mu.Unlock()
+				return c.loadInitialJSONLWindow(ctx, newPath, newFmt, newOn)
+			}
+		}
 	}
 	return nil
 }

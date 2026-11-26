@@ -58,13 +58,31 @@ func SplitMachineAddr(addr string) (on, local string) {
 	return "", addr
 }
 
+// cleanSessionTitle strips redundant CLI prompt/brand prefixes like "π - " from terminal window titles
+// so Gemini/other harnesses don't inherit a stale "π" prefix and Pi sessions pair cleanly with the colorful P icon.
+func cleanSessionTitle(raw string) string {
+	s := strings.TrimSpace(raw)
+	for _, p := range []string{"π - ", "π – ", "π — ", "π · ", "π: ", "π "} {
+		if strings.HasPrefix(s, p) {
+			trimmed := strings.TrimSpace(strings.TrimPrefix(s, p))
+			if trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return s
+}
+
 // Label is what a row shows: the caller's name, else the title, else the address.
 func (t Terminal) Label() string {
 	if t.Name != "" {
-		return t.Name
+		return cleanSessionTitle(t.Name)
+	}
+	if supportedMux(t.Labels[muxKindLabel]) && t.Labels[muxNameLabel] != "" {
+		return cleanSessionTitle(t.Labels[muxNameLabel])
 	}
 	if t.Title != "" {
-		return t.Title
+		return cleanSessionTitle(t.Title)
 	}
 	return t.Address
 }
@@ -102,7 +120,9 @@ func (t Terminal) NeedsYou() bool {
 }
 
 // Finished reports a terminal whose program is gone.
-func (t Terminal) Finished() bool { return t.FinishedMS != nil || t.ExitCode != nil || t.State == "finished" }
+func (t Terminal) Finished() bool {
+	return t.FinishedMS != nil || t.ExitCode != nil || t.State == "finished"
+}
 
 // ReadResult is terminal.read: the screen plus history, as text.
 type ReadResult struct {
@@ -122,12 +142,12 @@ type SendResult struct {
 
 // WaitResult is terminal.wait.
 type WaitResult struct {
-	Reason   string  `json:"reason"`
-	Ended    bool    `json:"ended"`
+	Reason   string          `json:"reason"`
+	Ended    bool            `json:"ended"`
 	ExitCode *int            `json:"exit_code"`
 	Signal   json.RawMessage `json:"signal"`
-	Status   *Status `json:"status"`
-	From     *string `json:"from"`
+	Status   *Status         `json:"status"`
+	From     *string         `json:"from"`
 }
 
 // KeysResult is terminal.keys.
@@ -192,9 +212,9 @@ type Event struct {
 
 // Display reports the viewer's terminal colors and cell geometry to herdr-core.
 type Display struct {
-	FG     string    `json:"fg,omitempty"`
-	BG     string    `json:"bg,omitempty"`
-	Cursor string    `json:"cursor,omitempty"`
+	FG     string     `json:"fg,omitempty"`
+	BG     string     `json:"bg,omitempty"`
+	Cursor string     `json:"cursor,omitempty"`
 	Cell   *[2]uint32 `json:"cell,omitempty"`
 }
 

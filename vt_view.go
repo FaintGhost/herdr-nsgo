@@ -268,12 +268,22 @@ func (st *SessionTerminal) Feed(data []byte) {
 		return
 	}
 	firstFrame := st.rawRing.Len() == 0
-	st.screen.Write(data)
+	clip := st.screen.writeFrame(data)
 	st.appendRawLocked(data)
 	st.dirtyCache = true
 	gt := st.ghostty
 	st.mu.Unlock()
 
+	if clip != nil && st.cx != nil {
+		st.cx.Post(func() {
+			st.mu.Lock()
+			closed := st.closed
+			st.mu.Unlock()
+			if !closed {
+				st.cx.SetClipboard(*clip)
+			}
+		})
+	}
 	if gt != nil {
 		gt.Feed(data)
 	}
@@ -668,6 +678,19 @@ func RenderSessionTerminalVisible(
 	fontSizeFn func() float32,
 	visibleFn func() bool,
 ) core.Node {
+	return RenderSessionTerminalConfigured(cx, st, palFn, vtPalFn, fontSizeFn, nil, visibleFn)
+}
+
+// RenderSessionTerminalConfigured renders the VT surface with dynamic font family, size, color scheme, and visibility pause.
+func RenderSessionTerminalConfigured(
+	cx *core.Scope,
+	st *SessionTerminal,
+	palFn func() Palette,
+	vtPalFn func() VTPalette,
+	fontSizeFn func() float32,
+	fontFamilyFn func() string,
+	visibleFn func() bool,
+) core.Node {
 	isVisible := func() bool {
 		return visibleFn == nil || visibleFn()
 	}
@@ -677,6 +700,14 @@ func RenderSessionTerminalVisible(
 			return float32(Tokens.FontVTDefault)
 		}
 		return fs
+	}
+	getFontFamily := func() string {
+		if fontFamilyFn != nil {
+			if fam := fontFamilyFn(); fam != "" {
+				return fam
+			}
+		}
+		return vtFontFamily
 	}
 
 	if st == nil {
@@ -702,14 +733,12 @@ func RenderSessionTerminalVisible(
 		}
 	}
 
+	diag := core.Show{When: func() bool { return st.diag != nil && st.diag.Get() != "" }, Then: func(cx *core.Scope) core.Node {
+		return core.Text{ContentFunc: st.diag.Get, Role: core.RoleStatus, Style: core.Style{Padding: core.Symmetric(Tokens.Space2, Tokens.Space3), FontSize: Tokens.FontCaption, FontFamily: core.FontMonospace}, StyleFunc: func() core.Style { return core.Style{Color: vtPalFn().Muted} }}
+	}}
+
 	// Native Ghostty surface on platforms that support it (iOS/macOS/Linux/Windows).
 	if gt := st.Ghostty(); gt != nil {
-		lightTh, darkTh := GhosttyTerminalThemes()
-		vtPal := vtPalFn()
-		chosenLight, chosenDark := lightTh, darkTh
-		if vtPal.Bg == DarkVTPalette().Bg {
-			chosenLight = darkTh
-		}
 		return core.View{
 			TestID: "vt-surface",
 			StyleFunc: func() core.Style {
@@ -725,18 +754,22 @@ func RenderSessionTerminalVisible(
 				st.mu.Unlock()
 			},
 			Children: []core.Node{
-				terminal.View{
-					Terminal:  gt,
-					Theme:     chosenLight,
-					DarkTheme: chosenDark,
-					NoKeyBar:  true,
-					Font: core.Font{
-						Family: vtFontFamily,
-						Size:   core.Points(getFontSize()),
-					},
-					Style:  core.Style{FlexGrow: 1},
-					TestID: "vt-ghostty",
-				},
+				diag,
+				core.Dynamic(func(*core.Scope) core.Node {
+					th := GhosttyThemeFor(vtPalFn())
+					return terminal.View{
+						Terminal:  gt,
+						Theme:     th,
+						DarkTheme: th,
+						NoKeyBar:  true,
+						Font: core.Font{
+							Family: getFontFamily(),
+							Size:   core.Points(getFontSize()),
+						},
+						Style:  core.Style{FlexGrow: 1},
+						TestID: "vt-ghostty",
+					}
+				}),
 			},
 		}
 	}
@@ -773,28 +806,7 @@ func RenderSessionTerminalVisible(
 			st.scrolledUp.Set(distFromBottom > 60)
 		},
 		Children: []core.Node{
-			core.Show{
-				When: func() bool {
-					return st.diag != nil && st.diag.Get() != ""
-				},
-				Then: func(cx *core.Scope) core.Node {
-					return core.View{
-						Style: core.Style{Padding: core.Symmetric(Tokens.Space2, Tokens.Space3)},
-						Children: []core.Node{
-							core.Text{
-								ContentFunc: st.diag.Get,
-								StyleFunc: func() core.Style {
-									return core.Style{
-										Color:      vtPalFn().Muted,
-										FontSize:   Tokens.FontCaption,
-										FontFamily: core.FontMonospace,
-									}
-								},
-							},
-						},
-					}
-				},
-			},
+			diag,
 			core.Show{
 				When: func() bool {
 					return st.historyHint != nil && st.historyHint.Get() != "" && (st.diag == nil || st.diag.Get() == "")
@@ -819,11 +831,10 @@ func RenderSessionTerminalVisible(
 							core.Text{
 								ContentFunc: st.historyHint.Get,
 								StyleFunc: func() core.Style {
-									pal := palFn()
 									return core.Style{
-										Color:      pal.Accent,
+										Color:      vtPalFn().Accent,
 										FontSize:   Tokens.FontMonoMeta,
-										FontWeight: core.FontWeightSemibold,
+										FontWeight: core.FontWeightMedium,
 									}
 								},
 							},
@@ -876,57 +887,57 @@ func RenderSessionTerminalVisible(
 						Children: []core.Node{
 							core.Canvas{
 								TestID: "vt-canvas",
-						StyleFunc: func() core.Style {
-							if !isVisible() {
-								return core.Style{
-									Width:      core.Pt(320),
-									Height:     core.Pt(220),
-									Background: vtPalFn().Bg,
-								}
-							}
-							if st.rev != nil {
-								_ = st.rev.Get()
-							}
-							fs := getFontSize()
-							cellW := fs * 0.62
-							cellH := fs * 1.40
-							cols, _ := st.screen.Size()
-							totalLines := st.screen.TotalLines()
-							if totalLines > maxVTCanvasRenderLines {
-								totalLines = maxVTCanvasRenderLines
-							}
-							w := core.Points(padX*2 + float32(cols)*cellW)
-							h := core.Points(padY*2 + float32(totalLines)*cellH)
-							if h < 220 {
-								h = 220
-							}
-							return core.Style{
-								Width:      core.Pt(w),
-								Height:     core.Pt(h),
-								Background: vtPalFn().Bg,
-							}
-						},
-						Draw: func(d *core.Drawing, size core.Size) {
-							if !isVisible() {
-								return
-							}
-							if st.rev != nil {
-								_ = st.rev.Get()
-							}
-							fs := getFontSize()
-							cellW := fs * 0.62
-							cellH := fs * 1.40
-							var query string
-							var activeMatch int
-							if st.searchQuery != nil {
-								query = st.searchQuery.Get()
-							}
-							if st.searchIdx != nil {
-								activeMatch = st.searchIdx.Get()
-							}
-							drawVTScreen(d, size, st.screen, palFn(), vtPalFn(), fs, cellW, cellH, padX, padY, query, activeMatch)
-						},
-					},
+								StyleFunc: func() core.Style {
+									if !isVisible() {
+										return core.Style{
+											Width:      core.Pt(320),
+											Height:     core.Pt(220),
+											Background: vtPalFn().Bg,
+										}
+									}
+									if st.rev != nil {
+										_ = st.rev.Get()
+									}
+									fs := getFontSize()
+									cellW := fs * 0.62
+									cellH := fs * 1.40
+									cols, _ := st.screen.Size()
+									totalLines := st.screen.TotalLines()
+									if totalLines > maxVTCanvasRenderLines {
+										totalLines = maxVTCanvasRenderLines
+									}
+									w := core.Points(padX*2 + float32(cols)*cellW)
+									h := core.Points(padY*2 + float32(totalLines)*cellH)
+									if h < 220 {
+										h = 220
+									}
+									return core.Style{
+										Width:      core.Pt(w),
+										Height:     core.Pt(h),
+										Background: vtPalFn().Bg,
+									}
+								},
+								Draw: func(d *core.Drawing, size core.Size) {
+									if !isVisible() {
+										return
+									}
+									if st.rev != nil {
+										_ = st.rev.Get()
+									}
+									fs := getFontSize()
+									cellW := fs * 0.62
+									cellH := fs * 1.40
+									var query string
+									var activeMatch int
+									if st.searchQuery != nil {
+										query = st.searchQuery.Get()
+									}
+									if st.searchIdx != nil {
+										activeMatch = st.searchIdx.Get()
+									}
+									drawVTScreen(d, size, st.screen, palFn(), vtPalFn(), getFontFamily(), fs, cellW, cellH, padX, padY, query, activeMatch)
+								},
+							},
 						},
 					},
 				},
@@ -958,6 +969,7 @@ func drawVTScreen(
 	screen *VTScreen,
 	pal Palette,
 	vtPal VTPalette,
+	fontFamily string,
 	fontSize, cellW, cellH, padX, padY float32,
 	searchQuery string,
 	activeMatch int,
@@ -991,8 +1003,11 @@ func drawVTScreen(
 	d.SetTextBaseline(core.BaselineAlphabetic)
 	d.SetTextAlign(core.TextAlignLeft)
 
+	if fontFamily == "" {
+		fontFamily = vtFontFamily
+	}
 	baseFont := core.Font{
-		Family: vtFontFamily,
+		Family: fontFamily,
 		Size:   core.Points(fontSize),
 	}
 	ascent := d.TextMetrics("Mg", baseFont).Ascent
@@ -1023,17 +1038,23 @@ func drawVTScreen(
 			}
 		}
 
-		// Search match highlights.
+		// Search match highlights (translucent semantic fills so vtPal.Fg text stays WCAG AA readable in Light & Dark).
 		for mi, m := range matches {
 			if m.Line != absLineIdx {
 				continue
 			}
-			hl := pal.AccentSoft
+			x := padX + float32(m.Col)*cellW
+			w := float32(m.Length) * cellW
+			hl := pal.RunningSoft
 			if mi == activeMatch {
-				hl = pal.Accent
+				hl = pal.WarnSoft
 			}
 			d.SetFillColor(hl)
-			d.BeginPath().Rect(padX+float32(m.Col)*cellW, y, float32(m.Length)*cellW, cellH).Fill()
+			d.BeginPath().Rect(x, y, w, cellH).Fill()
+			if mi == activeMatch {
+				d.SetFillColor(vtPal.Amber)
+				d.BeginPath().Rect(x, y+cellH-2, w, 2).Fill()
+			}
 		}
 
 		// Cursor drawn BEFORE text (as underline bar so character underneath stays readable).

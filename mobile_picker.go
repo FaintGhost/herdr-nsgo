@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/nsgo-dev/nsgo/core"
+	"github.com/nsgo-dev/nsgo/ui"
 )
 
 type pickerPage struct {
@@ -276,7 +277,14 @@ func (r *remotePicker) cleanup() {
 	}
 }
 
-func mobileAgentPicker(cx *core.Scope, a *App, t AggregatedTerminal, effort bool, closeSheet func()) core.Node {
+type pickerChoice struct {
+	ID          string
+	Label       string
+	Detail      string
+	DirectValue string
+}
+
+func mobileAgentPicker(cx *core.Scope, a *App, t AggregatedTerminal, liveModel string, effort bool, closeSheet func()) core.Node {
 	kind := DetectHarnessKind(t.Terminal)
 	title := "模型"
 	if effort {
@@ -285,23 +293,141 @@ func mobileAgentPicker(cx *core.Scope, a *App, t AggregatedTerminal, effort bool
 	c := a.pool.ClientFor(t.Key.InstanceID)
 	r := &remotePicker{client: c, addr: t.Key.Addr, kind: kind}
 	life := cx.Context()
+
+	// 0ms instant options from persistent cache + built-in presets + live transcript model.
+	catalog := core.NewSignalFunc(cx, a.InstantCatalogFor(t.Key.InstanceID, kind, liveModel), nil)
+	tuiMode := core.NewSignal(cx, false)
 	busy := core.NewSignal(cx, false)
+	refreshing := core.NewSignal(cx, false)
 	notice := core.NewSignal(cx, "")
 	chosen := core.NewSignal(cx, "")
+	chosenLabel := core.NewSignal(cx, "")
 	page := core.NewSignalFunc(cx, pickerPage{cursor: -1}, nil)
-	run := func(fn func(context.Context) (pickerPage, error), applying bool) {
+
+	// Silently refresh host model metadata in the background via fast read-only MachineExec (zero TUI disruption).
+	if c != nil {
+		refreshing.Set(true)
+		a.PrefetchAgentCatalog(t.Key, t.Terminal, func(updated AgentCatalog) {
+			if life.Err() != nil {
+				return
+			}
+			refreshing.Set(false)
+			if liveModel != "" && updated.DefaultModel == "" {
+				updated.DefaultModel = liveModel
+			}
+			catalog.Set(updated)
+		})
+		// Clear subtle refreshing indicator if prefetch skipped/cached or timed out.
+		time.AfterFunc(1200*time.Millisecond, func() {
+			if life.Err() == nil {
+				cx.Post(func() { refreshing.Set(false) })
+			}
+		})
+	}
+
+	currentValue := func() string {
+		if tuiMode.Get() {
+			return page.Get().current
+		}
+		if effort {
+			if s := a.SessionEffort(t.Key); s != "" {
+				return s
+			}
+			return catalog.Get().DefaultEffort
+		}
+		if s := a.SessionModel(t.Key); s != "" {
+			return s
+		}
+		if liveModel != "" {
+			return liveModel
+		}
+		return catalog.Get().DefaultModel
+	}
+
+	isCurrentChoice := func(ch pickerChoice) bool {
+		cur := strings.ToLower(strings.TrimSpace(currentValue()))
+		if cur == "" {
+			return false
+		}
+		idLow := strings.ToLower(ch.ID)
+		valLow := strings.ToLower(ch.DirectValue)
+		if cur == idLow || cur == valLow || cur == strings.ToLower(ch.Label) {
+			return true
+		}
+		if !effort && kind == "claude" && (idLow == "opus" || idLow == "sonnet" || idLow == "haiku") {
+			return strings.Contains(cur, idLow)
+		}
+		return false
+	}
+
+	choices := func() []pickerChoice {
+		if tuiMode.Get() {
+			rows := page.Get().rows
+			out := make([]pickerChoice, 0, len(rows))
+			for _, row := range rows {
+				lbl, det := row, ""
+				if effort || page.Get().effort {
+					lbl, det = EffortDisplay(row)
+				}
+				out = append(out, pickerChoice{ID: row, Label: lbl, Detail: det, DirectValue: row})
+			}
+			return out
+		}
+		cat := catalog.Get()
+		if effort {
+			effs := cat.Efforts
+			if kind == "codex" {
+				curMod := strings.ToLower(strings.TrimSpace(currentValue()))
+				if m := a.SessionModel(t.Key); m != "" {
+					curMod = strings.ToLower(m)
+				} else if liveModel != "" {
+					curMod = strings.ToLower(liveModel)
+				} else if cat.DefaultModel != "" {
+					curMod = strings.ToLower(cat.DefaultModel)
+				}
+				for _, m := range cat.Models {
+					if strings.EqualFold(m.ID, curMod) && len(m.Efforts) > 0 {
+						effs = m.Efforts
+						break
+					}
+				}
+			}
+			out := make([]pickerChoice, 0, len(effs))
+			for _, lv := range effs {
+				lbl, det := EffortDisplay(lv)
+				out = append(out, pickerChoice{ID: lv, Label: lbl, Detail: det, DirectValue: lv})
+			}
+			return out
+		}
+		out := make([]pickerChoice, 0, len(cat.Models))
+		for _, m := range cat.Models {
+			dv := m.DirectValue
+			if dv == "" {
+				dv = m.ID
+			}
+			lbl := m.Label
+			if lbl == "" {
+				lbl = m.ID
+			}
+			out = append(out, pickerChoice{ID: m.ID, Label: lbl, Detail: m.Detail, DirectValue: dv})
+		}
+		return out
+	}
+
+	runTUI := func(fn func(context.Context) (pickerPage, error), applying bool) {
 		if busy.Get() {
 			return
 		}
 		if c == nil {
-			notice.Set("实例离线，连接后可读取选项")
+			notice.Set("实例离线，连接后可同步远端菜单")
 			return
 		}
+		tuiMode.Set(true)
 		busy.Set(true)
 		notice.Set("")
 		go func() {
 			r.mu.Lock()
-			ctx, cancel := context.WithTimeout(life, 20*time.Second)
+			ctx, cancel := context.WithTimeout(life, 15*time.Second)
 			p, err := fn(ctx)
 			cancel()
 			r.mu.Unlock()
@@ -312,7 +438,7 @@ func mobileAgentPicker(cx *core.Scope, a *App, t AggregatedTerminal, effort bool
 				busy.Set(false)
 				if err != nil {
 					page.Set(pickerPage{cursor: -1})
-					notice.Set("未能确认远端状态：" + err.Error())
+					notice.Set("未能读取实时菜单：" + err.Error())
 					chosen.Set("")
 					return
 				}
@@ -320,8 +446,12 @@ func mobileAgentPicker(cx *core.Scope, a *App, t AggregatedTerminal, effort bool
 					field := "模型"
 					if page.Get().effort {
 						field = "思考强度"
+						a.SetSessionEffort(t.Key, chosen.Get())
+					} else {
+						a.SetSessionModel(t.Key, chosen.Get())
 					}
 					cx.Announce(field + "已提交：" + chosen.Get())
+					a.notifyToast("已切换" + field + "：" + chosen.Get())
 					closeSheet()
 					return
 				}
@@ -330,41 +460,153 @@ func mobileAgentPicker(cx *core.Scope, a *App, t AggregatedTerminal, effort bool
 			})
 		}()
 	}
+
+	applyDirect := func(targetID, targetLabel string) {
+		if busy.Get() {
+			return
+		}
+		if c == nil {
+			notice.Set("实例离线，请待恢复连接后再切换")
+			return
+		}
+		cmd, ok := DirectApplyCommand(kind, effort, targetID)
+		if !ok {
+			runTUI(func(ctx context.Context) (pickerPage, error) { return r.open(ctx, effort) }, false)
+			return
+		}
+		busy.Set(true)
+		notice.Set("")
+		go func() {
+			ctx, cancel := context.WithTimeout(life, 10*time.Second)
+			defer cancel()
+			_, err := c.Send(ctx, t.Key.Addr, cmd)
+			cx.Post(func() {
+				if life.Err() != nil {
+					return
+				}
+				busy.Set(false)
+				if err != nil {
+					notice.Set("切换失败：" + explain(err))
+					return
+				}
+				display := targetLabel
+				if display == "" {
+					display = targetID
+				}
+				if effort {
+					a.SetSessionEffort(t.Key, targetID)
+					cx.Announce("思考强度已切换：" + display)
+					a.notifyToast("已切换思考强度：" + display)
+				} else {
+					a.SetSessionModel(t.Key, targetID)
+					cx.Announce("模型已切换：" + display)
+					a.notifyToast("已切换模型：" + ShortModelLabel(display))
+				}
+				closeSheet()
+			})
+		}()
+	}
+
 	cx.Cleanup(func() {
 		if c != nil {
 			go r.cleanup()
 		}
 	})
-	load := func() { run(func(ctx context.Context) (pickerPage, error) { return r.open(ctx, effort) }, false) }
-	load()
-	status := core.Text{
-		ContentFunc: func() string {
-			if busy.Get() {
-				return "正在同步远端选项…"
-			}
-			if notice.Get() != "" {
-				return notice.Get()
-			}
-			if chosen.Get() != "" {
-				return "待应用 · " + chosen.Get()
-			}
-			if kind == "codex" && !page.Get().effort {
-				return "先选模型，再选推理强度"
-			}
-			if page.Get().current != "" {
-				return "当前 · " + page.Get().current
-			}
-			return "点选一项，再点应用"
+
+	statusRow := core.View{
+		Style: core.Style{
+			Direction:      core.Row,
+			AlignItems:     core.AlignCenter,
+			JustifyContent: core.JustifySpaceBetween,
+			Gap:            Tokens.Space2,
 		},
-		StyleFunc: func() core.Style {
-			return core.Style{FontSize: Tokens.FontCaption, Color: a.paletteOf(cx).TextSecondary}
+		Children: []core.Node{
+			core.View{
+				Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: Tokens.Space2, FlexShrink: 1, MinWidth: core.Pt(0)},
+				Children: []core.Node{
+					core.Show{
+						When: func() bool { return busy.Get() || refreshing.Get() },
+						Then: func(cx *core.Scope) core.Node {
+							return ui.Spinner{Size: 13, Variant: ui.SpinnerSpokes, Label: "同步中", Tint: func() core.Color { return a.paletteOf(cx).Running }}
+						},
+					},
+					core.Text{
+						MaxLines: 1,
+						ContentFunc: func() string {
+							if busy.Get() {
+								if tuiMode.Get() {
+									return "正在同步终端实时菜单…"
+								}
+								return "正在极速切换…"
+							}
+							if notice.Get() != "" {
+								return notice.Get()
+							}
+							if chosen.Get() != "" {
+								lbl := chosenLabel.Get()
+								if lbl == "" {
+									lbl = chosen.Get()
+								}
+								return "待应用 · " + lbl
+							}
+							if cur := currentValue(); cur != "" {
+								return "当前 · " + ShortModelLabel(cur)
+							}
+							return "点选一项即可快速切换"
+						},
+						StyleFunc: func() core.Style {
+							pal := a.paletteOf(cx)
+							fg := pal.TextSecondary
+							if notice.Get() != "" {
+								fg = pal.Danger
+							}
+							return core.Style{FontSize: Tokens.FontCaption, Color: fg, FlexShrink: 1, MinWidth: core.Pt(0)}
+						},
+					},
+				},
+			},
+			core.Show{
+				When: func() bool { return c != nil && !busy.Get() },
+				Then: func(cx *core.Scope) core.Node {
+					return core.View{
+						TestID: "model-sync-tui",
+						Role:   core.RoleButton,
+						OnPress: func(core.PressEvent) {
+							playSelectionHaptic(cx)
+							runTUI(func(ctx context.Context) (pickerPage, error) { return r.open(ctx, effort) }, false)
+						},
+						Style: core.Style{
+							Direction:  core.Row,
+							AlignItems: core.AlignCenter,
+							Gap:        core.Points(4),
+							Padding:    core.Symmetric(core.Points(4), core.Points(6)),
+						},
+						Children: []core.Node{
+							core.Icon{
+								SVG: iconRefresh,
+								StyleFunc: func() core.Style {
+									return core.Style{Width: core.Pt(13), Height: core.Pt(13), Color: a.paletteOf(cx).TextMuted}
+								},
+							},
+							core.Text{
+								Content: "终端菜单",
+								StyleFunc: func() core.Style {
+									return core.Style{Color: a.paletteOf(cx).TextMuted, FontSize: Tokens.FontMonoMeta, FontWeight: core.FontWeightMedium}
+								},
+							},
+						},
+					}
+				},
+			},
 		},
 	}
+
 	options := core.Show{
-		When: func() bool { return len(page.Get().rows) > 0 },
+		When: func() bool { return len(choices()) > 0 },
 		Then: func(cx *core.Scope) core.Node {
 			return GroupCard(cx, a, "model-options", []core.Node{
-				core.Each(func() []string { return page.Get().rows }, func(s string) string { return s }, func(cx *core.Scope, row func() string, idx func() int) core.Node {
+				core.Each(choices, func(ch pickerChoice) string { return ch.ID }, func(cx *core.Scope, itemFn func() pickerChoice, idx func() int) core.Node {
+					ch0 := itemFn()
 					return core.View{
 						Children: []core.Node{
 							core.Show{
@@ -373,16 +615,19 @@ func mobileAgentPicker(cx *core.Scope, a *App, t AggregatedTerminal, effort bool
 							},
 							core.View{
 								Role:     core.RoleButton,
-								TestID:   "model-option-" + row(),
+								TestID:   "model-option-" + ch0.ID,
 								Disabled: busy.Get,
 								OnPress: func(core.PressEvent) {
 									playSelectionHaptic(cx)
-									chosen.Set(row())
+									ch := itemFn()
+									chosen.Set(ch.DirectValue)
+									chosenLabel.Set(ch.Label)
 								},
 								StyleFunc: func() core.Style {
 									pal := a.paletteOf(cx)
+									ch := itemFn()
 									bg := core.Transparent
-									if chosen.Get() == row() {
+									if chosen.Get() == ch.DirectValue {
 										bg = pal.AccentSoft
 									}
 									return core.Style{
@@ -396,28 +641,52 @@ func mobileAgentPicker(cx *core.Scope, a *App, t AggregatedTerminal, effort bool
 									}
 								},
 								Children: []core.Node{
-									core.Text{
-										ContentFunc: row,
-										StyleFunc: func() core.Style {
-											return core.Style{
-												FlexGrow:   1,
-												FlexShrink: 1,
-												MinWidth:   core.Pt(0),
-												FontSize:   Tokens.FontRowTitle,
-												Color:      a.paletteOf(cx).Text,
-											}
+									core.View{
+										Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinWidth: core.Pt(0), Gap: core.Points(2)},
+										Children: []core.Node{
+											core.Text{
+												MaxLines:    1,
+												ContentFunc: func() string { return itemFn().Label },
+												StyleFunc: func() core.Style {
+													return core.Style{
+														FontSize:   Tokens.FontRowTitle,
+														FontWeight: core.FontWeightMedium,
+														Color:      a.paletteOf(cx).Text,
+													}
+												},
+											},
+											core.Show{
+												When: func() bool { return itemFn().Detail != "" },
+												Then: func(cx *core.Scope) core.Node {
+													return core.Text{
+														MaxLines:    1,
+														ContentFunc: func() string { return itemFn().Detail },
+														StyleFunc: func() core.Style {
+															return core.Style{
+																FontSize: Tokens.FontMonoMeta,
+																Color:    a.paletteOf(cx).TextMuted,
+															}
+														},
+													}
+												},
+											},
 										},
 									},
 									core.Show{
 										When: func() bool {
-											r := row()
-											return chosen.Get() == r || (chosen.Get() == "" && page.Get().current == r)
+											ch := itemFn()
+											return chosen.Get() == ch.DirectValue || (chosen.Get() == "" && isCurrentChoice(ch))
 										},
 										Then: func(cx *core.Scope) core.Node {
 											return core.Icon{
 												SVG: iconCheck,
 												StyleFunc: func() core.Style {
-													return core.Style{Width: core.Pt(16), Height: core.Pt(16), FlexShrink: 0, Color: a.paletteOf(cx).Text}
+													pal := a.paletteOf(cx)
+													fg := pal.Text
+													if chosen.Get() == "" {
+														fg = pal.Running
+													}
+													return core.Style{Width: core.Pt(16), Height: core.Pt(16), FlexShrink: 0, Color: fg}
 												},
 											}
 										},
@@ -429,8 +698,32 @@ func mobileAgentPicker(cx *core.Scope, a *App, t AggregatedTerminal, effort bool
 				}),
 			})
 		},
+		Else: func(cx *core.Scope) core.Node {
+			return GroupCard(cx, a, "", []core.Node{
+				core.View{
+					Style: core.Style{Padding: core.All(core.Points(14)), Gap: Tokens.Space2},
+					Children: []core.Node{
+						core.Show{
+							When: func() bool { return busy.Get() || refreshing.Get() },
+							Then: func(cx *core.Scope) core.Node {
+								return ui.Skeleton{Lines: 3, Label: "正在读取模型列表"}
+							},
+							Else: func(cx *core.Scope) core.Node {
+								return core.Text{
+									Content: "当前未发现本地模型缓存，可点上方「终端菜单」从远端拉取完整列表。",
+									StyleFunc: func() core.Style {
+										return core.Style{Color: a.paletteOf(cx).TextMuted, FontSize: Tokens.FontCaption}
+									},
+								}
+							},
+						},
+					},
+				},
+			})
+		},
 	}
-	paging := core.Show{When: func() bool { return page.Get().more && !busy.Get() }, Then: func(cx *core.Scope) core.Node {
+
+	paging := core.Show{When: func() bool { return tuiMode.Get() && page.Get().more && !busy.Get() }, Then: func(cx *core.Scope) core.Node {
 		var buttons []core.Node
 		for _, key := range []string{"up", "down"} {
 			label := "下一页"
@@ -438,7 +731,7 @@ func mobileAgentPicker(cx *core.Scope, a *App, t AggregatedTerminal, effort bool
 				label = "上一页"
 			}
 			buttons = append(buttons, ActionButton(cx, a, "model-page-"+key, label, ActionSecondary, func() {
-				run(func(ctx context.Context) (pickerPage, error) {
+				runTUI(func(ctx context.Context) (pickerPage, error) {
 					p, ok, err := r.read(ctx)
 					if err != nil {
 						return p, err
@@ -459,22 +752,31 @@ func mobileAgentPicker(cx *core.Scope, a *App, t AggregatedTerminal, effort bool
 		}
 		return core.View{Style: core.Style{Direction: core.Row, Gap: Tokens.Space2}, Children: buttons}
 	}}
+
 	apply := core.Show{When: func() bool { return chosen.Get() != "" && !busy.Get() }, Then: func(cx *core.Scope) core.Node {
 		return ActionButton(cx, a, "model-apply", "应用", ActionPrimary, func() {
-			target, shown := chosen.Get(), page.Get()
-			run(func(ctx context.Context) (pickerPage, error) {
-				return r.apply(ctx, shown, target)
-			}, true)
+			target, lbl := chosen.Get(), chosenLabel.Get()
+			if tuiMode.Get() {
+				shown := page.Get()
+				runTUI(func(ctx context.Context) (pickerPage, error) {
+					return r.apply(ctx, shown, target)
+				}, true)
+				return
+			}
+			applyDirect(target, lbl)
 		})
 	}}
+
 	label := fmt.Sprintf("%s · %s", title, kind)
 	return SheetModal(cx, a, "chat-model-sheet", label, "chat-model-close", closeSheet, []core.Node{
-		status,
+		statusRow,
 		options,
 		paging,
 		apply,
-		core.Show{When: func() bool { return !busy.Get() && notice.Get() != "" && c != nil }, Then: func(cx *core.Scope) core.Node {
-			return ActionButton(cx, a, "model-reload", "重新读取选项", ActionSecondary, load)
+		core.Show{When: func() bool { return tuiMode.Get() && !busy.Get() && notice.Get() != "" && c != nil }, Then: func(cx *core.Scope) core.Node {
+			return ActionButton(cx, a, "model-reload", "重新读取菜单", ActionSecondary, func() {
+				runTUI(func(ctx context.Context) (pickerPage, error) { return r.open(ctx, effort) }, false)
+			})
 		}},
 	})
 }

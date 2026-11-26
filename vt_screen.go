@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"regexp"
 	"strconv"
 	"strings"
@@ -23,8 +25,8 @@ const (
 
 // VTColor represents a terminal foreground or background color.
 type VTColor struct {
-	Kind  VTColorKind
-	Index uint8
+	Kind    VTColorKind
+	Index   uint8
 	R, G, B uint8
 }
 
@@ -151,12 +153,15 @@ type VTScreen struct {
 	title       string
 	oscLinks    []string
 	oscLinkSeen map[string]struct{}
+	oscStatus   *Status
 
 	// Incremental parser state.
-	state   vtParseState
-	csiBuf  []byte
-	oscBuf  []byte
-	utf8Buf []byte
+	state          vtParseState
+	csiBuf         []byte
+	oscTooLong     bool
+	clipboardWrite *string
+	oscBuf         []byte
+	utf8Buf        []byte
 
 	seq uint64
 }
@@ -231,6 +236,17 @@ func (s *VTScreen) Title() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.title
+}
+
+// OSCStatus returns the latest OSC 7501 structured status emitted directly on the VT byte stream.
+func (s *VTScreen) OSCStatus() *Status {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.oscStatus == nil {
+		return nil
+	}
+	cp := *s.oscStatus
+	return &cp
 }
 
 // InAltScreen reports whether the alternate screen buffer is active.
@@ -370,17 +386,25 @@ func (s *VTScreen) ReplaceHistory(raw []byte) {
 }
 
 // Write feeds raw VT byte output into the screen emulator.
-func (s *VTScreen) Write(p []byte) {
+func (s *VTScreen) Write(p []byte) { s.writeFrame(p) }
+
+// Only a live terminal consumes the clipboard result. Cached frames and
+// scrollback restoration still update the screen without clipboard side effects.
+func (s *VTScreen) writeFrame(p []byte) *string {
 	if len(p) == 0 {
-		return
+		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.clipboardWrite = nil
 	for _, b := range p {
 		s.feedByte(b)
 	}
 	s.seq++
+	out := s.clipboardWrite
+	s.clipboardWrite = nil
+	return out
 }
 
 func (s *VTScreen) feedByte(b byte) {
@@ -442,6 +466,7 @@ func (s *VTScreen) feedByte(b byte) {
 			s.state = vtStateCSI
 		case ']':
 			s.oscBuf = s.oscBuf[:0]
+			s.oscTooLong = false
 			s.state = vtStateOSC
 		case '(', ')', '*', '+':
 			s.state = vtStateEscapeCharset
@@ -504,8 +529,10 @@ func (s *VTScreen) feedByte(b byte) {
 		case 0x1b:
 			s.state = vtStateOSCEsc
 		default:
-			if len(s.oscBuf) < maxVTSeqBytes {
+			if len(s.oscBuf) < 128<<10 {
 				s.oscBuf = append(s.oscBuf, b)
+			} else {
+				s.oscTooLong = true
 			}
 		}
 
@@ -713,14 +740,33 @@ func (s *VTScreen) exitAltScreen(restoreCur bool) {
 }
 
 func (s *VTScreen) handleOSC() {
+	if s.oscTooLong {
+		return
+	}
 	raw := string(s.oscBuf)
 	codeStr, rest, ok := strings.Cut(raw, ";")
 	if !ok {
 		return
 	}
 	switch codeStr {
+	case "52":
+		selection, encoded, ok := strings.Cut(rest, ";")
+		if !ok || (selection != "" && selection != "c") || encoded == "?" {
+			return
+		}
+		data, err := base64.StdEncoding.DecodeString(encoded)
+		if err == nil && utf8.Valid(data) {
+			s.clipboardWrite = new(string(data))
+		}
 	case "0", "2":
 		s.title = strings.TrimSpace(rest)
+	case "7501":
+		// OSC 7501 ; <json> — Herdr structured program status protocol.
+		var st Status
+		if json.Unmarshal([]byte(strings.TrimSpace(rest)), &st) == nil && st.State != "" {
+			cp := st
+			s.oscStatus = &cp
+		}
 	case "8":
 		// OSC 8 ; params ; URI
 		_, uri, hasURI := strings.Cut(rest, ";")

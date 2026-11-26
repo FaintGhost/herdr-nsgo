@@ -1,11 +1,16 @@
 package main
 
 import (
+	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/nsgo-dev/nsgo/core"
 	"github.com/nsgo-dev/nsgo/nsgotest"
 )
+
+func TestMain(m *testing.M) { nsgotest.Main(m) }
 
 func TestUIChatViewDefaultSwitchExpandAndObserveSafeSend(t *testing.T) {
 	claudeKey := TermKey{InstanceID: "mac", Addr: "t1"}
@@ -92,14 +97,16 @@ func TestUIChatViewDefaultSwitchExpandAndObserveSafeSend(t *testing.T) {
 	if len(h.Query("text:/详细思维链/")) != 0 {
 		t.Fatal("expected thinking body collapsed initially")
 	}
-	h.Press("id:chat-thinking-m1-th-1-0")
+	h.Press("label:思考过程")
 	h.Find("text:/详细思维链/")
 
 	if len(h.Query("text:/session view/")) != 0 {
 		t.Fatal("expected tool output collapsed initially")
 	}
+	h.Find("label:工具已完成")
 	h.Press("id:chat-tool-m1-tg-2-0")
 	h.Find("text:/session view/")
+	h.Screenshot("chat-reading")
 
 	// 3. Typing in composer swaps Interrupt -> Send, and sending in Chat mode preserves SessionTerminal.Observe() == true!
 	st := uiRef.activeTerm.Get()
@@ -225,6 +232,80 @@ func TestUISessionZeroRemountSwitchAndStableHeader(t *testing.T) {
 	// Switch back to Chat -> instant visibility flip, still zero header shift!
 	h.Press("id:session-mode-chat")
 	h.Find("id:chat-surface")
+}
+
+func TestLongMobileComposerStaysWithinScreen(t *testing.T) {
+	h := nsgotest.Start(t, func(cx *core.Scope) core.Node {
+		_, root := testSeededApp(cx)
+		return root
+	}, nsgotest.Size(360, 720))
+	h.Press("id:session-row-mac::t1")
+	const editor = "id:session-composer"
+	short := h.Find(editor).Bounds()
+	draft := strings.Repeat("输入长文本WrapWithoutSpaces", 18)
+	h.Type(editor, draft)
+	v := h.FindMounted(editor)
+	box := v.Bounds()
+	if box.Size.Width > short.Size.Width+1 || box.Origin.X+box.Size.Width > 360 || box.Size.Height <= short.Size.Height || box.Size.Height > 112 || v.Text != draft {
+		t.Fatalf("composer before=%+v after=%+v, draft preserved=%t", short, box, v.Text == draft)
+	}
+	button := h.Find("id:session-send-btn").Bounds()
+	if button.Origin.X+button.Size.Width > 360 || button.Origin.Y+button.Size.Height > 720 {
+		t.Fatalf("send button outside viewport: %+v", button)
+	}
+	h.Resize(360, 480)
+	h.SetEnvironment(core.Environment{OS: core.OSAndroid, Idiom: core.IdiomPhone, KeyboardHeight: 230})
+	h.Press("id:session-upload-btn")
+	h.Press("id:session-expand-composer-btn")
+	box = h.FindMounted(editor).Bounds()
+	if box.Origin.Y < 0 || box.Origin.Y+box.Size.Height > 250 {
+		t.Fatalf("expanded editor extends past keyboard viewport: %+v", box)
+	}
+}
+
+func TestChatImagePasteSurvivesFailedSend(t *testing.T) {
+	h := nsgotest.Start(t, func(cx *core.Scope) core.Node { _, root := testSeededApp(cx); return root }, nsgotest.Size(360, 720))
+	h.Press("id:session-row-mac::t1")
+	h.Paste("id:session-composer", core.PasteEvent{Files: []core.PastedFile{{Name: "screen.png", MIME: "image/png", Data: []byte("png")}}})
+	if len(h.Query("id:chat-image-attachment")) != 1 {
+		t.Fatal("pasted screenshot missing from draft")
+	}
+	h.Press("id:session-send-btn") // offline fixture
+	h.Find("id:chat-image-attachment")
+	h.Press("label:移除附件")
+	h.Find("id:session-interrupt-btn")
+}
+
+func TestChatOpensAtLatestTurn(t *testing.T) {
+	var ctrl *ChatSessionController
+	h := nsgotest.Start(t, func(cx *core.Scope) core.Node {
+		a := NewApp(cx)
+		term := AggregatedTerminal{Key: TermKey{InstanceID: "local", Addr: "t1"}}
+		ctrl = NewChatSessionController(cx, term.Key, nil, nil, nil)
+		// Like a restored snapshot, the turns are available before the viewport mounts.
+		for i := range 36 {
+			id := fmt.Sprintf("turn-%d", i)
+			ctrl.parsedItems = append(ctrl.parsedItems, ChatTurnItem{ID: id, Role: RoleUser, Text: id})
+		}
+		ctrl.rebuildMergedLocked()
+		return RenderChatSession(cx, a, ctrl, func() AggregatedTerminal { return term }, nil)
+	}, nsgotest.Size(390, 600))
+	scroll := h.Find("id:chat-transcript-scroll")
+	end := scroll.Content.Height - scroll.Frame.Size.Height
+	if end <= 0 || scroll.Offset.Y < end-1 {
+		t.Fatalf("opened at y=%.1f, latest turn requires y=%.1f", scroll.Offset.Y, end)
+	}
+	h.ScrollTo("id:chat-transcript-scroll", core.Point{Y: 500})
+	ctrl.AddOptimisticUser("新消息")
+	h.Advance(20 * time.Millisecond)
+	if got := scroll.Offset.Y; got != 500 {
+		t.Fatalf("new turn moved the reader from y=500 to y=%v", got)
+	}
+	ctrl.ScrollToBottom()
+	h.Advance(time.Second)
+	if got := scroll.Content.Height - scroll.Frame.Size.Height - scroll.Offset.Y; got > 1 {
+		t.Fatalf("jump to latest left %v points", got)
+	}
 }
 
 func itoaTest(n int) string {

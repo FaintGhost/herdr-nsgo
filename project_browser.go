@@ -9,7 +9,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nsgo-dev/nsgo/base/textview"
 	"github.com/nsgo-dev/nsgo/core"
+	"github.com/nsgo-dev/nsgo/ui"
+	"github.com/nsgo-dev/nsgo/ui/diff"
 )
 
 // Pass the path as argv. The host's current directory is the session root on
@@ -135,6 +138,7 @@ func projectSheet(cx *core.Scope, a *App, t AggregatedTerminal, close func()) co
 			return core.Style{Color: a.paletteOf(cx).Text, FontFamily: core.FontMonospace, FontSize: Tokens.FontMonoMeta}
 		}}
 	}
+	highlighter := newAppHighlighter(cx)
 	var tabs []core.Node
 	for _, tab := range []struct{ key, title string }{{"files", "文件"}, {"changes", "工作区"}, {"staged", "暂存区"}} {
 		tabs = append(tabs, FilterPill(cx, a, "project-"+tab.key, func() string { return tab.title }, func() bool { return loc.Get().view == tab.key }, nil, func() { history = nil; load(projectLocation{relative: ".", view: tab.key}) }))
@@ -184,22 +188,86 @@ func projectSheet(cx *core.Scope, a *App, t AggregatedTerminal, close func()) co
 						return (p.Directory && len(p.Entries) == 0) || p.Text != ""
 					},
 					Then: func(cx *core.Scope) core.Node {
-						return GroupCard(cx, a, "", []core.Node{
-							core.View{
-								Style: core.Style{Padding: core.All(core.Points(12))},
-								Children: []core.Node{
-									label(func() string {
-										if s := msg.Get(); s != "" {
-											return s
-										}
-										p := page.Get()
-										if p.Directory && len(p.Entries) == 0 {
-											return "空目录"
-										}
-										return p.Text
-									}),
+						return core.Dynamic(func(cx *core.Scope) core.Node {
+							if s := msg.Get(); s != "" {
+								return GroupCard(cx, a, "", []core.Node{
+									core.View{Style: core.Style{Padding: core.All(core.Points(12))}, Children: []core.Node{label(func() string { return msg.Get() })}},
+								})
+							}
+							p := page.Get()
+							curLoc := loc.Get()
+							if p.Directory && len(p.Entries) == 0 {
+								return GroupCard(cx, a, "", []core.Node{
+									core.View{Style: core.Style{Padding: core.All(core.Points(12))}, Children: []core.Node{label(func() string { return "空目录" })}},
+								})
+							}
+							// Syntax-highlighted unified git diff view for changes / staged tabs!
+							if curLoc.view != "files" && p.Text != "" && p.Text != "没有差异" && (strings.Contains(p.Text, "diff --git ") || strings.Contains(p.Text, "@@ ")) {
+								return GroupCard(cx, a, "", []core.Node{
+									core.View{
+										TestID: "project-diff-view",
+										Style:  core.Style{Padding: core.All(core.Points(6))},
+										Children: []core.Node{
+											diff.View{
+												Patch:      func() string { return page.Get().Text },
+												Unified:    true,
+												SoftWrap:   true,
+												Selectable: true,
+												FontSize:   Tokens.FontMonoMeta,
+												LineHeight: 18,
+											},
+										},
+									},
+								})
+							}
+							// Syntax-highlighted source file viewer when viewing a recognized code/config file!
+							if curLoc.view == "files" && !p.Directory && p.Text != "" {
+								lang := langFromFilePath(curLoc.relative)
+								if lang == "" {
+									lang = inferCodeLanguage(p.Text)
+								}
+								if lang != "" {
+									return GroupCard(cx, a, "", []core.Node{
+										core.View{
+											TestID: "project-code-view",
+											Style:  core.Style{Padding: core.All(core.Points(4))},
+											Children: []core.Node{
+												ui.TextView{
+													MarkdownFunc: func() string { return fencedCodeMarkdown(lang, page.Get().Text) },
+													Highlighter:  highlighter,
+													Selectable:   true,
+													Options:      textview.Options{NoMath: true, NoHTML: true},
+													StyleOf: func(part textview.Part) core.Style {
+														pal := a.paletteOf(cx)
+														switch part {
+														case textview.PartRoot:
+															return core.Style{Gap: 0}
+														case textview.PartCodeBlock:
+															return core.Style{Background: pal.Surface, BorderWidth: 0, CornerRadius: Tokens.RadiusKey}
+														case textview.PartCodeBlockScroll:
+															return core.Style{Padding: core.Symmetric(10, 12)}
+														case textview.PartCodeBlockCode:
+															return core.Style{FontSize: Tokens.FontMonoMeta, LineHeight: 18, FontFamily: a.MonoFontFamily()}
+														}
+														return core.Style{}
+													},
+													CodeBlockActions: []textview.CodeAction{
+														{ID: textview.CopyAction, Label: "复制"},
+													},
+												},
+											},
+										},
+									})
+								}
+							}
+							return GroupCard(cx, a, "", []core.Node{
+								core.View{
+									Style: core.Style{Padding: core.All(core.Points(12))},
+									Children: []core.Node{
+										label(func() string { return page.Get().Text }),
+									},
 								},
-							},
+							})
 						})
 					},
 				},

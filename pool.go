@@ -158,16 +158,48 @@ func AggregateTerminals(snaps []InstanceSnapshot) []AggregatedTerminal {
 	return out
 }
 
-// alertTracker computes deduplicated NeedsYou notification diffs over AggregateTerminals snapshots.
+// alertTracker computes deduplicated NeedsYou and completion-report notification diffs over AggregateTerminals snapshots.
 // First sight of an instance/terminal seeds silently so reconnecting doesn't spam stale alerts.
 type alertTracker struct {
-	mu     sync.Mutex
-	seeded bool
-	seen   map[string]string // canonical terminal identity -> last status signature
+	mu        sync.Mutex
+	seeded    bool
+	seen      map[string]string // canonical terminal identity -> last status signature
+	lastState map[string]string // canonical terminal identity -> previous StateWord
 }
 
 func newAlertTracker() *alertTracker {
-	return &alertTracker{seen: make(map[string]string)}
+	return &alertTracker{
+		seen:      make(map[string]string),
+		lastState: make(map[string]string),
+	}
+}
+
+// isExplicitCompletionTerminal reports whether a terminal carries an explicit agent completion report.
+func isExplicitCompletionTerminal(t Terminal) bool {
+	if t.NeedsYou() {
+		return false
+	}
+	if t.Status != nil && t.Status.State == "done" {
+		return true
+	}
+	return t.Finished() && IsAgentTerminal(t)
+}
+
+// completionSignature uniquely identifies one completion event so reading/acknowledging it stays dismissed
+// until the terminal runs a newer turn or reports a new completion message.
+func completionSignature(t Terminal) string {
+	var statusMS, finMS uint64
+	if t.StatusMS != nil {
+		statusMS = *t.StatusMS
+	}
+	if t.FinishedMS != nil {
+		finMS = *t.FinishedMS
+	}
+	msg := ""
+	if t.Status != nil {
+		msg = strings.TrimSpace(t.Status.Msg)
+	}
+	return fmt.Sprintf("done:%d:%d:%s:%s", statusMS, finMS, t.StateWord(), msg)
 }
 
 func (tr *alertTracker) diff(snaps []InstanceSnapshot, agg []AggregatedTerminal) []AggregatedTerminal {
@@ -182,27 +214,45 @@ func (tr *alertTracker) diff(snaps []InstanceSnapshot, agg []AggregatedTerminal)
 			id = it.CoreID + "::" + it.Key.Addr
 		}
 		active[id] = true
-		if it.Terminal.NeedsYou() {
+		curState := it.Terminal.StateWord()
+		prevState := tr.lastState[id]
+
+		switch {
+		case it.Terminal.NeedsYou():
 			msg := ""
 			kind := ""
 			if it.Terminal.Status != nil {
 				msg = it.Terminal.Status.Msg
 				kind = it.Terminal.Status.Kind
 			}
-			sig := fmt.Sprintf("%s:%s:%s", it.Terminal.StateWord(), kind, msg)
+			sig := fmt.Sprintf("%s:%s:%s", curState, kind, msg)
 			if tr.seen[id] != sig {
 				tr.seen[id] = sig
 				if tr.seeded {
 					alerts = append(alerts, it)
 				}
 			}
-		} else {
+		case isExplicitCompletionTerminal(it.Terminal) || (prevState == "working" && (curState == "idle" || curState == "done")):
+			sig := completionSignature(it.Terminal)
+			if tr.seen[id] != sig {
+				tr.seen[id] = sig
+				if tr.seeded {
+					alerts = append(alerts, it)
+				}
+			}
+		case curState == "working":
 			delete(tr.seen, id)
 		}
+		tr.lastState[id] = curState
 	}
 	for id := range tr.seen {
 		if !active[id] {
 			delete(tr.seen, id)
+		}
+	}
+	for id := range tr.lastState {
+		if !active[id] {
+			delete(tr.lastState, id)
 		}
 	}
 	tr.seeded = true
@@ -407,6 +457,7 @@ type coreWorker struct {
 	machines    []MachineView
 	templates   []Template
 	terminals   map[string]Terminal
+	revision    uint64 // Changes to terminal membership or state since the last RPC began.
 	termOrder   []string
 	notified    map[string]string // addr -> last notified state+msg key
 }
@@ -510,6 +561,7 @@ func (p *CorePool) WakeAll() {
 		c := w.client
 		w.mu.Unlock()
 		if c != nil {
+			w.triggerResync()
 			go func(client *Client) {
 				if !client.Ping(500 * time.Millisecond) {
 					_ = client.Close()
@@ -536,6 +588,16 @@ func (p *CorePool) ReconnectInstance(instanceID string) {
 	select {
 	case w.wakeCh <- struct{}{}:
 	default:
+	}
+}
+
+// RefreshInstance reconciles a stale address without dropping open streams.
+func (p *CorePool) RefreshInstance(id string) {
+	p.mu.Lock()
+	w := p.workers[id]
+	p.mu.Unlock()
+	if w != nil {
+		w.triggerResync()
 	}
 }
 
@@ -668,7 +730,18 @@ func (w *coreWorker) run(ctx context.Context) {
 		}
 
 		c := NewClient(rw)
-		c.OnEvent(func(ev Event) { w.applyEvent(ctx, c, ev) })
+		var initMu sync.Mutex
+		var pending []Event
+		ready := false
+		c.OnEvent(func(ev Event) {
+			initMu.Lock()
+			defer initMu.Unlock()
+			if !ready {
+				pending = append(pending, ev)
+				return
+			}
+			w.applyEvent(ctx, c, ev)
+		})
 
 		hctx, hcancel := context.WithTimeout(ctx, 20*time.Second)
 		hello, err := c.HelloFramed(hctx)
@@ -717,6 +790,13 @@ func (w *coreWorker) run(ctx context.Context) {
 		}
 		w.replaceTerminalsLocked(sub.Terminals)
 		w.mu.Unlock()
+		initMu.Lock()
+		for _, ev := range pending {
+			w.applyEvent(ctx, c, ev)
+		}
+		pending = nil
+		ready = true
+		initMu.Unlock()
 		w.pool.emitChange()
 
 		// Fetch templates (and retry machines if initial call timed out) asynchronously.
@@ -819,6 +899,11 @@ func (w *coreWorker) triggerResync() {
 
 func (w *coreWorker) applyEvent(ctx context.Context, c *Client, ev Event) {
 	w.mu.Lock()
+	if w.client != c {
+		w.mu.Unlock()
+		return
+	}
+	w.revision++
 	switch ev.Type {
 	case "created":
 		var t Terminal
@@ -844,12 +929,27 @@ func (w *coreWorker) applyEvent(ctx context.Context, c *Client, ev Event) {
 		delete(w.notified, ev.Terminal)
 	case "status":
 		if t, ok := w.terminals[ev.Terminal]; ok {
-			var st Status
-			if json.Unmarshal(ev.Data, &st) == nil && st.State != "" {
-				t.Status = &st
-				t.State = st.State
-				w.terminals[ev.Terminal] = t
+			var payload struct {
+				Status *Status `json:"status"`
+				State  string  `json:"state"`
 			}
+			if json.Unmarshal(ev.Data, &payload) != nil {
+				w.mu.Unlock()
+				w.triggerResync()
+				return
+			}
+			st := payload.Status
+			if st == nil && payload.State != "" {
+				st = new(Status)
+				_ = json.Unmarshal(ev.Data, st)
+			}
+			if st == nil || st.State == "" {
+				w.mu.Unlock()
+				w.triggerResync()
+				return
+			}
+			t.Status = st
+			w.terminals[ev.Terminal] = t
 		} else {
 			w.mu.Unlock()
 			w.triggerResync()
@@ -869,8 +969,9 @@ func (w *coreWorker) applyEvent(ctx context.Context, c *Client, ev Event) {
 		return
 	default:
 		if ev.Terminal != "" {
+			revision := w.revision
 			w.mu.Unlock()
-			go w.refreshOne(ctx, c, ev.Terminal)
+			go w.refreshOne(ctx, c, ev.Terminal, revision)
 			return
 		}
 	}
@@ -879,7 +980,7 @@ func (w *coreWorker) applyEvent(ctx context.Context, c *Client, ev Event) {
 	w.pool.emitChange()
 }
 
-func (w *coreWorker) refreshOne(ctx context.Context, c *Client, addr string) {
+func (w *coreWorker) refreshOne(ctx context.Context, c *Client, addr string, revision uint64) {
 	rctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	t, err := c.Get(rctx, addr)
@@ -887,10 +988,20 @@ func (w *coreWorker) refreshOne(ctx context.Context, c *Client, addr string) {
 		return
 	}
 	w.mu.Lock()
+	if w.client != c {
+		w.mu.Unlock()
+		return
+	}
+	if w.revision != revision {
+		w.mu.Unlock()
+		w.triggerResync()
+		return
+	}
 	if _, ok := w.terminals[addr]; !ok {
 		w.termOrder = append(w.termOrder, addr)
 	}
 	w.terminals[addr] = t
+	w.revision++
 	w.mu.Unlock()
 	w.pool.emitChange()
 }
@@ -898,12 +1009,25 @@ func (w *coreWorker) refreshOne(ctx context.Context, c *Client, addr string) {
 func (w *coreWorker) resync(ctx context.Context, c *Client) {
 	rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+	w.mu.Lock()
+	revision := w.revision
+	w.mu.Unlock()
 	list, err := c.List(rctx, true)
 	if err != nil {
 		return
 	}
 	machines, _ := c.Machines(rctx)
 	w.mu.Lock()
+	if w.client != c {
+		w.mu.Unlock()
+		return
+	}
+	if revision != w.revision {
+		w.mu.Unlock()
+		w.triggerResync()
+		return
+	}
+	w.revision++
 	w.replaceTerminalsLocked(list.Terminals)
 	if machines != nil {
 		w.machines = machines

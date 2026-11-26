@@ -103,6 +103,55 @@ func fakeFramedServer(t *testing.T, srv net.Conn, onRPC func(method string, para
 	}()
 }
 
+func TestFramedEventLinesAndCredit(t *testing.T) {
+	conn, srv := net.Pipe()
+	client := NewClient(conn)
+	defer client.Close()
+	const channel = 7
+	credits := make(chan uint32, 4)
+	fakeFramedServer(t, srv, func(_ string, _ json.RawMessage, write func(uint32, FrameKind, []byte)) (any, error) {
+		// Arrival before the subscribe reply, one split status and two events in one DATA frame.
+		write(channel, FrameData, []byte(`{"method":"event","params":{"type":"sta`))
+		batch := []byte("tus\",\"terminal\":\"mac/t1\"}}\n{\"method\":\"event\",\"params\":{\"type\":\"removed\",\"terminal\":\"mac/t2\"}}\n")
+		write(channel, FrameData, append(batch, bytes.Repeat([]byte{'\n'}, 32<<10)...))
+		return map[string]any{"channel": channel}, nil
+	}, func(ch uint32, kind FrameKind, body []byte) {
+		if ch == channel && kind == FrameCredit {
+			credits <- binary.LittleEndian.Uint32(body)
+		}
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	events := make(chan Event, 4)
+	client.OnEvent(func(ev Event) { events <- ev })
+	if _, err := client.HelloFramed(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Subscribe(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"status:mac/t1", "removed:mac/t2"} {
+		select {
+		case ev := <-events:
+			if ev.Type+":"+ev.Terminal != want {
+				t.Fatalf("event = %+v, want %s", ev, want)
+			}
+		case <-ctx.Done():
+			t.Fatal("missing event", want)
+		}
+	}
+	for range 2 {
+		select {
+		case n := <-credits:
+			if n < 32<<10 {
+				t.Fatalf("credit = %d", n)
+			}
+		case <-ctx.Done():
+			t.Fatal("missing event channel credit")
+		}
+	}
+}
+
 func TestFramedMuxRoundTripAndAttach(t *testing.T) {
 	cliConn, srvConn := net.Pipe()
 	defer cliConn.Close()

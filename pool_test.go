@@ -113,6 +113,16 @@ func TestInlineApprovalWhitelist(t *testing.T) {
 			wantAllow: true,
 		},
 		{
+			name:      "antigravity permission allowed",
+			term:      Terminal{State: "blocked", Status: &Status{State: "blocked", Kind: "permission", App: "antigravity"}},
+			wantAllow: true,
+		},
+		{
+			name:      "agy permission allowed",
+			term:      Terminal{State: "blocked", Status: &Status{State: "blocked", Kind: "permission", App: "agy"}},
+			wantAllow: true,
+		},
+		{
 			name:      "unknown app permission rejected",
 			term:      Terminal{State: "blocked", Status: &Status{State: "blocked", Kind: "permission", App: "mystery-cli"}},
 			wantAllow: false,
@@ -242,7 +252,7 @@ pushBlocked:
 	if fn == nil {
 		t.Fatal("pushEvent not registered")
 	}
-	data, _ := json.Marshal(Status{State: "blocked", Kind: "permission", App: "claude", Msg: "Allow git push?"})
+	data, _ := json.Marshal(map[string]any{"reported": true, "status": Status{State: "blocked", Kind: "permission", App: "claude", Msg: "Allow git push?"}})
 	fn(Event{Type: "status", Terminal: "t1", Seq: 2, Data: data})
 
 	deadline2 := time.After(3 * time.Second)

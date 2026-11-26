@@ -337,15 +337,15 @@ func TestDogfoodFixEmptyStateTransitionsOutOfLoadingWhenZeroItems(t *testing.T) 
 	}, nsgotest.Size(390, 844))
 
 	h.Press("id:session-row-mac::t1")
-	// While initial sync is still blocked, "正在同步会话记录…" is displayed.
-	h.Find("text:正在同步会话记录…")
+	// The placeholder stays visible until the initial transcript read completes.
+	h.Find("id:chat-history-skeleton")
 
 	// Unblock sync -> resolves 0 items (SourceVTFallback with empty screen).
 	close(blockCh)
 	_ = uiRef.activeChat.Get().RefreshSync(t.Context())
 	h.Press("id:chat-source-pill")
 
-	if len(h.Query("text:正在同步会话记录…")) != 0 {
+	if len(h.Query("id:chat-history-skeleton")) != 0 {
 		t.Fatal("Chat View stayed stuck on '正在同步会话记录…' after Source left SourceLoading with 0 items!")
 	}
 	h.Find("text:当前暂无结构化对话记录")

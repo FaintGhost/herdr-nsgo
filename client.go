@@ -2,9 +2,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -68,7 +70,7 @@ func (e *RPCError) Remediation() string {
 		return "操作被取消（可能有别人同时在操作这个终端）。重试一次。"
 	}
 	if e.Message != "" {
-		return "检查连接后重试；仍失败就检查远端 hc server 状态。"
+		return fmt.Sprintf("%s（RPC %d）：%s", e.Method, e.Code, e.Error())
 	}
 	return "检查连接后重试。"
 }
@@ -76,17 +78,17 @@ func (e *RPCError) Remediation() string {
 // Client speaks JSON-RPC 2.0 with a core: newline-delimited before hello,
 // and optionally 9-byte LE binary framed after HelloFramed.
 type Client struct {
-	rw       io.ReadWriteCloser
-	enc      *json.Encoder
-	writeMu  sync.Mutex
-	nextID   atomic.Int64
-	framed   atomic.Bool
-	helloID  atomic.Int64 // request ID expecting framed upgrade
+	rw      io.ReadWriteCloser
+	enc     *json.Encoder
+	writeMu sync.Mutex
+	nextID  atomic.Int64
+	framed  atomic.Bool
+	helloID atomic.Int64 // request ID expecting framed upgrade
 
 	mu          sync.Mutex
 	pending     map[int64]chan reply
 	streams     map[uint32]*AttachStream
-	eventChans  map[uint32]bool
+	eventChans  map[uint32]chan queuedFrame
 	earlyFrames map[uint32][]queuedFrame
 	events      func(Event)
 	closed      chan struct{}
@@ -106,7 +108,7 @@ func NewClient(rw io.ReadWriteCloser) *Client {
 		enc:         json.NewEncoder(rw),
 		pending:     make(map[int64]chan reply),
 		streams:     make(map[uint32]*AttachStream),
-		eventChans:  make(map[uint32]bool),
+		eventChans:  make(map[uint32]chan queuedFrame),
 		earlyFrames: make(map[uint32][]queuedFrame),
 		closed:      make(chan struct{}),
 	}
@@ -157,10 +159,9 @@ func (c *Client) readLoop() {
 
 func (c *Client) dispatchStreamFrame(ch uint32, kind FrameKind, body []byte) {
 	c.mu.Lock()
-	isEventChan := c.eventChans[ch]
+	events := c.eventChans[ch]
 	stream := c.streams[ch]
-	evFn := c.events
-	if !isEventChan && stream == nil {
+	if events == nil && stream == nil {
 		// Frames on a freshly opened channel can arrive before Attach/Subscribe
 		// finishes decoding its JSON-RPC reply; buffer them briefly so initial paint is never lost.
 		if len(c.earlyFrames[ch]) < 64 {
@@ -171,14 +172,84 @@ func (c *Client) dispatchStreamFrame(ch uint32, kind FrameKind, body []byte) {
 	}
 	c.mu.Unlock()
 
-	if isEventChan {
-		if kind == FrameData && len(body) > 0 && evFn != nil {
-			c.deliverEventJSON(body, evFn)
+	if events != nil {
+		select {
+		case events <- queuedFrame{kind: kind, body: body}:
+		case <-c.closed:
 		}
 		return
 	}
 	if stream != nil {
 		stream.deliver(kind, body)
+	}
+}
+
+// readEvents consumes the subscription in wire order. JSON lines can share a
+// DATA frame or span frames. CREDIT counts bytes, independently of line breaks.
+func (c *Client) readEvents(ch uint32, early []queuedFrame, frames <-chan queuedFrame) {
+	const window = 64 << 10
+	grant := func(n uint32) bool {
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], n)
+		return c.writeFrame(ch, FrameCredit, b[:]) == nil
+	}
+	if !grant(window) {
+		_ = c.Close()
+		return
+	}
+	var tail []byte
+	var consumed uint32
+	for {
+		var f queuedFrame
+		if len(early) > 0 {
+			f, early = early[0], early[1:]
+		} else {
+			select {
+			case <-c.closed:
+				return
+			case f = <-frames:
+			}
+		}
+		if f.kind == FrameClose {
+			_ = c.Close()
+			return
+		}
+		if f.kind != FrameData {
+			continue
+		}
+		consumed += uint32(len(f.body))
+		if consumed >= window/2 {
+			if !grant(consumed) {
+				_ = c.Close()
+				return
+			}
+			consumed = 0
+		}
+		c.mu.Lock()
+		fn := c.events
+		c.mu.Unlock()
+		tail = append(tail, f.body...)
+		for {
+			line, rest, ok := bytes.Cut(tail, []byte{'\n'})
+			if !ok {
+				break
+			}
+			if fn != nil && len(line) > 0 {
+				c.deliverEventJSON(line, fn)
+			}
+			tail = rest
+		}
+		// Older cores can send a complete object without a trailing newline.
+		if len(tail) > 0 && json.Valid(tail) {
+			if fn != nil {
+				c.deliverEventJSON(tail, fn)
+			}
+			tail = nil
+		}
+		if len(tail) > maxFramePayload {
+			_ = c.Close()
+			return
+		}
 	}
 }
 
@@ -570,19 +641,14 @@ func (c *Client) Subscribe(ctx context.Context) (SubscribeResult, error) {
 	var out SubscribeResult
 	err := c.Call(ctx, "events.subscribe", map[string]any{}, &out)
 	if err == nil && out.Channel != nil {
+		ch := *out.Channel
+		frames := make(chan queuedFrame, 64)
 		c.mu.Lock()
-		c.eventChans[*out.Channel] = true
-		early := c.earlyFrames[*out.Channel]
-		delete(c.earlyFrames, *out.Channel)
-		evFn := c.events
+		early := c.earlyFrames[ch]
+		delete(c.earlyFrames, ch)
+		c.eventChans[ch] = frames
 		c.mu.Unlock()
-		if evFn != nil {
-			for _, f := range early {
-				if f.kind == FrameData && len(f.body) > 0 {
-					c.deliverEventJSON(f.body, evFn)
-				}
-			}
-		}
+		go c.readEvents(ch, early, frames)
 	}
 	return out, err
 }
@@ -590,7 +656,9 @@ func (c *Client) Subscribe(ctx context.Context) (SubscribeResult, error) {
 // PutFile uploads bytes beside a live terminal using 64 KiB chunked RPCs when framed,
 // or single-shot terminal.put on unframed links, returning the remote absolute path.
 func (c *Client) PutFile(ctx context.Context, addr, name string, data []byte) (PutResult, error) {
-	if !c.framed.Load() {
+	// put_begin is core-local. terminal.put routes machine/tN to the owner.
+	on, _ := SplitMachineAddr(addr)
+	if !c.framed.Load() || on != "" {
 		var out PutResult
 		err := c.Call(ctx, "terminal.put", map[string]any{
 			"terminal": addr,

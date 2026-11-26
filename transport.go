@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -16,7 +17,8 @@ import (
 // answers and notifications.
 type conn struct {
 	io.ReadWriteCloser
-	closers []func() error
+	dialPreview func(context.Context, string, string) (net.Conn, error)
+	closers     []func() error
 }
 
 func (c *conn) Close() error {
@@ -74,6 +76,7 @@ func dialSSH(h Host, tofu *TOFUStore) (io.ReadWriteCloser, error) {
 	}
 	return &conn{
 		ReadWriteCloser: readWrite{stdout, stdin},
+		dialPreview:     client.DialContext,
 		closers:         []func() error{sess.Close, client.Close},
 	}, nil
 }
@@ -169,6 +172,7 @@ func dialLocal() (io.ReadWriteCloser, error) {
 	}
 	return &conn{
 		ReadWriteCloser: readWrite{stdout, stdin},
+		dialPreview:     (&net.Dialer{}).DialContext,
 		closers:         []func() error{cmd.Process.Kill, func() error { return cmd.Wait() }},
 	}, nil
 }

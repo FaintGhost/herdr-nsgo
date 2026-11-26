@@ -24,6 +24,7 @@ type TranscriptFormat string
 
 const (
 	FormatClaude      TranscriptFormat = "claude"
+	FormatPi          TranscriptFormat = "pi"
 	FormatPiOmp       TranscriptFormat = "pi-omp"
 	FormatCodex       TranscriptFormat = "codex"
 	FormatAntigravity TranscriptFormat = "antigravity"
@@ -55,6 +56,7 @@ type ChatToolCall struct {
 	InputSummary string `json:"input_summary,omitempty"`
 	Output       string `json:"output,omitempty"`
 	IsError      bool   `json:"is_error,omitempty"`
+	HasResult    bool   `json:"has_result,omitzero"`
 	DiffFile     string `json:"diff_file,omitempty"`
 	DiffOld      string `json:"diff_old,omitempty"`
 	DiffNew      string `json:"diff_new,omitempty"`
@@ -68,16 +70,18 @@ func (tc ChatToolCall) HasDiff() bool {
 
 // ChatTurnItem is the immutable normalized view-model item rendered by screen_chat.go.
 type ChatTurnItem struct {
-	ID         string
-	Role       ChatRole
-	Text       string
-	FromAgent  string
-	Model      string
-	App        string
-	Blocks     []MarkdownBlock
-	Tools      []ChatToolCall
-	Optimistic bool
-	SourceLine int // 1-based file line number where this item originated (0 for VT/optimistic)
+	ID           string
+	Role         ChatRole
+	Text         string
+	FromAgent    string
+	Model        string
+	Effort       string
+	App          string
+	Blocks       []MarkdownBlock
+	Tools        []ChatToolCall
+	DeliveryMode string `json:",omitempty"`
+	Optimistic   bool
+	SourceLine   int // 1-based file line number where this item originated (0 for VT/optimistic)
 }
 
 const maxSafeJSONLLineBytes = 512 * 1024
@@ -689,8 +693,10 @@ func ParseTranscriptLinesAt(format TranscriptFormat, lines []string, firstLine i
 	switch format {
 	case FormatClaude:
 		return parseClaudeJSONLAt(lines, firstLine)
+	case FormatPi:
+		return parsePiOmpJSONLAt(lines, firstLine, "pi")
 	case FormatPiOmp:
-		return parsePiOmpJSONLAt(lines, firstLine)
+		return parsePiOmpJSONLAt(lines, firstLine, "omp")
 	case FormatCodex:
 		return parseCodexJSONLAt(lines, firstLine)
 	case FormatAntigravity:
@@ -732,6 +738,7 @@ func attachToolResult(items []ChatTurnItem, toolIdx map[string][2]int, callID, o
 	if !ok || loc[0] >= len(items) || loc[1] >= len(items[loc[0]].Tools) {
 		return false
 	}
+	items[loc[0]].Tools[loc[1]].HasResult = true
 	items[loc[0]].Tools[loc[1]].Output = truncateToolOutput(output)
 	if isErr {
 		items[loc[0]].Tools[loc[1]].IsError = true
@@ -929,13 +936,14 @@ func extractClaudeToolResultContent(raw json.RawMessage) string {
 // 2. OMP & Pi (~/.omp/agent/sessions/*/*.jsonl & ~/.pi/agent/sessions/*/*.jsonl)
 
 func ParsePiOmpJSONL(lines []string) []ChatTurnItem {
-	return parsePiOmpJSONLAt(lines, 1)
+	return parsePiOmpJSONLAt(lines, 1, "omp")
 }
 
-func parsePiOmpJSONLAt(lines []string, firstLine int) []ChatTurnItem {
+func parsePiOmpJSONLAt(lines []string, firstLine int, app string) []ChatTurnItem {
 	var items []ChatTurnItem
 	toolIdx := make(map[string][2]int)
 	baseIdx := firstLine - 1
+	curEffort := ""
 
 	for lineNo, raw := range lines {
 		raw = strings.TrimSpace(raw)
@@ -947,9 +955,11 @@ func parsePiOmpJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 		srcLine := absIdx + 1
 
 		var env struct {
-			Type    string `json:"type"`
-			ID      string `json:"id"`
-			Message struct {
+			Type          string `json:"type"`
+			ID            string `json:"id"`
+			ThinkingLevel string `json:"thinkingLevel"`
+			Level         string `json:"level"`
+			Message       struct {
 				Role       string          `json:"role"`
 				Model      string          `json:"model"`
 				ToolCallID string          `json:"toolCallId"`
@@ -958,7 +968,16 @@ func parsePiOmpJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 				Content    json.RawMessage `json:"content"`
 			} `json:"message"`
 		}
-		if json.Unmarshal([]byte(raw), &env) != nil || env.Type != "message" {
+		if json.Unmarshal([]byte(raw), &env) != nil {
+			continue
+		}
+		if env.Type == "thinking_level_change" {
+			if lv := nonEmpty(strings.TrimSpace(env.ThinkingLevel), strings.TrimSpace(env.Level)); lv != "" {
+				curEffort = lv
+			}
+			continue
+		}
+		if env.Type != "message" {
 			continue
 		}
 		rowID := nonEmpty(env.ID, fmt.Sprintf("omp-%d", absIdx))
@@ -992,7 +1011,8 @@ func parsePiOmpJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 						Role:       RoleAssistant,
 						Text:       s,
 						Model:      env.Message.Model,
-						App:        "omp",
+						Effort:     curEffort,
+						App:        app,
 						Blocks:     SplitMarkdownBlocks(s),
 						SourceLine: srcLine,
 					})
@@ -1008,7 +1028,8 @@ func parsePiOmpJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 							Role:       RoleThinking,
 							Text:       th,
 							Model:      env.Message.Model,
-							App:        "omp",
+							Effort:     curEffort,
+							App:        app,
 							SourceLine: srcLine,
 						})
 					}
@@ -1021,7 +1042,8 @@ func parsePiOmpJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 							Role:       RoleAssistant,
 							Text:       txt,
 							Model:      env.Message.Model,
-							App:        "omp",
+							Effort:     curEffort,
+							App:        app,
 							Blocks:     SplitMarkdownBlocks(txt),
 							SourceLine: srcLine,
 						})
@@ -1077,6 +1099,7 @@ func parseCodexJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 	var items []ChatTurnItem
 	toolIdx := make(map[string][2]int)
 	curModel := ""
+	curEffort := ""
 	baseIdx := firstLine - 1
 
 	for lineNo, raw := range lines {
@@ -1097,10 +1120,17 @@ func parseCodexJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 		}
 		if env.Type == "turn_context" {
 			var tc struct {
-				Model string `json:"model"`
+				Model           string `json:"model"`
+				Effort          string `json:"effort"`
+				ReasoningEffort string `json:"reasoning_effort"`
 			}
-			if json.Unmarshal(env.Payload, &tc) == nil && tc.Model != "" {
-				curModel = tc.Model
+			if json.Unmarshal(env.Payload, &tc) == nil {
+				if tc.Model != "" {
+					curModel = tc.Model
+				}
+				if eff := nonEmpty(strings.TrimSpace(tc.Effort), strings.TrimSpace(tc.ReasoningEffort)); eff != "" {
+					curEffort = eff
+				}
 			}
 			continue
 		}
@@ -1154,6 +1184,7 @@ func parseCodexJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 					Role:       RoleAssistant,
 					Text:       txt,
 					Model:      curModel,
+					Effort:     curEffort,
 					App:        "codex",
 					Blocks:     SplitMarkdownBlocks(txt),
 					SourceLine: srcLine,
@@ -1172,6 +1203,7 @@ func parseCodexJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 					Role:       RoleThinking,
 					Text:       strings.Join(parts, "\n"),
 					Model:      curModel,
+					Effort:     curEffort,
 					App:        "codex",
 					SourceLine: srcLine,
 				})
@@ -1239,14 +1271,18 @@ func parseAntigravityJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 		srcLine := absIdx + 1
 
 		var row struct {
-			StepIndex int    `json:"step_index"`
-			Source    string `json:"source"`
-			Type      string `json:"type"`
-			Status    string `json:"status"`
-			Model     string `json:"model"`
-			Thinking  string `json:"thinking"`
-			Content   string `json:"content"`
-			ToolCalls []struct {
+			StepIndex       int    `json:"step_index"`
+			Source          string `json:"source"`
+			Type            string `json:"type"`
+			Status          string `json:"status"`
+			Model           string `json:"model"`
+			Effort          string `json:"effort"`
+			EffortLevel     string `json:"effort_level"`
+			ThinkingLevel   string `json:"thinking_level"`
+			ReasoningEffort string `json:"reasoning_effort"`
+			Thinking        string `json:"thinking"`
+			Content         string `json:"content"`
+			ToolCalls       []struct {
 				Name string          `json:"name"`
 				Args json.RawMessage `json:"args"`
 			} `json:"tool_calls"`
@@ -1271,12 +1307,24 @@ func parseAntigravityJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 			}
 		case "PLANNER_RESPONSE":
 			pendingToolRefs = nil
+			cleanModel, modelEffort := splitModelAndEffort(row.Model)
+			eff := nonEmpty(
+				strings.TrimSpace(row.Effort),
+				nonEmpty(
+					strings.TrimSpace(row.EffortLevel),
+					nonEmpty(
+						strings.TrimSpace(row.ThinkingLevel),
+						nonEmpty(strings.TrimSpace(row.ReasoningEffort), modelEffort),
+					),
+				),
+			)
 			if th := strings.TrimSpace(row.Thinking); th != "" {
 				items = append(items, ChatTurnItem{
 					ID:         rowID + "-th",
 					Role:       RoleThinking,
 					Text:       th,
-					Model:      row.Model,
+					Model:      cleanModel,
+					Effort:     eff,
 					App:        "antigravity",
 					SourceLine: srcLine,
 				})
@@ -1286,7 +1334,8 @@ func parseAntigravityJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 					ID:         rowID + "-txt",
 					Role:       RoleAssistant,
 					Text:       txt,
-					Model:      row.Model,
+					Model:      cleanModel,
+					Effort:     eff,
 					App:        "antigravity",
 					Blocks:     SplitMarkdownBlocks(txt),
 					SourceLine: srcLine,
@@ -1305,6 +1354,7 @@ func parseAntigravityJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 				loc := pendingToolRefs[0]
 				pendingToolRefs = pendingToolRefs[1:]
 				if loc[0] < len(items) && loc[1] < len(items[loc[0]].Tools) {
+					items[loc[0]].Tools[loc[1]].HasResult = true
 					items[loc[0]].Tools[loc[1]].Output = truncateToolOutput(row.Content)
 					stUpper := strings.ToUpper(strings.TrimSpace(row.Status))
 					failedExit := strings.Contains(row.Content, "Command exited with code ") && !strings.Contains(row.Content, "Command exited with code 0")
@@ -1451,4 +1501,189 @@ func nonEmpty(a, b string) string {
 		return a
 	}
 	return b
+}
+
+// ContextUsage summarizes the most recent turn's token footprint against the estimated model context window.
+type ContextUsage struct {
+	ContextTokens int
+	OutputTokens  int
+	WindowTokens  int
+	Model         string
+}
+
+// Valid reports whether meaningful token usage data was found.
+func (u ContextUsage) Valid() bool {
+	return u.ContextTokens > 0
+}
+
+// Ratio returns context utilization in [0, 1+].
+func (u ContextUsage) Ratio() float64 {
+	if u.ContextTokens <= 0 || u.WindowTokens <= 0 {
+		return 0
+	}
+	return float64(u.ContextTokens) / float64(u.WindowTokens)
+}
+
+// Label returns a compact human-readable badge like "64k · 32%".
+func (u ContextUsage) Label() string {
+	if u.ContextTokens <= 0 {
+		return ""
+	}
+	toks := formatCompactTokens(u.ContextTokens)
+	if u.WindowTokens <= 0 {
+		return toks
+	}
+	pct := int(u.Ratio()*100 + 0.5)
+	if pct > 100 {
+		pct = 100
+	}
+	return fmt.Sprintf("%s · %d%%", toks, pct)
+}
+
+func formatCompactTokens(n int) string {
+	if n >= 1_000_000 {
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	}
+	if n >= 1000 {
+		k := float64(n) / 1000
+		if k >= 10 {
+			return fmt.Sprintf("%.0fk", k)
+		}
+		return fmt.Sprintf("%.1fk", k)
+	}
+	return fmt.Sprintf("%d", n)
+}
+
+func estimateContextWindow(model string, used int) int {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case strings.Contains(lower, "gemini"):
+		return 1_000_000
+	case strings.Contains(lower, "claude"):
+		if used > 200_000 {
+			return 1_000_000
+		}
+		return 200_000
+	case strings.Contains(lower, "gpt-5") || strings.Contains(lower, "codex"):
+		if used > 200_000 {
+			return 400_000
+		}
+		return 200_000
+	default:
+		if used > 200_000 {
+			return 1_000_000
+		}
+		return 200_000
+	}
+}
+
+// ParseTranscriptUsage scans JSONL lines in reverse to extract the latest context token footprint in O(few lines).
+func ParseTranscriptUsage(format TranscriptFormat, lines []string) ContextUsage {
+	for i := len(lines) - 1; i >= 0; i-- {
+		raw := strings.TrimSpace(lines[i])
+		if raw == "" {
+			continue
+		}
+		switch format {
+		case FormatClaude:
+			if !strings.Contains(raw, `"usage"`) {
+				continue
+			}
+			var env struct {
+				Message struct {
+					Model string `json:"model"`
+					Usage struct {
+						InputTokens              int `json:"input_tokens"`
+						CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+						CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+						OutputTokens             int `json:"output_tokens"`
+					} `json:"usage"`
+				} `json:"message"`
+			}
+			if json.Unmarshal([]byte(raw), &env) != nil {
+				continue
+			}
+			ctxToks := env.Message.Usage.InputTokens + env.Message.Usage.CacheCreationInputTokens + env.Message.Usage.CacheReadInputTokens
+			if ctxToks > 0 {
+				return ContextUsage{
+					ContextTokens: ctxToks,
+					OutputTokens:  env.Message.Usage.OutputTokens,
+					WindowTokens:  estimateContextWindow(env.Message.Model, ctxToks),
+					Model:         env.Message.Model,
+				}
+			}
+
+		case FormatPi, FormatPiOmp:
+			if !strings.Contains(raw, `"usage"`) {
+				continue
+			}
+			var env struct {
+				Message struct {
+					Model string `json:"model"`
+					Usage struct {
+						Input       int `json:"input"`
+						CacheRead   int `json:"cacheRead"`
+						CacheWrite  int `json:"cacheWrite"`
+						Output      int `json:"output"`
+						TotalTokens int `json:"totalTokens"`
+					} `json:"usage"`
+				} `json:"message"`
+			}
+			if json.Unmarshal([]byte(raw), &env) != nil {
+				continue
+			}
+			ctxToks := env.Message.Usage.Input + env.Message.Usage.CacheRead + env.Message.Usage.CacheWrite
+			if ctxToks <= 0 {
+				ctxToks = env.Message.Usage.TotalTokens
+			}
+			if ctxToks > 0 {
+				return ContextUsage{
+					ContextTokens: ctxToks,
+					OutputTokens:  env.Message.Usage.Output,
+					WindowTokens:  estimateContextWindow(env.Message.Model, ctxToks),
+					Model:         env.Message.Model,
+				}
+			}
+
+		case FormatCodex:
+			if !strings.Contains(raw, `"token_count"`) {
+				continue
+			}
+			var env struct {
+				Type    string `json:"type"`
+				Payload struct {
+					Type string `json:"type"`
+					Info *struct {
+						ModelContextWindow int `json:"model_context_window"`
+						LastTokenUsage     struct {
+							InputTokens  int `json:"input_tokens"`
+							OutputTokens int `json:"output_tokens"`
+							TotalTokens  int `json:"total_tokens"`
+						} `json:"last_token_usage"`
+					} `json:"info"`
+				} `json:"payload"`
+			}
+			if json.Unmarshal([]byte(raw), &env) != nil || env.Payload.Info == nil {
+				continue
+			}
+			u := env.Payload.Info.LastTokenUsage
+			ctxToks := u.InputTokens
+			if ctxToks <= 0 {
+				ctxToks = u.TotalTokens
+			}
+			if ctxToks > 0 {
+				win := env.Payload.Info.ModelContextWindow
+				if win <= 0 {
+					win = estimateContextWindow("codex", ctxToks)
+				}
+				return ContextUsage{
+					ContextTokens: ctxToks,
+					OutputTokens:  u.OutputTokens,
+					WindowTokens:  win,
+					Model:         "codex",
+				}
+			}
+		}
+	}
+	return ContextUsage{}
 }

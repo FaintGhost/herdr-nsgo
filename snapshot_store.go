@@ -13,12 +13,33 @@ const (
 	snapIndexStorageKey = "herdr-nsgo.snap.index.v1"
 	chatSnapKeyPrefix   = "herdr-nsgo.chatsnap.v1."
 	vtSnapKeyPrefix     = "herdr-nsgo.vtsnap.v1."
+	homeSnapStorageKey  = "herdr-nsgo.home.snap.v1"
+	catalogKeyPrefix    = "herdr-nsgo.catalog.v1."
+	homeDirsStorageKey  = "herdr-nsgo.homedirs.v1"
 
 	maxSnapKeys          = 24
 	maxSnapChatItems     = 40
 	maxSnapItemTextBytes = 12 * 1024
 	maxSnapVTBytes       = 32 * 1024
 )
+
+// AgentModelOption represents one selectable model discovered for an agent harness.
+type AgentModelOption struct {
+	ID          string   `json:"id"`
+	Label       string   `json:"label"`
+	Detail      string   `json:"detail,omitempty"`
+	Efforts     []string `json:"efforts,omitempty"`
+	DirectValue string   `json:"direct_value,omitempty"` // argument passed to /model <arg>
+}
+
+// AgentCatalog caches discovered models and effort/thinking options for one (instance, harness) pair.
+type AgentCatalog struct {
+	Models        []AgentModelOption `json:"models,omitempty"`
+	Efforts       []string           `json:"efforts,omitempty"`
+	DefaultModel  string             `json:"default_model,omitempty"`
+	DefaultEffort string             `json:"default_effort,omitempty"`
+	UpdatedMS     int64              `json:"updated_ms,omitempty"`
+}
 
 // ChatSnapshot stores a compact, bounded local snapshot of a session's structured conversation
 // so opening any previously visited session renders on Frame 0 (0ms) before SSH/RPC catches up.
@@ -27,6 +48,7 @@ type ChatSnapshot struct {
 	Format       TranscriptFormat `json:"format,omitempty"`
 	ResolvedPath string           `json:"resolved_path,omitempty"`
 	OnMachine    string           `json:"on_machine,omitempty"`
+	LastLine     int              `json:"last_line,omitempty"`
 	Items        []ChatTurnItem   `json:"items"`
 	UpdatedMS    int64            `json:"updated_ms"`
 }
@@ -34,25 +56,40 @@ type ChatSnapshot struct {
 // SnapshotStore persists bounded LRU per-session Chat and VT snapshots in NSGo local storage
 // (with an in-memory mirror for fast synchronous Frame-0 reads and nil-scope unit tests).
 type SnapshotStore struct {
-	cx      *core.Scope
-	mu      sync.Mutex
-	order   []string // MRU at end
-	chatMem map[string]ChatSnapshot
-	vtMem   map[string][]byte
+	cx          *core.Scope
+	mu          sync.Mutex
+	order       []string // MRU at end
+	chatMem     map[string]ChatSnapshot
+	vtMem       map[string][]byte
+	homeMem     []InstanceSnapshot
+	catalogMem  map[string]AgentCatalog
+	homeDirsMem map[string]string
 }
 
 // NewSnapshotStore initializes a SnapshotStore and loads the persisted LRU key index if cx != nil.
 func NewSnapshotStore(cx *core.Scope) *SnapshotStore {
 	s := &SnapshotStore{
-		cx:      cx,
-		chatMem: make(map[string]ChatSnapshot),
-		vtMem:   make(map[string][]byte),
+		cx:          cx,
+		chatMem:     make(map[string]ChatSnapshot),
+		vtMem:       make(map[string][]byte),
+		catalogMem:  make(map[string]AgentCatalog),
+		homeDirsMem: make(map[string]string),
 	}
 	if cx != nil {
 		if raw, ok := cx.Storage().GetItem(snapIndexStorageKey); ok && raw != "" {
 			var keys []string
 			if json.Unmarshal([]byte(raw), &keys) == nil {
 				s.order = keys
+			}
+		}
+		if raw, ok := cx.Storage().GetItem(homeDirsStorageKey); ok && raw != "" {
+			var dirs map[string]string
+			if json.Unmarshal([]byte(raw), &dirs) == nil {
+				for k, v := range dirs {
+					if k != "" && v != "" {
+						s.homeDirsMem[k] = v
+					}
+				}
 			}
 		}
 	}
@@ -250,4 +287,160 @@ func (s *SnapshotStore) LoadVT(key TermKey) ([]byte, bool) {
 	s.vtMem[ks] = dec
 	s.mu.Unlock()
 	return append([]byte(nil), dec...), true
+}
+
+// SaveHome persists the last known instance/session list so cold-start renders immediately on Frame 0.
+func (s *SnapshotStore) SaveHome(snaps []InstanceSnapshot) {
+	if s == nil || len(snaps) == 0 {
+		return
+	}
+	compact := make([]InstanceSnapshot, 0, len(snaps))
+	for _, sn := range snaps {
+		cp := sn
+		cp.Online = false
+		cp.State = stateDialing
+		cp.Problem = ""
+		if len(cp.Terminals) > 40 {
+			cp.Terminals = append([]Terminal(nil), cp.Terminals[:40]...)
+		} else {
+			cp.Terminals = append([]Terminal(nil), cp.Terminals...)
+		}
+		compact = append(compact, cp)
+	}
+	s.mu.Lock()
+	s.homeMem = compact
+	s.mu.Unlock()
+	if s.cx != nil {
+		if raw, err := json.Marshal(compact); err == nil {
+			s.cx.Post(func() {
+				s.cx.Storage().SetItem(homeSnapStorageKey, string(raw))
+			})
+		}
+	}
+}
+
+// LoadHome retrieves the persisted home snapshot (all marked dialing until live RPC confirms state).
+func (s *SnapshotStore) LoadHome() ([]InstanceSnapshot, bool) {
+	if s == nil {
+		return nil, false
+	}
+	s.mu.Lock()
+	if len(s.homeMem) > 0 {
+		out := append([]InstanceSnapshot(nil), s.homeMem...)
+		s.mu.Unlock()
+		return out, true
+	}
+	s.mu.Unlock()
+	if s.cx == nil {
+		return nil, false
+	}
+	raw, ok := s.cx.Storage().GetItem(homeSnapStorageKey)
+	if !ok || raw == "" {
+		return nil, false
+	}
+	var out []InstanceSnapshot
+	if json.Unmarshal([]byte(raw), &out) != nil || len(out) == 0 {
+		return nil, false
+	}
+	for i := range out {
+		out[i].Online = false
+		out[i].State = stateDialing
+		out[i].Problem = ""
+	}
+	s.mu.Lock()
+	s.homeMem = append([]InstanceSnapshot(nil), out...)
+	s.mu.Unlock()
+	return out, true
+}
+
+// SaveCatalog caches discovered model/effort options per (instanceID, kind) in memory and local storage.
+func (s *SnapshotStore) SaveCatalog(instanceID, kind string, cat AgentCatalog) {
+	if s == nil || kind == "" {
+		return
+	}
+	key := instanceID + "::" + kind
+	if cat.UpdatedMS <= 0 {
+		cat.UpdatedMS = time.Now().UnixMilli()
+	}
+	s.mu.Lock()
+	s.catalogMem[key] = cat
+	s.mu.Unlock()
+	if s.cx != nil {
+		if raw, err := json.Marshal(cat); err == nil {
+			s.cx.Post(func() {
+				s.cx.Storage().SetItem(catalogKeyPrefix+key, string(raw))
+			})
+		}
+	}
+}
+
+// LoadCatalog synchronously loads cached model/effort options for (instanceID, kind) in 0ms.
+func (s *SnapshotStore) LoadCatalog(instanceID, kind string) (AgentCatalog, bool) {
+	if s == nil || kind == "" {
+		return AgentCatalog{}, false
+	}
+	key := instanceID + "::" + kind
+	s.mu.Lock()
+	if hit, ok := s.catalogMem[key]; ok {
+		s.mu.Unlock()
+		return hit, true
+	}
+	s.mu.Unlock()
+	if s.cx == nil {
+		return AgentCatalog{}, false
+	}
+	raw, ok := s.cx.Storage().GetItem(catalogKeyPrefix + key)
+	if !ok || raw == "" {
+		return AgentCatalog{}, false
+	}
+	var cat AgentCatalog
+	if json.Unmarshal([]byte(raw), &cat) != nil {
+		return AgentCatalog{}, false
+	}
+	s.mu.Lock()
+	s.catalogMem[key] = cat
+	s.mu.Unlock()
+	return cat, true
+}
+
+// SaveHomeDir persists a remote $HOME directory mapping so cold starts skip `printf $HOME` RPCs.
+func (s *SnapshotStore) SaveHomeDir(cacheKey, home string) {
+	if s == nil || cacheKey == "" || home == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.homeDirsMem[cacheKey] == home {
+		s.mu.Unlock()
+		return
+	}
+	s.homeDirsMem[cacheKey] = home
+	cp := make(map[string]string, len(s.homeDirsMem))
+	for k, v := range s.homeDirsMem {
+		cp[k] = v
+	}
+	s.mu.Unlock()
+	if s.cx != nil {
+		if raw, err := json.Marshal(cp); err == nil {
+			s.cx.Post(func() {
+				s.cx.Storage().SetItem(homeDirsStorageKey, string(raw))
+			})
+		}
+	}
+}
+
+// AllHomeDirs returns a copy of all cached remote $HOME directories.
+func (s *SnapshotStore) AllHomeDirs() map[string]string {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.homeDirsMem) == 0 {
+		return nil
+	}
+	cp := make(map[string]string, len(s.homeDirsMem))
+	for k, v := range s.homeDirsMem {
+		cp[k] = v
+	}
+	return cp
 }
