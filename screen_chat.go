@@ -691,8 +691,8 @@ func renderToolDiffBlock(_ *core.Scope, tc ChatToolCall, maxH core.Points) core.
 		Unified:    true,
 		SoftWrap:   true,
 		Selectable: true,
-		FontSize:   11.5,
-		LineHeight: 17.5,
+		FontSize:   Tokens.FontMonoMeta,
+		LineHeight: 18,
 	}
 	if patchVal != "" {
 		dv.Patch = func() string { return patchVal }
@@ -1043,7 +1043,7 @@ func renderChatAssistantCard(
 						return model
 					}
 					return termFn().Terminal.AppName()
-				}, Style: core.Style{FlexShrink: 1, MinWidth: core.Pt(0), FontSize: 11}, StyleFunc: ui.Colored(func() core.Color { return a.paletteOf(cx).TextMuted })},
+				}, Style: core.Style{FlexShrink: 1, MinWidth: core.Pt(0), FontSize: Tokens.FontMonoMeta}, StyleFunc: ui.Colored(func() core.Color { return a.paletteOf(cx).TextMuted })},
 				chat.Actions{
 					TestID: "chat-actions-" + cardID,
 					Text:   func() string { return itemFn().Text },

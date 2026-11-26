@@ -49,6 +49,8 @@ func TestPaletteWCAGContrast(t *testing.T) {
 				{"vt blue on vt bg", tc.vt.Blue, tc.vt.Bg, 4.5},
 				{"vt amber on vt bg", tc.vt.Amber, tc.vt.Bg, 4.5},
 				{"vt red on vt bg", tc.vt.Red, tc.vt.Bg, 4.5},
+				{"vt fg on warn-soft search highlight", tc.vt.Fg, Composite(tc.p.WarnSoft, tc.vt.Bg), 4.5},
+				{"vt fg on running-soft search highlight", tc.vt.Fg, Composite(tc.p.RunningSoft, tc.vt.Bg), 4.5},
 			}
 			for _, pair := range pairs {
 				ratio := ContrastRatio(pair.fg, pair.bg)
@@ -166,7 +168,7 @@ func TestTokenCatalogComplete(t *testing.T) {
 func TestNoRawColorsInScreens(t *testing.T) {
 	re := regexp.MustCompile(`\bcore\.RGB(A)?\s*\(`)
 	patterns := []string{
-		"screen_*.go", "components.go", "main.go",
+		"screen_*.go", "components.go", "icons.go", "main.go", "vt_view.go",
 		"mobile_picker.go", "project_browser.go", "browser_preview.go",
 		"slash_commands.go", "dictation.go",
 	}

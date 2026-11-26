@@ -837,10 +837,64 @@ func InlineApprovalCard(cx *core.Scope, a *App, itemFn func() AggregatedTerminal
 					},
 				},
 			},
-			// Action row
+			// Compact 36px action row (fits comfortably inside both mobile cards and 280px wide sidebar)
 			core.Show{
 				When: func() bool { return CanInlineApprove(itemFn().Terminal) },
 				Then: func(cx *core.Scope) core.Node {
+					compactBtn := func(testID, label string, variant ActionVariant, onPress func()) core.Node {
+						scale := newPressScale(cx)
+						return core.View{
+							TestID:      testID,
+							Role:        core.RoleButton,
+							OnPressDown: func(core.PressEvent) { pressSpringTo(cx, scale, 0.97) },
+							OnPressUp:   func(core.PressEvent) { pressSpringTo(cx, scale, 1.0) },
+							OnPress: func(core.PressEvent) {
+								pressSpringTo(cx, scale, 1.0)
+								playSelectionHaptic(cx)
+								if onPress != nil {
+									onPress()
+								}
+							},
+							Style: core.Style{Animated: pressAnimStyle(scale)},
+							StyleFunc: func() core.Style {
+								pal := a.paletteOf(cx)
+								bg := pal.Accent
+								if variant == ActionDanger {
+									bg = pal.DangerSoft
+								} else if variant == ActionSecondary {
+									bg = pal.SurfaceRaised
+								}
+								return core.Style{
+									FlexShrink:     0,
+									Height:         core.Pt(36),
+									Padding:        core.Symmetric(0, Tokens.Space3),
+									CornerRadius:   Tokens.RadiusCtrl,
+									Background:     bg,
+									AlignItems:     core.AlignCenter,
+									JustifyContent: core.JustifyCenter,
+								}
+							},
+							Children: []core.Node{
+								core.Text{
+									Content: label,
+									StyleFunc: func() core.Style {
+										pal := a.paletteOf(cx)
+										fg := pal.AccentFg
+										if variant == ActionDanger {
+											fg = pal.Danger
+										} else if variant == ActionSecondary {
+											fg = pal.Text
+										}
+										return core.Style{
+											Color:      fg,
+											FontSize:   core.Points(13),
+											FontWeight: core.FontWeightMedium,
+										}
+									},
+								},
+							},
+						}
+					}
 					return core.View{
 						Style: core.Style{
 							Direction: core.Row,
@@ -848,17 +902,17 @@ func InlineApprovalCard(cx *core.Scope, a *App, itemFn func() AggregatedTerminal
 						},
 						Children: []core.Node{
 							core.View{
-								Style: core.Style{FlexGrow: 1},
+								Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinWidth: core.Pt(0)},
 								Children: []core.Node{
-									ActionButton(cx, a, "approve-allow-"+keyStr, "允许", ActionPrimary, func() {
+									compactBtn("approve-allow-"+keyStr, "允许", ActionPrimary, func() {
 										a.InlineApprove(itemFn().Key, true)
 									}),
 								},
 							},
 							core.View{
-								Style: core.Style{FlexGrow: 1},
+								Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinWidth: core.Pt(0)},
 								Children: []core.Node{
-									ActionButton(cx, a, "approve-deny-"+keyStr, "拒绝", ActionDanger, func() {
+									compactBtn("approve-deny-"+keyStr, "拒绝", ActionDanger, func() {
 										a.InlineApprove(itemFn().Key, false)
 									}),
 								},
@@ -877,8 +931,8 @@ func InlineApprovalCard(cx *core.Scope, a *App, itemFn func() AggregatedTerminal
 									pal := a.paletteOf(cx)
 									return core.Style{
 										FlexShrink:     0,
-										Width:          core.Pt(Tokens.SizeTouch),
-										Height:         core.Pt(Tokens.SizeTouch),
+										Width:          core.Pt(36),
+										Height:         core.Pt(36),
 										CornerRadius:   Tokens.RadiusCtrl,
 										Background:     pal.SurfaceRaised,
 										AlignItems:     core.AlignCenter,
@@ -898,11 +952,43 @@ func InlineApprovalCard(cx *core.Scope, a *App, itemFn func() AggregatedTerminal
 					}
 				},
 				Else: func(cx *core.Scope) core.Node {
-					return ActionButton(cx, a, "attention-open-"+keyStr, "进入终端处理", ActionSecondary, func() {
-						if onOpen != nil {
-							onOpen(itemFn().Key)
-						}
-					})
+					scale := newPressScale(cx)
+					return core.View{
+						TestID:      "attention-open-" + keyStr,
+						Role:        core.RoleButton,
+						OnPressDown: func(core.PressEvent) { pressSpringTo(cx, scale, 0.97) },
+						OnPressUp:   func(core.PressEvent) { pressSpringTo(cx, scale, 1.0) },
+						OnPress: func(core.PressEvent) {
+							pressSpringTo(cx, scale, 1.0)
+							playSelectionHaptic(cx)
+							if onOpen != nil {
+								onOpen(itemFn().Key)
+							}
+						},
+						Style: core.Style{Animated: pressAnimStyle(scale)},
+						StyleFunc: func() core.Style {
+							return core.Style{
+								Height:         core.Pt(36),
+								Padding:        core.Symmetric(0, Tokens.Space3),
+								CornerRadius:   Tokens.RadiusCtrl,
+								Background:     a.paletteOf(cx).SurfaceRaised,
+								AlignItems:     core.AlignCenter,
+								JustifyContent: core.JustifyCenter,
+							}
+						},
+						Children: []core.Node{
+							core.Text{
+								Content: "进入终端处理",
+								StyleFunc: func() core.Style {
+									return core.Style{
+										Color:      a.paletteOf(cx).Text,
+										FontSize:   core.Points(13),
+										FontWeight: core.FontWeightMedium,
+									}
+								},
+							},
+						},
+					}
 				},
 			},
 		},

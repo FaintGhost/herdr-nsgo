@@ -393,3 +393,98 @@ func TestQuietStudioUnifiedSheetsAndGallery(t *testing.T) {
 	}
 	h.Press("id:preview-close")
 }
+
+func TestQuietStudioReviewFixes(t *testing.T) {
+	// 1. Wide 680x720 boundary: Inbox InlineApprovalCard 36px buttons, Instances actions, and Session composer stay inside bounds.
+	wide := nsgotest.Start(t, func(cx *core.Scope) core.Node {
+		a, node := testSeededApp(cx)
+		a.SetTranscriptBackend(&fakeTranscriptBackend{})
+		return node
+	}, nsgotest.Size(680, 720))
+
+	wide.Press("id:rail-tab-inbox")
+	wide.Find("id:screen-inbox")
+	allowB := wide.Find("id:approve-allow-kr::t7").Bounds()
+	if allowB.Size.Height > 36.5 {
+		t.Fatalf("InlineApprovalCard button must be compact 36px height per spec, got %+v", allowB.Size)
+	}
+	if allowB.Origin.X+allowB.Size.Width > Tokens.RailWidth+Tokens.SidebarWidth {
+		t.Fatalf("InlineApprovalCard allow button overflows 280px sidebar: %+v", allowB)
+	}
+	openB := wide.Find("id:approve-open-kr::t7").Bounds()
+	if openB.Size.Height > 36.5 || openB.Origin.X+openB.Size.Width > Tokens.RailWidth+Tokens.SidebarWidth {
+		t.Fatalf("InlineApprovalCard open button must be 36x36 inside sidebar, got %+v", openB)
+	}
+
+	wide.Press("id:rail-tab-instances")
+	wide.Find("id:screen-instances")
+	delB := wide.Find("id:inst-delete-kr").Bounds()
+	if delB.Origin.X+delB.Size.Width > Tokens.RailWidth+Tokens.SidebarWidth {
+		t.Fatalf("instanceCard delete action overflows 280px sidebar: %+v", delB)
+	}
+
+	wide.Press("id:rail-tab-home")
+	wide.Press("id:session-row-mac::t1")
+	wide.Find("id:chat-glass-composer")
+	wideStop := wide.Find("id:session-interrupt-btn").Bounds()
+	if wideStop.Origin.X+wideStop.Size.Width > 680 {
+		t.Fatalf("680px wide split-pane composer stop button overflows viewport: %+v", wideStop)
+	}
+
+	// 2. Narrow 360x720 with active chips + delivery indicator + open keyboard with bottom SafeArea: no overflow & no keyboard gap.
+	narrow := nsgotest.Start(t, func(cx *core.Scope) core.Node {
+		a, node := testSeededApp(cx)
+		a.SetTranscriptBackend(&fakeTranscriptBackend{})
+		return node
+	}, nsgotest.Size(360, 720), nsgotest.Environment(core.Environment{OS: core.OSIOS, Idiom: core.IdiomPhone, SafeArea: core.Edges{Bottom: 34}}))
+
+	narrow.Press("id:session-row-mac::t1")
+	narrow.Type("id:session-composer", "检查状态")
+	narrow.Press("id:session-send-btn")
+	narrow.Find("id:chat-delivery-status")
+	stopB := narrow.Find("id:session-interrupt-btn").Bounds()
+	if stopB.Origin.X+stopB.Size.Width > 360 {
+		t.Fatalf("360px composer stop button overflows screen with active delivery indicator: %+v", stopB)
+	}
+	narrow.SetEnvironment(core.Environment{OS: core.OSIOS, Idiom: core.IdiomPhone, SafeArea: core.Edges{Bottom: 34}, KeyboardHeight: 260})
+	compB := narrow.Find("id:chat-glass-composer").Bounds()
+	// Bottom of composer should sit ~8px above the keyboard (720 - 260 = 460), NOT 38px+ above it due to SafeArea.Bottom!
+	if 460-(compB.Origin.Y+compB.Size.Height) > 16 {
+		t.Fatalf("composer left stale SafeArea.Bottom gap above open keyboard: composer=%+v keyboardTop=460", compB)
+	}
+
+	// 3. Cross-session quotedText isolation: quoting in Session A must not leak into Session B!
+	var uiRef *uiController
+	quoteH := nsgotest.Start(t, func(cx *core.Scope) core.Node {
+		a, _ := testSeededApp(cx)
+		snaps := a.instances.Get()
+		snaps[1].Terminals[0].Foreground = &Foreground{PID: 34488, Name: "claude", Cwd: "/repo", Argv: []string{"claude"}}
+		a.SeedSnapshots(snaps)
+		fb := &fakeTranscriptBackend{
+			terms: map[TermKey]AggregatedTerminal{
+				{InstanceID: "mac", Addr: "t1"}: {Key: TermKey{InstanceID: "mac", Addr: "t1"}, Terminal: snaps[1].Terminals[0]},
+			},
+			files: map[string][]string{
+				"::/Users/dev/.claude/sessions/34488.json": {`{"pid":34488,"sessionId":"q1","cwd":"/repo"}`},
+				"::/Users/dev/.claude/projects/-repo/q1.jsonl": {
+					`{"type":"assistant","uuid":"a1","message":{"id":"m1","model":"claude-opus-4-7","role":"assistant","content":[{"type":"text","text":"session-A-secret-quote"}]}}`,
+				},
+			},
+		}
+		a.transcriptResolver.SetHome("mac", "", "/Users/dev")
+		a.SetTranscriptBackend(fb)
+		node, ctrl := rootWithController(cx, a)
+		uiRef = ctrl
+		return node
+	}, nsgotest.Size(390, 844))
+
+	quoteH.Press("id:session-row-mac::t1")
+	_ = uiRef.activeChat.Get().RefreshSync(t.Context())
+	quoteH.Press("id:chat-quote-m1-txt-0-0")
+	quoteH.Find("id:composer-quote-banner")
+	quoteH.Press("id:session-switcher-btn")
+	quoteH.Press("id:switcher-item-kr::t8")
+	if len(quoteH.Query("id:composer-quote-banner")) != 0 {
+		t.Fatal("quotedText leaked from Session A into Session B across session switch")
+	}
+}

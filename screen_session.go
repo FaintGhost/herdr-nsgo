@@ -43,6 +43,20 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 	composerHeight := core.NewSignal(cx, core.Points(22))
 	quotedText := core.NewSignal(cx, "")
 
+	// Reset transient per-session UI state whenever the active session switches while sessionScreen stays mounted.
+	lastSessionKey := u.activeSession.GetUntracked()
+	cx.Effect(func() {
+		next := u.activeSession.Get()
+		if next != lastSessionKey {
+			lastSessionKey = next
+			quotedText.Set("")
+			composerTall.Set(false)
+			showSearch.Set(false)
+			ctrlArmed.Set(false)
+			ctrlLocked.Set(false)
+		}
+	})
+
 	curKey := func() TermKey { return u.activeSession.Get() }
 	curTerm := func() AggregatedTerminal {
 		t, _ := a.FindTerminal(curKey())
@@ -471,7 +485,21 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 			},
 			Else: func(cx *core.Scope) core.Node {
 				if !isChatMode() {
-					return IconButton(cx, a, "session-send-btn", "发送", iconSend, true, sendComposerText)
+					return base.Button{
+						TestID:  "session-send-btn",
+						Label:   "发送",
+						OnPress: func(core.PressEvent) { playSelectionHaptic(cx); sendComposerText() },
+						Style: core.Style{
+							Width:          core.Pt(34),
+							Height:         core.Pt(34),
+							FlexShrink:     0,
+							CornerRadius:   17,
+							AlignItems:     core.AlignCenter,
+							JustifyContent: core.JustifyCenter,
+						},
+						StyleFunc: func() core.Style { return core.Style{Background: a.paletteOf(cx).Accent} },
+						Children:  []core.Node{ui.Icon(lucide.ArrowUp, 17, func() core.Color { return a.paletteOf(cx).AccentFg })},
+					}
 				}
 				empty := func() bool {
 					return strings.TrimSpace(a.Compose(curKey().String())) == "" && a.chatImages.Get()[curKey()].name == ""
@@ -896,6 +924,10 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 								TestID: "chat-glass-composer",
 								StyleFunc: func() core.Style {
 									pal := a.paletteOf(cx)
+									safeBottom := core.Points(0)
+									if cx.Env().KeyboardHeight() == 0 {
+										safeBottom = max(0, cx.Env().SafeArea().Bottom-4)
+									}
 									return core.Style{
 										Width:        core.Pct(100),
 										MaxWidth:     core.Pt(Tokens.ChatMaxWidth),
@@ -904,7 +936,7 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 										BorderWidth:  1,
 										BorderColor:  pal.GlassBorder,
 										Padding:      core.Symmetric(core.Points(10), core.Points(12)),
-										Margin:       core.Edges{Bottom: max(0, cx.Env().SafeArea().Bottom-4)},
+										Margin:       core.Edges{Bottom: safeBottom},
 										Gap:          core.Points(6),
 									}
 								},
@@ -1032,18 +1064,28 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 													},
 												},
 												core.Show{When: func() bool { return defaultSubmitMode(DetectHarnessKind(curTerm().Terminal)) != chatNormal }, Then: func(cx *core.Scope) core.Node {
-													return core.View{Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: core.Points(4), FlexShrink: 1, MinWidth: core.Pt(0)}, Children: []core.Node{
-														chat.Chip{TestID: "chat-model-selector", Text: "模型", Caret: true, OnPress: func() { openAgentSelector(false) }},
-														chat.Chip{TestID: "chat-effort-selector", Text: "思考强度", Caret: true, OnPress: func() { openAgentSelector(true) }},
-														chat.Chip{TestID: "chat-mode-toggle", TextFunc: func() string { return "忙时" + string(modeFor(DetectHarnessKind(curTerm().Terminal))) }, OnPress: func() {
-															kind := DetectHarnessKind(curTerm().Terminal)
-															next := chatSteer
-															if modeFor(kind) == next {
-																next = chatQueue
-															}
-															selectedMode.Set(submitChoice{curKey(), kind, next})
-														}},
-													}}
+													return core.Scroll{
+														Horizontal:    true,
+														HideIndicator: true,
+														Style:         core.Style{FlexShrink: 1, MinWidth: core.Pt(0)},
+														Children: []core.Node{
+															core.View{
+																Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: core.Points(4)},
+																Children: []core.Node{
+																	chat.Chip{TestID: "chat-model-selector", Text: "模型", Caret: true, OnPress: func() { openAgentSelector(false) }},
+																	chat.Chip{TestID: "chat-effort-selector", Text: "思考强度", Caret: true, OnPress: func() { openAgentSelector(true) }},
+																	chat.Chip{TestID: "chat-mode-toggle", TextFunc: func() string { return "忙时" + string(modeFor(DetectHarnessKind(curTerm().Terminal))) }, OnPress: func() {
+																		kind := DetectHarnessKind(curTerm().Terminal)
+																		next := chatSteer
+																		if modeFor(kind) == next {
+																			next = chatQueue
+																		}
+																		selectedMode.Set(submitChoice{curKey(), kind, next})
+																	}},
+																},
+															},
+														},
+													}
 												}},
 												core.View{Style: core.Style{FlexGrow: 1}},
 												renderDeliveryIndicator(cx, a, func() string {

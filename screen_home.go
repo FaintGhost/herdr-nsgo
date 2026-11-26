@@ -85,7 +85,7 @@ func (u *uiController) homeScreen(cx *core.Scope, wide bool) core.Node {
 					Then: func(cx *core.Scope) core.Node {
 						return core.View{
 							Style: core.Style{
-								Padding: core.Edges{Left: 34, Right: 14, Bottom: Tokens.Space2},
+								Padding: core.Edges{Left: 34, Bottom: Tokens.Space2},
 								Gap:     Tokens.Space1,
 							},
 							Children: []core.Node{
@@ -179,7 +179,7 @@ func (u *uiController) homeScreen(cx *core.Scope, wide bool) core.Node {
 															Children: []core.Node{
 																core.Show{
 																	When: func() bool { return chIdx() > 0 },
-																	Then: func(cx *core.Scope) core.Node { return InsetDivider(cx, a, 34) },
+																	Then: func(cx *core.Scope) core.Node { return InsetDivider(cx, a, 14) },
 																},
 																SessionRow(cx, a, chItem, func() bool {
 																	return u.activeSession.Get() == chItem().Key
