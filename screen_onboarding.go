@@ -4,25 +4,18 @@ import (
 	"github.com/nsgo-dev/nsgo/core"
 )
 
-// onboardingScreen renders the 0-instance cold-start guide with QR pairing, manual SSH setup,
-// one-click authorized_keys command copy, and troubleshooting checklist (centered max 520px on wide screens).
+// onboardingScreen renders the Quiet Studio 0-instance cold-start guide with QR pairing,
+// manual SSH setup, grouped steps, and compact authorized_keys command box (centered max 520px).
 func (u *uiController) onboardingScreen(cx *core.Scope) core.Node {
 	a := u.app
 	showTroubleshoot := core.NewSignal(cx, false)
 
 	stepRow := func(num, title, desc string) core.Node {
 		return core.View{
-			StyleFunc: func() core.Style {
-				pal := a.paletteOf(cx)
-				return core.Style{
-					Direction:    core.Row,
-					Gap:          Tokens.Space3,
-					Padding:      core.All(Tokens.Space3),
-					Background:   pal.Surface,
-					CornerRadius: Tokens.RadiusCard,
-					BorderWidth:  1,
-					BorderColor:  pal.Border,
-				}
+			Style: core.Style{
+				Direction: core.Row,
+				Gap:       Tokens.Space3,
+				Padding:   core.Symmetric(core.Points(12), core.Points(14)),
 			},
 			Children: []core.Node{
 				core.View{
@@ -30,10 +23,10 @@ func (u *uiController) onboardingScreen(cx *core.Scope) core.Node {
 						pal := a.paletteOf(cx)
 						return core.Style{
 							FlexShrink:     0,
-							Width:          core.Pt(26),
-							Height:         core.Pt(26),
-							CornerRadius:   13,
-							Background:     pal.AccentSoft,
+							Width:          core.Pt(24),
+							Height:         core.Pt(24),
+							CornerRadius:   12,
+							Background:     pal.SurfaceRaised,
 							AlignItems:     core.AlignCenter,
 							JustifyContent: core.JustifyCenter,
 						}
@@ -44,16 +37,17 @@ func (u *uiController) onboardingScreen(cx *core.Scope) core.Node {
 							StyleFunc: func() core.Style {
 								pal := a.paletteOf(cx)
 								return core.Style{
-									Color:      pal.Accent,
-									FontSize:   Tokens.FontCaption,
-									FontWeight: core.FontWeightBold,
+									Color:      pal.Text,
+									FontSize:   Tokens.FontMonoMeta,
+									FontWeight: core.FontWeightSemibold,
+									FontFamily: core.FontMonospace,
 								}
 							},
 						},
 					},
 				},
 				core.View{
-					Style: core.Style{FlexGrow: 1, FlexShrink: 1, Gap: core.Points(3)},
+					Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinWidth: core.Pt(0), Gap: core.Points(2)},
 					Children: []core.Node{
 						core.Text{
 							Content: title,
@@ -62,7 +56,7 @@ func (u *uiController) onboardingScreen(cx *core.Scope) core.Node {
 								return core.Style{
 									Color:      pal.Text,
 									FontSize:   Tokens.FontRowTitle,
-									FontWeight: core.FontWeightSemibold,
+									FontWeight: core.FontWeightMedium,
 								}
 							},
 						},
@@ -95,13 +89,14 @@ func (u *uiController) onboardingScreen(cx *core.Scope) core.Node {
 		},
 		Children: []core.Node{
 			TopHeader(cx, a, func() string { return "herdr" }, nil, []core.Node{
-				IconButton(cx, a, "onboarding-settings-btn", "设置", iconSettings, false, func() {
+				IconTap(cx, a, "onboarding-settings-btn", "设置", iconSettings, func() {
 					u.subPage.Set("settings")
 				}),
 			}),
 			ToastBanner(cx, a),
 			core.Scroll{
-				Style: core.Style{FlexGrow: 1},
+				EdgeEffects: core.EdgeEffects{Top: core.EdgeEffectSoft, Bottom: core.EdgeEffectSoft},
+				Style:       core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0)},
 				Children: []core.Node{
 					core.View{
 						Style: core.Style{
@@ -114,8 +109,8 @@ func (u *uiController) onboardingScreen(cx *core.Scope) core.Node {
 								Style: core.Style{
 									Width:    core.Pct(100),
 									MaxWidth: core.Pt(520),
-									Padding:  core.All(Tokens.Space4),
-									Gap:      Tokens.Space4,
+									Padding:  core.All(Tokens.PagePadX),
+									Gap:      Tokens.SectionGap,
 								},
 								Children: []core.Node{
 									core.View{
@@ -127,7 +122,7 @@ func (u *uiController) onboardingScreen(cx *core.Scope) core.Node {
 													pal := a.paletteOf(cx)
 													return core.Style{
 														Color:      pal.Text,
-														FontSize:   core.Points(22),
+														FontSize:   Tokens.FontNav,
 														FontWeight: core.FontWeightBold,
 													}
 												},
@@ -156,69 +151,119 @@ func (u *uiController) onboardingScreen(cx *core.Scope) core.Node {
 											}),
 										},
 									},
-									SectionHeader(cx, a, func() string { return "1 分钟上手步骤" }, nil),
 									core.View{
 										Style: core.Style{Gap: Tokens.Space2},
 										Children: []core.Node{
-											stepRow("1", "在远端电脑运行 herdr-core", "确认已安装 hc 并在后台运行，且可通过 Tailscale 或局域网 SSH 登录。"),
-											stepRow("2", "授权本机 ed25519 公钥（或直接填密码）", "点击下方一键复制命令在远端执行即可免密连接；也可以直接在表单填 SSH 密码登录。"),
-											stepRow("3", "扫码或填写主机地址", "支持同时添加多台独立实例，客户端会自动按 CoreID 去重并保留直连优先。"),
-										},
-									},
-									core.View{
-										StyleFunc: func() core.Style {
-											pal := a.paletteOf(cx)
-											return core.Style{
-												Background:   pal.Surface,
-												CornerRadius: Tokens.RadiusCard,
-												BorderWidth:  1,
-												BorderColor:  pal.Border,
-												Padding:      core.All(Tokens.Space3),
-												Gap:          Tokens.Space2,
-											}
-										},
-										Children: []core.Node{
-											core.Text{
-												Content: "本机免密公钥命令",
-												StyleFunc: func() core.Style {
-													pal := a.paletteOf(cx)
-													return core.Style{
-														Color:      pal.Text,
-														FontSize:   Tokens.FontCaption,
-														FontWeight: core.FontWeightSemibold,
-													}
-												},
-											},
-											core.Text{
-												ContentFunc: func() string {
-													return AuthorizedKeysCommand(a.localPubKey.Get())
-												},
-												StyleFunc: func() core.Style {
-													pal := a.paletteOf(cx)
-													return core.Style{
-														Color:      pal.TextMuted,
-														FontSize:   Tokens.FontMonoMeta,
-														FontFamily: core.FontMonospace,
-													}
-												},
-											},
-											ActionButton(cx, a, "onboarding-copy-key-btn", "复制 authorized_keys 命令", ActionSecondary, func() {
-												cmd := AuthorizedKeysCommand(a.localPubKey.Get())
-												if cx != nil {
-													cx.SetClipboard(cmd)
-												}
-												a.notifyToast("已复制公钥授权命令，到远端终端粘贴执行即可。")
+											SectionHeader(cx, a, func() string { return "1 分钟上手步骤" }, nil),
+											GroupCard(cx, a, "", []core.Node{
+												stepRow("1", "在远端电脑运行 herdr-core", "确认已安装 hc 并在后台运行，且可通过 Tailscale 或局域网 SSH 登录。"),
+												InsetDivider(cx, a, 50),
+												stepRow("2", "授权本机 ed25519 公钥（或直接填密码）", "点击下方一键复制命令在远端执行即可免密连接；也可以直接在表单填 SSH 密码登录。"),
+												InsetDivider(cx, a, 50),
+												stepRow("3", "扫码或填写主机地址", "支持同时添加多台独立实例，客户端会自动按 CoreID 去重并保留直连优先。"),
 											}),
 										},
 									},
-									ActionButtonFunc(cx, a, "onboarding-troubleshoot-btn", func() string {
-										if showTroubleshoot.Get() {
-											return "收起常见排障指南"
-										}
-										return "连不上？查看常见排障指南"
-									}, ActionGhost, func() {
-										showTroubleshoot.Set(!showTroubleshoot.Get())
+									GroupCard(cx, a, "", []core.Node{
+										core.View{
+											Style: core.Style{Padding: core.All(core.Points(14)), Gap: Tokens.Space2},
+											Children: []core.Node{
+												core.Text{
+													Content: "本机免密公钥命令",
+													StyleFunc: func() core.Style {
+														pal := a.paletteOf(cx)
+														return core.Style{
+															Color:      pal.Text,
+															FontSize:   Tokens.FontCaption,
+															FontWeight: core.FontWeightMedium,
+														}
+													},
+												},
+												core.View{
+													StyleFunc: func() core.Style {
+														return core.Style{
+															Background:   a.paletteOf(cx).Bg,
+															CornerRadius: Tokens.RadiusCtrl,
+															Padding:      core.Symmetric(Tokens.Space2, Tokens.Space3),
+														}
+													},
+													Children: []core.Node{
+														core.Text{
+															ContentFunc: func() string {
+																return AuthorizedKeysCommand(a.localPubKey.Get())
+															},
+															StyleFunc: func() core.Style {
+																pal := a.paletteOf(cx)
+																return core.Style{
+																	Color:      pal.TextSecondary,
+																	FontSize:   Tokens.FontMonoMeta,
+																	FontFamily: core.FontMonospace,
+																}
+															},
+														},
+													},
+												},
+												ActionButton(cx, a, "onboarding-copy-key-btn", "复制 authorized_keys 命令", ActionSecondary, func() {
+													cmd := AuthorizedKeysCommand(a.localPubKey.Get())
+													if cx != nil {
+														cx.SetClipboard(cmd)
+													}
+													a.notifyToast("已复制公钥授权命令，到远端终端粘贴执行即可。")
+												}),
+											},
+										},
 									}),
+									core.View{
+										TestID: "onboarding-troubleshoot-btn",
+										Role:   core.RoleButton,
+										OnPress: func(core.PressEvent) {
+											playSelectionHaptic(cx)
+											showTroubleshoot.Set(!showTroubleshoot.Get())
+										},
+										Style: core.Style{
+											Direction:  core.Row,
+											AlignItems: core.AlignCenter,
+											AlignSelf:  core.AlignStart,
+											Gap:        core.Points(4),
+											Padding:    core.Symmetric(core.Points(4), Tokens.Space1),
+										},
+										Children: []core.Node{
+											core.Text{
+												ContentFunc: func() string {
+													if showTroubleshoot.Get() {
+														return "收起常见排障指南"
+													}
+													return "连不上？查看常见排障指南"
+												},
+												StyleFunc: func() core.Style {
+													return core.Style{
+														Color:      a.paletteOf(cx).TextMuted,
+														FontSize:   Tokens.FontCaption,
+														FontWeight: core.FontWeightMedium,
+													}
+												},
+											},
+											core.Show{
+												When: showTroubleshoot.Get,
+												Then: func(cx *core.Scope) core.Node {
+													return core.Icon{
+														SVG: iconChevronU,
+														StyleFunc: func() core.Style {
+															return core.Style{Width: core.Pt(13), Height: core.Pt(13), Color: a.paletteOf(cx).TextMuted}
+														},
+													}
+												},
+												Else: func(cx *core.Scope) core.Node {
+													return core.Icon{
+														SVG: iconChevronD,
+														StyleFunc: func() core.Style {
+															return core.Style{Width: core.Pt(13), Height: core.Pt(13), Color: a.paletteOf(cx).TextMuted}
+														},
+													}
+												},
+											},
+										},
+									},
 									core.Show{
 										When: showTroubleshoot.Get,
 										Then: func(cx *core.Scope) core.Node {

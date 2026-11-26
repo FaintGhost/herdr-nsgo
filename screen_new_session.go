@@ -104,7 +104,8 @@ func (u *uiController) newSessionSheet(cx *core.Scope) core.Node {
 		}
 	}
 
-	return SheetModal(cx, a, "sheet-new-session", "新建会话", "sheet-new-session-close", func() {
+	showMux := core.NewSignal(cx, false)
+	form := SheetModal(cx, a, "sheet-new-session", "新建会话", "sheet-new-session-close", func() {
 		u.showNewSession.Set(false)
 	}, []core.Node{
 		// Target instance chips
@@ -197,6 +198,18 @@ func (u *uiController) newSessionSheet(cx *core.Scope) core.Node {
 				}
 			},
 		},
+		GroupCard(cx, a, "", []core.Node{
+			SheetListRow(cx, a, "new-host-mux", "接入 tmux 或 Zellij 会话", "", iconTerminal, false, true, func() {
+				if submitting.Get() {
+					return
+				}
+				if selectedInst.Get() == "" {
+					errMsg.Set("请先选择实例")
+					return
+				}
+				showMux.Set(true)
+			}),
+		}),
 		// Template / Shell chips
 		core.View{
 			Style: core.Style{Gap: Tokens.Space1},
@@ -205,7 +218,7 @@ func (u *uiController) newSessionSheet(cx *core.Scope) core.Node {
 					Content: "启动模板",
 					StyleFunc: func() core.Style {
 						pal := a.paletteOf(cx)
-						return core.Style{Color: pal.TextSecondary, FontSize: Tokens.FontCaption, FontWeight: core.FontWeightSemibold}
+						return core.Style{Color: pal.TextMuted, FontSize: Tokens.FontSection, FontWeight: core.FontWeightMedium}
 					},
 				},
 				core.Scroll{
@@ -241,9 +254,16 @@ func (u *uiController) newSessionSheet(cx *core.Scope) core.Node {
 				},
 			},
 		},
-		inputField("new-session-cwd", "工作目录（可选）", "/path/to/workspace", cwd.Get, cwd.Set),
-		inputField("new-session-name", "会话名称（可选）", "例如 fix-auth", name.Get, name.Set),
-		inputField("new-session-prompt", "首条指令或任务（可选）", "例如 帮我跑一遍测试并修复报错", prompt.Get, prompt.Set),
+		GroupCard(cx, a, "", []core.Node{
+			core.View{
+				Style: core.Style{Padding: core.All(core.Points(14)), Gap: Tokens.Space3},
+				Children: []core.Node{
+					inputField("new-session-cwd", "工作目录（可选）", "/path/to/workspace", cwd.Get, cwd.Set),
+					inputField("new-session-name", "会话名称（可选）", "例如 fix-auth", name.Get, name.Set),
+					inputField("new-session-prompt", "首条指令或任务（可选）", "例如 帮我跑一遍测试并修复报错", prompt.Get, prompt.Set),
+				},
+			},
+		}),
 		core.Show{
 			When: func() bool { return errMsg.Get() != "" },
 			Then: func(cx *core.Scope) core.Node {
@@ -300,4 +320,7 @@ func (u *uiController) newSessionSheet(cx *core.Scope) core.Node {
 			}()
 		}),
 	})
+	return core.Show{When: showMux.Get, Then: func(cx *core.Scope) core.Node {
+		return u.muxPicker(cx, selectedInst.Get(), selectedMachine.Get(), cwd.Get(), func() { showMux.Set(false) })
+	}, Else: func(*core.Scope) core.Node { return form }}
 }

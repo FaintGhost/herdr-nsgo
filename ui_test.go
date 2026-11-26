@@ -344,3 +344,52 @@ func TestQuietStudioSessionHeaderAndToolsSheet(t *testing.T) {
 	h.Press("id:session-search-btn")
 	h.Find("id:session-search-input")
 }
+
+func TestQuietStudioUnifiedSheetsAndGallery(t *testing.T) {
+	h := nsgotest.Start(t, func(cx *core.Scope) core.Node {
+		a, node := testSeededApp(cx)
+		a.SetTranscriptBackend(&fakeTranscriptBackend{})
+		return node
+	}, nsgotest.Size(390, 844))
+
+	// 1. Settings -> Tokens gallery shows live Quiet Studio component preview slice and unified 40x40 icon back button.
+	h.Press("id:home-settings-btn")
+	h.Find("id:screen-settings")
+	h.Press("id:settings-tokens-btn")
+	h.Find("id:screen-tokens")
+	h.Find("id:tokens-gallery-preview")
+	backBounds := h.Find("id:tokens-back-btn").Bounds()
+	if backBounds.Size.Width != backBounds.Size.Height || backBounds.Size.Width > 44 {
+		t.Fatalf("tokens-back-btn must use unified 40x40 IconTap, got %+v", backBounds.Size)
+	}
+	h.Press("id:tokens-back-btn")
+	h.Press("id:settings-back-btn")
+
+	// 2. Open session -> verify mobileAgentPicker, projectSheet, and browserPreviewSheet all use unified SheetModal (32x32 circular close).
+	h.Press("id:session-row-mac::t1")
+	h.Press("id:chat-model-selector")
+	h.Find("id:chat-model-sheet")
+	modelClose := h.Find("id:chat-model-close").Bounds()
+	if modelClose.Size.Width != modelClose.Size.Height || modelClose.Size.Width > 36 {
+		t.Fatalf("chat-model-close must use unified SheetModal 32x32 circular X button, got %+v", modelClose.Size)
+	}
+	h.Press("id:chat-model-close")
+
+	h.Press("id:session-tools-btn")
+	h.Press("id:tool-project")
+	h.Find("id:project-sheet")
+	projClose := h.Find("id:project-close").Bounds()
+	if projClose.Size.Width != projClose.Size.Height || projClose.Size.Width > 36 {
+		t.Fatalf("project-close must use unified SheetModal 32x32 circular X button, got %+v", projClose.Size)
+	}
+	h.Press("id:project-close")
+
+	h.Press("id:session-tools-btn")
+	h.Press("id:tool-preview")
+	h.Find("id:browser-preview")
+	prevClose := h.Find("id:preview-close").Bounds()
+	if prevClose.Size.Width != prevClose.Size.Height || prevClose.Size.Width > 36 {
+		t.Fatalf("preview-close must use unified SheetModal 32x32 circular X button, got %+v", prevClose.Size)
+	}
+	h.Press("id:preview-close")
+}
