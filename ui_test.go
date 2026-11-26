@@ -216,3 +216,61 @@ func TestUIResponsiveWideSplitPane(t *testing.T) {
 
 	app.Find("id:split-pane-layout")
 }
+
+func TestQuietStudioComponents(t *testing.T) {
+	lp := LightPalette()
+	fg, soft, label := stateColor(lp, "working")
+	if fg != lp.Running || soft != lp.RunningSoft || label != "运行中" {
+		t.Fatalf("working state must use decoupled Running emerald (%#x/%#x), got %#x/%#x (%q)",
+			uint32(lp.Running), uint32(lp.RunningSoft), uint32(fg), uint32(soft), label)
+	}
+	if fg == lp.Accent {
+		t.Fatal("working semantic color must be decoupled from monochrome Accent")
+	}
+
+	var tapped bool
+	var railTab string
+	var railSettings bool
+	app := nsgotest.Start(t, func(cx *core.Scope) core.Node {
+		a := NewApp(cx)
+		activeTab := core.NewSignal(cx, "home")
+		return core.View{
+			Style: core.Style{Direction: core.Row, Width: core.Pct(100), Height: core.Pct(100)},
+			Children: []core.Node{
+				WideNavRail(cx, a, activeTab, func() { railSettings = true }),
+				core.View{
+					Style: core.Style{FlexGrow: 1, Gap: Tokens.Space3, Padding: core.All(Tokens.Space3)},
+					Children: []core.Node{
+						GroupCard(cx, a, "test-group", []core.Node{
+							SheetListRow(cx, a, "test-sheet-row", "会话文件与 Git 差异", ":3000", nil, false, true, func() {
+								tapped = true
+							}),
+							InsetDivider(cx, a, 34),
+						}),
+						IconTap(cx, a, "test-icon-tap", "搜索", nil, func() {
+							railTab = activeTab.Get()
+						}),
+						FloatingTabBar(cx, a, activeTab),
+					},
+				},
+			},
+		}
+	}, nsgotest.Size(390, 844))
+
+	app.Find("id:wide-nav-rail")
+	app.Find("id:test-group")
+	app.Find("id:bottom-tab-bar")
+	app.Press("id:test-sheet-row")
+	if !tapped {
+		t.Fatal("SheetListRow press callback did not fire")
+	}
+	app.Press("id:rail-tab-inbox")
+	app.Press("id:test-icon-tap")
+	if railTab != "inbox" {
+		t.Fatalf("WideNavRail tab switch expected inbox, got %q", railTab)
+	}
+	app.Press("id:rail-settings-btn")
+	if !railSettings {
+		t.Fatal("WideNavRail settings callback did not fire")
+	}
+}
