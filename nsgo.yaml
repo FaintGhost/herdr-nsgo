@@ -2,8 +2,25 @@ name: herdr-nsgo
 id: dev.herdr.nsgo
 version: 1.0.0
 
+release:
+  github: FaintGhost/herdr-nsgo
+
+updates:
+  key: uVpT5oxc0ms2q3v2VWIl2l6GVKNcVyDGajrMsSVFn1U=
+  channel: direct
+  automatic: true
+
 android:
-  permissions: [CAMERA]
+  loopback_cleartext: true
+  permissions: [CAMERA, RECORD_AUDIO, POST_NOTIFICATIONS]
+
+apple:
+  info:
+    NSAppTransportSecurity:
+      NSAllowsLocalNetworking: true
+    NSCameraUsageDescription: 用于扫码配对和拍摄聊天附件。
+    NSMicrophoneUsageDescription: 用于将口述内容加入会话草稿。
+    NSSpeechRecognitionUsageDescription: 使用系统语音识别将口述内容转为文字。
 
 dev:
   target: native

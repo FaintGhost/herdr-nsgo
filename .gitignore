@@ -1,2 +1,5 @@
 dist/
 *.exe
+.nsgo/
+.DS_Store
+.ryugi/.gitignore
