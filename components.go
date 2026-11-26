@@ -95,7 +95,7 @@ func harnessBrandSVG(kind string) *core.SVG {
 	case "codex":
 		return iconCodexBrand
 	case "antigravity":
-		return iconGeminiBrand
+		return iconAntigravityBrand
 	case "pi", "omp":
 		return iconPiBrand
 	default:

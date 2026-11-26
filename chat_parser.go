@@ -758,6 +758,7 @@ func parseClaudeJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 	toolIdx := make(map[string][2]int)
 	seenUUID := make(map[string]bool)
 	lastAsstMsgID := ""
+	curEffort := ""
 	baseIdx := firstLine - 1
 
 	for lineNo, raw := range lines {
@@ -778,6 +779,12 @@ func parseClaudeJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 				Role    string          `json:"role"`
 				Content json.RawMessage `json:"content"`
 			} `json:"message"`
+			Params struct {
+				Model        string `json:"model"`
+				OutputConfig struct {
+					Effort string `json:"effort"`
+				} `json:"output_config"`
+			} `json:"params"`
 		}
 		if json.Unmarshal([]byte(raw), &env) != nil {
 			continue
@@ -790,9 +797,17 @@ func parseClaudeJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 		}
 
 		switch env.Type {
+		case "api-request":
+			if eff := strings.TrimSpace(env.Params.OutputConfig.Effort); eff != "" {
+				curEffort = strings.ToLower(eff)
+			}
+			continue
 		case "user":
 			var strContent string
 			if json.Unmarshal(env.Message.Content, &strContent) == nil {
+				if eff := extractClaudeEffortCommandArg(strContent); eff != "" {
+					curEffort = eff
+				}
 				txt, from := cleanUserPrompt(strContent)
 				if txt != "" {
 					items = append(items, ChatTurnItem{
@@ -871,6 +886,7 @@ func parseClaudeJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 							Role:       RoleThinking,
 							Text:       th,
 							Model:      env.Message.Model,
+							Effort:     curEffort,
 							App:        "claude-code",
 							SourceLine: srcLine,
 						})
@@ -887,12 +903,16 @@ func parseClaudeJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 						items[len(items)-1].Text = merged
 						items[len(items)-1].Blocks = SplitMarkdownBlocks(merged)
 						items[len(items)-1].SourceLine = srcLine
+						if curEffort != "" {
+							items[len(items)-1].Effort = curEffort
+						}
 					} else {
 						items = append(items, ChatTurnItem{
 							ID:         fmt.Sprintf("%s-txt-%d-%d", msgID, absIdx, bi),
 							Role:       RoleAssistant,
 							Text:       txt,
 							Model:      env.Message.Model,
+							Effort:     curEffort,
 							App:        "claude-code",
 							Blocks:     SplitMarkdownBlocks(txt),
 							SourceLine: srcLine,
@@ -904,6 +924,26 @@ func parseClaudeJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 		}
 	}
 	return items
+}
+
+func extractClaudeEffortCommandArg(s string) string {
+	if !strings.Contains(s, "<command-name>/effort</command-name>") {
+		return ""
+	}
+	start := strings.Index(s, "<command-args>")
+	if start < 0 {
+		return ""
+	}
+	rest := s[start+len("<command-args>"):]
+	end := strings.Index(rest, "</command-args>")
+	if end < 0 {
+		return ""
+	}
+	arg := strings.ToLower(strings.TrimSpace(rest[:end]))
+	if isKnownEffortToken(arg) {
+		return arg
+	}
+	return ""
 }
 
 func extractClaudeToolResultContent(raw json.RawMessage) string {

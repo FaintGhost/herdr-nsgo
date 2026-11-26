@@ -183,18 +183,31 @@ func TestOnForegroundResumeIgnoresBriefFocusDrop(t *testing.T) {
 }
 
 func TestAllHarnessesExtractAndDisplayModelAndEffort(t *testing.T) {
-	// 1. splitModelAndEffort handles Agy's "Gemini 4 Neon (High)" format.
+	// 1. splitModelAndEffort handles BOTH Agy's "Gemini 4 Neon (High)" and "gemini-4-neon-high" formats.
 	m, e := splitModelAndEffort("Gemini 4 Neon (High)")
 	if m != "Gemini 4 Neon" || e != "high" {
 		t.Fatalf("splitModelAndEffort = (%q, %q), want (Gemini 4 Neon, high)", m, e)
 	}
+	m2, e2 := splitModelAndEffort("gemini-4-neon-high")
+	if m2 != "gemini-4-neon" || e2 != "high" || ShortModelLabel("gemini-4-neon-high") != "Gemini 4 Neon" {
+		t.Fatalf("splitModelAndEffort(hyphen) = (%q, %q), label=%q", m2, e2, ShortModelLabel("gemini-4-neon-high"))
+	}
 
-	// 2. ParseAntigravityJSONL extracts both clean model and effort from PLANNER_RESPONSE.
+	// 2. ParseAntigravityJSONL extracts both clean model and effort from real hyphenated PLANNER_RESPONSE model IDs.
 	agyItems := ParseAntigravityJSONL([]string{
-		`{"step_index":1,"type":"PLANNER_RESPONSE","model":"Gemini 4 Neon (High)","content":"Done!"}`,
+		`{"step_index":1,"type":"PLANNER_RESPONSE","model":"gemini-4-neon-high","content":"Done!"}`,
 	})
-	if len(agyItems) != 1 || agyItems[0].Model != "Gemini 4 Neon" || agyItems[0].Effort != "high" {
+	if len(agyItems) != 1 || agyItems[0].Model != "gemini-4-neon" || agyItems[0].Effort != "high" {
 		t.Fatalf("unexpected Agy parsed item: %+v", agyItems)
+	}
+
+	// 2b. ParseClaudeJSONL extracts per-turn effort from api-request output_config.effort and /effort commands!
+	clItems := ParseClaudeJSONL([]string{
+		`{"type":"api-request","params":{"model":"claude-opus-5-5","output_config":{"effort":"high"}}}`,
+		`{"type":"assistant","uuid":"a1","message":{"id":"msg1","model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":"Hi"}]}}`,
+	})
+	if len(clItems) != 1 || clItems[0].Model != "claude-opus-5-5" || clItems[0].Effort != "high" {
+		t.Fatalf("unexpected Claude parsed item: %+v", clItems)
 	}
 
 	// 3. parsePiOmpJSONLAt extracts thinking_level_change effort.

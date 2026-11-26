@@ -92,7 +92,7 @@ jobs:
         env:
           NSGO_UPDATES_KEY: ${{ secrets.NSGO_UPDATES_KEY }}
         run: |
-          go tool nsgo build -target android_arm64 -version "${{ steps.ver.outputs.version }}" -release-notes /tmp/release-notes.md -output dist
+          go tool nsgo build -target android_arm64 -version "${{ steps.ver.outputs.version }}" -ldflags "-X main.appBuildVersion=${{ steps.ver.outputs.version }}" -release-notes /tmp/release-notes.md -output dist
           cd dist/releases
           sha256sum herdr-nsgo-${{ steps.ver.outputs.version }}-android-arm64.apk > herdr-nsgo-${{ steps.ver.outputs.version }}-android-arm64.apk.sha256
           ls -lh

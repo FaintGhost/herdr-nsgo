@@ -644,9 +644,7 @@ func (u *uiController) settingsScreen(cx *core.Scope) core.Node {
 															}
 															return "检查更新"
 														}, ActionSecondary, func() {
-															if cx != nil {
-																updater.Check(cx)
-															}
+															a.CheckForAppUpdates(cx, false)
 														}),
 													},
 												},
@@ -664,7 +662,7 @@ func (u *uiController) settingsScreen(cx *core.Scope) core.Node {
 													Style: core.Style{Padding: core.Symmetric(core.Points(12), core.Points(14))},
 													Children: []core.Node{
 														core.Text{
-															Content: "herdr-nsgo · 纯 Go + NSGo Quiet Studio 原生客户端",
+															Content: "herdr-nsgo v" + strings.TrimPrefix(appBuildVersion, "v") + " · 纯 Go + NSGo Quiet Studio 原生客户端",
 															StyleFunc: func() core.Style {
 																pal := a.paletteOf(cx)
 																return core.Style{Color: pal.TextSecondary, FontSize: Tokens.FontCaption}

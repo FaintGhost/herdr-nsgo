@@ -22,8 +22,30 @@ if kind == 'claude':
         d = json.loads(cfg.read_text(encoding='utf-8', errors='replace'))
         if isinstance(d.get('model'), str):
             out['default_model'] = d['model'].strip()
-        if isinstance(d.get('effortLevel'), str):
-            out['default_effort'] = d['effortLevel'].strip()
+        if isinstance(d.get('effortLevel'), str) and d['effortLevel'].strip():
+            out['default_effort'] = d['effortLevel'].strip().lower()
+        if not out['default_effort'] and isinstance(d.get('env'), dict):
+            ev = d['env'].get('CLAUDE_CODE_EFFORT_LEVEL')
+            if isinstance(ev, str) and ev.strip():
+                out['default_effort'] = ev.strip().lower()
+        if not out['default_effort'] and isinstance(d.get('modelSettings'), dict):
+            ms = d['modelSettings']
+            dm = out['default_model'].lower()
+            fallback_eff = ''
+            for mk, mv in ms.items():
+                if not isinstance(mv, dict):
+                    continue
+                el = mv.get('effortLevel')
+                if not isinstance(el, str) or not el.strip():
+                    continue
+                el = el.strip().lower()
+                if not fallback_eff:
+                    fallback_eff = el
+                if dm and (mk.lower() == dm or dm in mk.lower()):
+                    out['default_effort'] = el
+                    break
+            if not out['default_effort'] and fallback_eff:
+                out['default_effort'] = fallback_eff
     except OSError:
         pass
     except ValueError:
@@ -142,7 +164,13 @@ elif kind == 'antigravity':
                 if not out['default_effort']:
                     out['default_effort'] = m.group(2).strip().lower()
             else:
-                out['default_model'] = raw_model
+                hm = re.match(r'^(.*?)-(off|minimal|low|medium|high|xhigh|max|ultra)$', raw_model, re.I)
+                if hm:
+                    out['default_model'] = hm.group(1).strip()
+                    if not out['default_effort']:
+                        out['default_effort'] = hm.group(2).strip().lower()
+                else:
+                    out['default_model'] = raw_model
         for ek in ('effort', 'effortLevel', 'thinkingLevel', 'reasoningEffort', 'thinking_level', 'effort_level'):
             if isinstance(d.get(ek), str) and d[ek].strip() and not out['default_effort']:
                 out['default_effort'] = d[ek].strip().lower()
@@ -278,8 +306,16 @@ func DirectApplyCommand(kind string, effort bool, value string) (string, bool) {
 	}
 }
 
+func isKnownEffortToken(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "auto":
+		return true
+	}
+	return false
+}
+
 // splitModelAndEffort splits an optional trailing effort tag like "Gemini 4 Neon (High)"
-// into ("Gemini 4 Neon", "high"). Returns (trimmedRaw, "") if no known effort tag is present.
+// or "gemini-4-neon-high" into ("Gemini 4 Neon", "high") / ("gemini-4-neon", "high").
 func splitModelAndEffort(raw string) (string, string) {
 	s := strings.TrimSpace(raw)
 	if s == "" {
@@ -288,10 +324,16 @@ func splitModelAndEffort(raw string) (string, string) {
 	if strings.HasSuffix(s, ")") {
 		if lp := strings.LastIndex(s, "("); lp > 0 {
 			inner := strings.ToLower(strings.TrimSpace(s[lp+1 : len(s)-1]))
-			switch inner {
-			case "off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "auto":
+			if isKnownEffortToken(inner) {
 				return strings.TrimSpace(s[:lp]), inner
 			}
+		}
+	}
+	if dash := strings.LastIndex(s, "-"); dash > 0 && dash+1 < len(s) {
+		suffix := strings.ToLower(strings.TrimSpace(s[dash+1:]))
+		switch suffix {
+		case "off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra":
+			return strings.TrimSpace(s[:dash]), suffix
 		}
 	}
 	return s, ""
@@ -396,9 +438,9 @@ func ShortModelLabel(raw string) string {
 		}
 	}
 	if strings.HasPrefix(low, "gemini-") {
-		rest := strings.TrimSuffix(strings.TrimSuffix(s[len("gemini-"):], "-preview"), "-exp")
+		rest := strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(s[len("gemini-"):], "-tiered"), "-preview"), "-exp")
 		parts := strings.Split(rest, "-")
-		if len(parts) >= 2 {
+		if len(parts) >= 2 && parts[1] != "" {
 			tier := strings.ToUpper(parts[1][:1]) + parts[1][1:]
 			return "Gemini " + parts[0] + " " + tier
 		}
@@ -478,7 +520,7 @@ func (a *App) PrefetchAgentCatalog(key TermKey, t Terminal, onUpdate func(AgentC
 		res, err := backend.MachineExec(ctx, key.InstanceID, ExecParams{
 			On:      on,
 			Cwd:     t.CurrentDir(),
-			Line:    readAgentCatalogScript,
+			Line:    "HC_AGENT_KIND=" + kind + " " + readAgentCatalogScript,
 			Timeout: 4,
 			Env:     map[string]string{"HC_AGENT_KIND": kind},
 		})
