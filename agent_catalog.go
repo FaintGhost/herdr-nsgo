@@ -28,11 +28,14 @@ if kind == 'claude':
             ev = d['env'].get('CLAUDE_CODE_EFFORT_LEVEL')
             if isinstance(ev, str) and ev.strip():
                 out['default_effort'] = ev.strip().lower()
-        if not out['default_effort'] and isinstance(d.get('modelSettings'), dict):
+        if isinstance(d.get('modelSettings'), dict):
             ms = d['modelSettings']
             dm = out['default_model'].lower()
             fallback_eff = ''
+            resolved_model = ''
             for mk, mv in ms.items():
+                if dm and (mk.lower() == dm or dm in mk.lower()) and len(mk) > len(resolved_model):
+                    resolved_model = mk.strip()
                 if not isinstance(mv, dict):
                     continue
                 el = mv.get('effortLevel')
@@ -43,7 +46,8 @@ if kind == 'claude':
                     fallback_eff = el
                 if dm and (mk.lower() == dm or dm in mk.lower()):
                     out['default_effort'] = el
-                    break
+            if resolved_model and dm in ('opus', 'sonnet', 'haiku', 'default', ''):
+                out['default_model'] = resolved_model
             if not out['default_effort'] and fallback_eff:
                 out['default_effort'] = fallback_eff
     except OSError:
@@ -407,6 +411,18 @@ func EffortDisplay(level string) (label, detail string) {
 	}
 }
 
+func isShortDigits(s string) bool {
+	if len(s) == 0 || len(s) > 2 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // ShortModelLabel compresses a full model identifier into a compact composer chip label.
 func ShortModelLabel(raw string) string {
 	s, _ := splitModelAndEffort(raw)
@@ -415,6 +431,10 @@ func ShortModelLabel(raw string) string {
 	}
 	if idx := strings.LastIndex(s, "/"); idx >= 0 && idx+1 < len(s) {
 		s = s[idx+1:]
+	}
+	// Strip optional context-window suffix such as "[1m]" or "[200k]" before parsing version digits.
+	if b := strings.Index(s, "["); b > 0 {
+		s = strings.TrimSpace(s[:b])
 	}
 	low := strings.ToLower(s)
 	switch low {
@@ -430,8 +450,17 @@ func ShortModelLabel(raw string) string {
 	if strings.HasPrefix(low, "claude-") {
 		rest := s[len("claude-"):]
 		parts := strings.Split(rest, "-")
-		if len(parts) >= 3 && len(parts[1]) == 1 && len(parts[2]) == 1 {
+		// Format 1: claude-opus-5-5 / claude-sonnet-4-6-20260101
+		if len(parts) >= 3 && isShortDigits(parts[1]) && isShortDigits(parts[2]) {
 			return strings.ToUpper(parts[0][:1]) + parts[0][1:] + " " + parts[1] + "." + parts[2]
+		}
+		// Format 2: claude-opus-5 / claude-sonnet-4
+		if len(parts) >= 2 && isShortDigits(parts[1]) {
+			return strings.ToUpper(parts[0][:1]) + parts[0][1:] + " " + parts[1]
+		}
+		// Format 3: claude-3-7-sonnet
+		if len(parts) >= 3 && isShortDigits(parts[0]) && isShortDigits(parts[1]) && parts[2] != "" {
+			return strings.ToUpper(parts[2][:1]) + parts[2][1:] + " " + parts[0] + "." + parts[1]
 		}
 		if len(parts) >= 1 && parts[0] != "" {
 			return strings.ToUpper(parts[0][:1]) + parts[0][1:]

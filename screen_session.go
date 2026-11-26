@@ -598,15 +598,29 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 			_ = a.catalogRev.Get()
 		}
 		k := curKey()
-		if m := a.SessionModel(k); m != "" {
-			return ShortModelLabel(m)
-		}
-		if m := latestTranscriptModel(); m != "" {
-			return ShortModelLabel(m)
-		}
+		live := latestTranscriptModel()
 		kind := DetectHarnessKind(curTerm().Terminal)
-		if cat := a.InstantCatalogFor(k.InstanceID, kind, ""); cat.DefaultModel != "" {
-			return ShortModelLabel(cat.DefaultModel)
+		catDef := a.InstantCatalogFor(k.InstanceID, kind, "").DefaultModel
+		if m := a.SessionModel(k); m != "" {
+			// If the optimistic selection is a bare Claude family alias ("opus"/"sonnet"/"haiku")
+			// and the live transcript or host catalog knows the exact version ("claude-opus-5-5"),
+			// display the specific version ("Opus 5.5") instead of bare "Opus".
+			lowM := strings.ToLower(strings.TrimSpace(m))
+			if lowM == "opus" || lowM == "sonnet" || lowM == "haiku" || lowM == "default" {
+				if live != "" && (lowM == "default" || strings.Contains(strings.ToLower(live), lowM)) {
+					return ShortModelLabel(live)
+				}
+				if catDef != "" && (lowM == "default" || strings.Contains(strings.ToLower(catDef), lowM)) {
+					return ShortModelLabel(catDef)
+				}
+			}
+			return ShortModelLabel(m)
+		}
+		if live != "" {
+			return ShortModelLabel(live)
+		}
+		if catDef != "" {
+			return ShortModelLabel(catDef)
 		}
 		return "模型"
 	}

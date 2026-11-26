@@ -201,13 +201,13 @@ func TestAllHarnessesExtractAndDisplayModelAndEffort(t *testing.T) {
 		t.Fatalf("unexpected Agy parsed item: %+v", agyItems)
 	}
 
-	// 2b. ParseClaudeJSONL extracts per-turn effort from api-request output_config.effort and /effort commands!
+	// 2b. ParseClaudeJSONL extracts per-turn effort from api-request output_config.effort and formats Opus 5.5!
 	clItems := ParseClaudeJSONL([]string{
 		`{"type":"api-request","params":{"model":"claude-opus-5-5","output_config":{"effort":"high"}}}`,
-		`{"type":"assistant","uuid":"a1","message":{"id":"msg1","model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":"Hi"}]}}`,
+		`{"type":"assistant","uuid":"a1","message":{"id":"msg1","model":"claude-opus-5-5[1m]","role":"assistant","content":[{"type":"text","text":"Hi"}]}}`,
 	})
-	if len(clItems) != 1 || clItems[0].Model != "claude-opus-5-5" || clItems[0].Effort != "high" {
-		t.Fatalf("unexpected Claude parsed item: %+v", clItems)
+	if len(clItems) != 1 || clItems[0].Effort != "high" || ShortModelLabel(clItems[0].Model) != "Opus 5.5" {
+		t.Fatalf("unexpected Claude parsed item: %+v (label=%q)", clItems, ShortModelLabel(clItems[0].Model))
 	}
 
 	// 3. parsePiOmpJSONLAt extracts thinking_level_change effort.

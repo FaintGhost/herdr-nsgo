@@ -758,6 +758,7 @@ func parseClaudeJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 	toolIdx := make(map[string][2]int)
 	seenUUID := make(map[string]bool)
 	lastAsstMsgID := ""
+	curModel := ""
 	curEffort := ""
 	baseIdx := firstLine - 1
 
@@ -798,6 +799,9 @@ func parseClaudeJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 
 		switch env.Type {
 		case "api-request":
+			if m := strings.TrimSpace(env.Params.Model); m != "" {
+				curModel = m
+			}
 			if eff := strings.TrimSpace(env.Params.OutputConfig.Effort); eff != "" {
 				curEffort = strings.ToLower(eff)
 			}
@@ -870,6 +874,10 @@ func parseClaudeJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 				continue
 			}
 			msgID := nonEmpty(env.Message.ID, nonEmpty(env.UUID, fmt.Sprintf("ca-%d", absIdx)))
+			asstModel := nonEmpty(strings.TrimSpace(env.Message.Model), curModel)
+			if asstModel != "" {
+				curModel = asstModel
+			}
 			for bi, b := range blocks {
 				switch b.Type {
 				case "thinking":
@@ -885,7 +893,7 @@ func parseClaudeJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 							ID:         fmt.Sprintf("%s-th-%d-%d", msgID, absIdx, bi),
 							Role:       RoleThinking,
 							Text:       th,
-							Model:      env.Message.Model,
+							Model:      asstModel,
 							Effort:     curEffort,
 							App:        "claude-code",
 							SourceLine: srcLine,
@@ -911,7 +919,7 @@ func parseClaudeJSONLAt(lines []string, firstLine int) []ChatTurnItem {
 							ID:         fmt.Sprintf("%s-txt-%d-%d", msgID, absIdx, bi),
 							Role:       RoleAssistant,
 							Text:       txt,
-							Model:      env.Message.Model,
+							Model:      asstModel,
 							Effort:     curEffort,
 							App:        "claude-code",
 							Blocks:     SplitMarkdownBlocks(txt),
