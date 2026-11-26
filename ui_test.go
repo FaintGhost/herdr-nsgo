@@ -488,3 +488,88 @@ func TestQuietStudioReviewFixes(t *testing.T) {
 		t.Fatal("quotedText leaked from Session A into Session B across session switch")
 	}
 }
+
+func TestQuietStudioVerifyScreenshots(t *testing.T) {
+	// 1. Phone Light Home, Inbox, Instances, Tools Sheet, Settings, Tokens Gallery, Dark Home
+	h := nsgotest.Start(t, func(cx *core.Scope) core.Node {
+		a, node := testSeededApp(cx)
+		snaps := a.instances.Get()
+		snaps[0].Terminals = append(snaps[0].Terminals, Terminal{
+			Address: "t9",
+			Name:    "rate-limited-job",
+			Cwd:     "/srv/jobs",
+			State:   "error",
+			Status:  &Status{State: "error", App: "claude", Msg: "You've hit your 5-hour limit"},
+		})
+		a.instances.Set(snaps)
+		a.SeedSnapshots(snaps)
+		a.SetTranscriptBackend(&fakeTranscriptBackend{})
+		return node
+	}, nsgotest.Size(390, 844))
+
+	h.Find("id:screen-home")
+	h.Screenshot("actual-home-light")
+
+	h.Press("id:tab-inbox")
+	h.Find("id:screen-inbox")
+	h.Screenshot("actual-inbox")
+
+	h.Press("id:tab-instances")
+	h.Find("id:screen-instances")
+	h.Screenshot("actual-instances")
+
+	h.Press("id:tab-home")
+	h.Press("id:session-row-mac::t1")
+	h.Find("id:screen-session")
+	h.Press("id:session-tools-btn")
+	h.Find("id:sheet-session-tools")
+	h.Screenshot("actual-session-tools")
+	h.Press("id:sheet-session-tools-close")
+	h.Press("id:session-back-btn")
+
+	h.Press("id:home-settings-btn")
+	h.Find("id:screen-settings")
+	h.Screenshot("actual-settings")
+	h.Press("id:settings-tokens-btn")
+	h.Find("id:tokens-gallery-preview")
+	h.Screenshot("actual-tokens-gallery")
+	h.Press("id:tokens-back-btn")
+	h.Press("id:theme-dark")
+	h.Press("id:settings-back-btn")
+	h.Find("id:screen-home")
+	h.Screenshot("actual-home-dark")
+
+	// 2. Wide 1080x680 3-pane (56px WideNavRail + 280px sidebar + 720px centered Chat)
+	var wideUI *uiController
+	wide := nsgotest.Start(t, func(cx *core.Scope) core.Node {
+		a, _ := testSeededApp(cx)
+		snaps := a.instances.Get()
+		snaps[1].Terminals[0].Foreground = &Foreground{PID: 34488, Name: "claude", Cwd: "/Volumes/ExternalSSD/workspace/herdr-nsgo", Argv: []string{"claude"}}
+		a.SeedSnapshots(snaps)
+		fb := &fakeTranscriptBackend{
+			terms: map[TermKey]AggregatedTerminal{
+				{InstanceID: "mac", Addr: "t1"}: {Key: TermKey{InstanceID: "mac", Addr: "t1"}, Terminal: snaps[1].Terminals[0]},
+			},
+			files: map[string][]string{
+				"::/Users/dev/.claude/sessions/34488.json": {`{"pid":34488,"sessionId":"w1","cwd":"/Volumes/ExternalSSD/workspace/herdr-nsgo"}`},
+				"::/Users/dev/.claude/projects/-Volumes-ExternalSSD-workspace-herdr-nsgo/w1.jsonl": {
+					`{"type":"user","uuid":"u1","message":{"role":"user","content":"帮我把桌面宽屏三栏和会话阅读宽度调到最舒服的比例"}}`,
+					`{"type":"assistant","uuid":"a1","message":{"id":"m1","model":"claude-opus-4-7","role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"Edit","input":{"file_path":"main.go","old_string":"old","new_string":"new"}}]}}`,
+					`{"type":"user","uuid":"u2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","content":"Updated main.go"}]}}`,
+					`{"type":"assistant","uuid":"a2","message":{"id":"m1","model":"claude-opus-4-7","role":"assistant","content":[{"type":"text","text":"已完成三栏布局：左侧 56px 图标 Rail、280px 会话侧栏、右侧居中 720px 阅读流与悬浮输入器。"}]}}`,
+				},
+			},
+		}
+		a.transcriptResolver.SetHome("mac", "", "/Users/dev")
+		a.SetTranscriptBackend(fb)
+		node, ctrl := rootWithController(cx, a)
+		wideUI = ctrl
+		return node
+	}, nsgotest.Size(1080, 680))
+
+	wide.Press("id:session-row-mac::t1")
+	_ = wideUI.activeChat.Get().RefreshSync(t.Context())
+	wide.Find("id:wide-nav-rail")
+	wide.Find("id:chat-surface")
+	wide.Screenshot("actual-wide-rail")
+}

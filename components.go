@@ -1359,19 +1359,7 @@ func SheetModal(cx *core.Scope, a *App, testID, title, closeTestID string, onClo
 			}
 		},
 		Children: []core.Node{
-			// Quiet Studio drag handle
-			core.View{
-				StyleFunc: func() core.Style {
-					return core.Style{
-						Width:        core.Pt(36),
-						Height:       core.Pt(4),
-						CornerRadius: 2,
-						Background:   a.paletteOf(cx).Fill,
-						AlignSelf:    core.AlignCenter,
-					}
-				},
-			},
-			// Sheet header: 18px title + circular 32x32 Lucide X close button
+			// Sheet header: 18px title + circular 32x32 Lucide X close button (ui.Sheet renders the top drag handle)
 			core.View{
 				Style: core.Style{
 					Direction:      core.Row,
