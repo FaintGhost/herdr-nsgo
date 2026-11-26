@@ -186,7 +186,9 @@ func TestUISessionVTViewObserveToggleKeycapAndSnippets(t *testing.T) {
 	app.Find("id:sheet-snippets")
 	app.Press("id:sheet-snippets-close")
 
-	// Toggle in-session search bar.
+	// Toggle in-session search bar via Tools sheet.
+	app.Press("id:session-tools-btn")
+	app.Find("id:sheet-session-tools")
 	app.Press("id:session-search-btn")
 	app.Find("id:session-search-input")
 }
@@ -313,4 +315,32 @@ func TestQuietStudioShellAndInboxGrouping(t *testing.T) {
 	phone.Find("text:权限审批 · 1")
 	phone.Find("text:等待回答与认证 · 1")
 	phone.Find("text:异常与限流 · 1")
+}
+
+func TestQuietStudioSessionHeaderAndToolsSheet(t *testing.T) {
+	h := nsgotest.Start(t, func(cx *core.Scope) core.Node {
+		_, node := testSeededApp(cx)
+		return node
+	}, nsgotest.Size(390, 844))
+
+	h.Press("id:session-row-mac::t1")
+	h.Find("id:screen-session")
+	h.Find("id:chat-glass-composer")
+
+	// Session header must stay clean: Search lives inside sheet-session-tools, not in the top header.
+	if len(h.Query("id:session-search-btn")) != 0 {
+		t.Fatal("session-search-btn must move into sheet-session-tools to keep the 48px session header uncluttered")
+	}
+
+	// Working + empty composer shows fixed-size circular stop button (session-interrupt-btn).
+	stopBounds := h.Find("id:session-interrupt-btn").Bounds()
+	if stopBounds.Size.Width != stopBounds.Size.Height || stopBounds.Size.Width > 38 {
+		t.Fatalf("session-interrupt-btn must be a compact fixed-size circle (34x34), got %+v", stopBounds.Size)
+	}
+
+	// Open tools sheet -> tap session-search-btn -> reveals session-search-input.
+	h.Press("id:session-tools-btn")
+	h.Find("id:sheet-session-tools")
+	h.Press("id:session-search-btn")
+	h.Find("id:session-search-input")
 }

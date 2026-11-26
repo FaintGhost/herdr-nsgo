@@ -8,19 +8,27 @@ import (
 
 	"github.com/nsgo-dev/nsgo/base"
 	"github.com/nsgo-dev/nsgo/core"
+	"github.com/nsgo-dev/nsgo/icons/lucide"
 	"github.com/nsgo-dev/nsgo/ui"
+	"github.com/nsgo-dev/nsgo/ui/chat"
 )
 
 // sessionScreen renders the unified Session view with seamless 0ms switching between
 // Chat View (official NSGo ui/chat + ui/diff + Moshi Floating Glass Composer) and real 2D VT Terminal View:
-// - 44px compact safe-area header with 1-tap Quick Session Switcher, fixed 聊天|终端 segmented pill, search, tools
-// - Collapsible search bar (filters Chat cards in chat mode; jumps VT matches in vt mode)
-// - Active viewport (Chat View or VT Canvas, both kept mounted for <1ms visibility swap)
-// - Mode-adaptive bottom composer: Floating Liquid-Glass multiline composer in Chat mode (with >_ quick VT switch,
-//   expandable tall editor, quote preview, and swipe-down keyboard dismiss) vs KeycapBar + terminal dock in VT mode.
+//   - 44px compact safe-area header with 1-tap Quick Session Switcher, fixed 聊天|终端 segmented pill, search, tools
+//   - Collapsible search bar (filters Chat cards in chat mode; jumps VT matches in vt mode)
+//   - Active viewport (Chat View or VT Canvas, both kept mounted for <1ms visibility swap)
+//   - Mode-adaptive bottom composer: Floating Liquid-Glass multiline composer in Chat mode (with >_ quick VT switch,
+//     expandable tall editor, quote preview, and swipe-down keyboard dismiss) vs KeycapBar + terminal dock in VT mode.
 func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 	a := u.app
 	showSearch := core.NewSignal(cx, false)
+	previewKey := core.NewSignal(cx, TermKey{})
+	muxKey := core.NewSignal(cx, TermKey{})
+	projectKey := core.NewSignal(cx, TermKey{})
+	showAttachments := core.NewSignal(cx, false)
+	var attachmentKey TermKey
+	showVoice := core.NewSignal(cx, TermKey{})
 	showSnippets := core.NewSignal(cx, false)
 	showTools := core.NewSignal(cx, false)
 	showSwitcher := core.NewSignal(cx, false)
@@ -31,6 +39,7 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 
 	composerExpanded := core.NewSignal(cx, true)
 	composerTall := core.NewSignal(cx, false)
+	composerInset := core.NewSignal(cx, core.Points(138))
 	composerHeight := core.NewSignal(cx, core.Points(22))
 	quotedText := core.NewSignal(cx, "")
 
@@ -70,9 +79,46 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 		return qb.String()
 	}
 
+	type submitChoice struct {
+		key  TermKey
+		kind string
+		mode chatSubmitMode
+	}
+	selectedMode := core.NewSignal(cx, submitChoice{})
+	modeFor := func(kind string) chatSubmitMode {
+		choice := selectedMode.Get()
+		if choice.key == curKey() && choice.kind == kind {
+			return choice.mode
+		}
+		return defaultSubmitMode(kind)
+	}
 	sendComposerText := func() {
 		k := curKey()
-		raw := strings.TrimSpace(a.Compose(k.String()))
+		kind := DetectHarnessKind(curTerm().Terminal)
+		mode := modeFor(kind)
+		draft := a.Compose(k.String())
+		raw := strings.TrimSpace(draft)
+		if strings.HasPrefix(raw, "/") {
+			mode = chatNormal
+		}
+		if isChatMode() && a.chatImages.Get()[k].name != "" {
+			chatCtrl := curChat()
+			quote := quotedText.Get()
+			a.sendChatImage(k, buildFinalSendText(raw), kind, mode, func(message string) {
+				if a.Compose(k.String()) == draft {
+					a.SetCompose(k.String(), "")
+				}
+				if curKey() == k && quotedText.Get() == quote {
+					quotedText.Set("")
+				}
+				if chatCtrl != nil && !chatCtrl.isClosed() {
+					id := chatCtrl.beginChatSend(message, string(mode))
+					chatCtrl.confirmSubmission(id, mode)
+					chatCtrl.RefreshAsync()
+				}
+			})
+			return
+		}
 		if raw == "" {
 			return
 		}
@@ -86,7 +132,7 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 			chatCtrl := curChat()
 			var optID string
 			if chatCtrl != nil {
-				optID = chatCtrl.AddOptimisticUser(text)
+				optID = chatCtrl.beginChatSend(text, string(mode))
 			}
 			a.SetCompose(k.String(), "")
 			playSelectionHaptic(cx)
@@ -94,7 +140,7 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 			if a.clientForKey(k) == nil && a.transcriptBackend != nil {
 				return
 			}
-			a.SendToWithCallback(k, text, func(err error) {
+			a.sendChatWithMode(k, text, kind, mode, func(err error) {
 				if err != nil {
 					if chatCtrl != nil {
 						chatCtrl.RemoveOptimistic(optID)
@@ -107,6 +153,7 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 					return
 				}
 				if chatCtrl != nil {
+					chatCtrl.confirmSubmission(optID, mode)
 					chatCtrl.RefreshAsync()
 				}
 			})
@@ -189,33 +236,67 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 		},
 	}
 
-	var leftControls []core.Node
+	var headerControls []core.Node
 	if showBack {
-		leftControls = append(leftControls, IconButton(cx, a, "session-back-btn", "返回", iconBack, false, func() {
-			u.closeSession()
-		}))
+		headerControls = append(headerControls, IconTap(cx, a, "session-back-btn", "返回", iconBack, u.closeSession))
 	}
-	// Moshi-inspired 1-tap Quick Session Switcher button in TopHeader (fixed across Chat & VT modes!)
-	leftControls = append(leftControls, IconButton(cx, a, "session-switcher-btn", "快速切换会话", iconSwitcher, false, func() {
-		showSwitcher.Set(true)
-	}))
-	leftNode := core.View{
-		Style:    core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: core.Points(6), FlexShrink: 0},
-		Children: leftControls,
-	}
+	headerControls = append(headerControls, base.Button{
+		TestID:    "session-switcher-btn",
+		LabelFunc: func() string { return "切换会话 · " + curTerm().Terminal.Label() },
+		OnPress:   func(core.PressEvent) { showSwitcher.Set(true) },
+		Style: core.Style{
+			FlexGrow:   1,
+			FlexShrink: 1,
+			MinWidth:   core.Pt(0),
+			MinHeight:  core.Pt(Tokens.SizeTouch),
+			Direction:  core.Row,
+			AlignItems: core.AlignCenter,
+			Gap:        core.Points(6),
+			Padding:    core.Symmetric(0, core.Points(4)),
+		},
+		Children: []core.Node{
+			core.View{
+				StyleFunc: func() core.Style {
+					return core.Style{
+						FlexShrink:   0,
+						Width:        core.Pt(8),
+						Height:       core.Pt(8),
+						CornerRadius: 4,
+						Background:   stateDotColor(a.paletteOf(cx), curTerm().Terminal.StateWord()),
+					}
+				},
+			},
+			core.Text{
+				ContentFunc: func() string { return curTerm().Terminal.Label() },
+				MaxLines:    1,
+				Style: core.Style{
+					FlexShrink: 1,
+					MinWidth:   core.Pt(0),
+					FontSize:   Tokens.FontSession,
+					FontWeight: core.FontWeightSemibold,
+				},
+				StyleFunc: ui.Colored(func() core.Color { return a.paletteOf(cx).Text }),
+			},
+			ui.Icon(lucide.ChevronDown, 13, func() core.Color { return a.paletteOf(cx).TextMuted }),
+		},
+	})
 
 	modeSegmentPill := core.View{
 		StyleFunc: func() core.Style {
 			pal := a.paletteOf(cx)
+			bw := core.Points(0)
+			if pal.Dark {
+				bw = 1
+			}
 			return core.Style{
 				FlexShrink:   0,
 				Direction:    core.Row,
 				AlignItems:   core.AlignCenter,
 				Background:   pal.SurfaceRaised,
-				CornerRadius: Tokens.RadiusCtrl,
-				BorderWidth:  1,
+				CornerRadius: Tokens.RadiusPill,
+				BorderWidth:  bw,
 				BorderColor:  pal.Border,
-				Padding:      core.All(core.Points(2)),
+				Padding:      core.All(core.Points(3)),
 				Gap:          core.Points(2),
 			}
 		},
@@ -254,6 +335,16 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 				}
 				a.SetCompose(curKey().String(), txt)
 			},
+			OnPaste: func(ev core.PasteEvent) {
+				if !isChatMode() {
+					return
+				}
+				for _, file := range ev.Files {
+					if strings.HasPrefix(file.MIME, "image/") {
+						a.attachChatImage(curKey(), file.Name, file.MIME, file.Data)
+					}
+				}
+			},
 			OnSubmit: func(string) {
 				sendComposerText()
 			},
@@ -261,7 +352,10 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 				composerHeight.Set(sz.Height)
 			},
 			Style: core.Style{
-				Width:             core.Pct(100),
+				MinWidth:          core.Pt(0),
+				MaxWidth:          core.Pct(100),
+				AlignSelf:         core.AlignStretch,
+				Overflow:          core.Hidden,
 				FontSize:          Tokens.FontBody,
 				LineHeight:        core.Points(20),
 				TextAlignVertical: core.TextAlignVerticalTop,
@@ -288,13 +382,11 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 					maxLinesH = 220
 					minH = 148
 				}
-				curH := composerHeight.Get() + 10
-				if curH < minH {
-					curH = minH
-				}
-				if curH > maxLinesH {
-					curH = maxLinesH
-				}
+				// Reserve the header, composer controls and safe area while the IME is open.
+				available := cx.Env().Window().Height - cx.Env().KeyboardHeight() - cx.Env().SafeArea().Top - cx.Env().SafeArea().Bottom
+				maxLinesH = min(maxLinesH, max(36, available-150))
+				minH = min(minH, maxLinesH)
+				curH := min(maxLinesH, max(minH, composerHeight.Get()+8))
 				return core.Style{
 					Height:           core.Pt(curH),
 					MinHeight:        core.Pt(minH),
@@ -308,33 +400,110 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 		}
 	}
 
-	uploadAction := func() {
+	pickPhoto := func(key TermKey, chatMode bool) {
 		if cx == nil {
 			return
 		}
-		cx.PickImages(core.PickOptions{Limit: 1}, func(files []core.PickedFile) {
+		cx.PickImages(core.PickOptions{Limit: 1, MaxDimension: 2400}, func(files []core.PickedFile) {
 			if len(files) == 0 {
 				return
 			}
 			f := files[0]
-			a.UploadFileTo(curKey(), f.Name, f.Data)
+			if chatMode {
+				a.attachChatImage(key, f.Name, f.MIME, f.Data)
+				return
+			}
+			a.UploadFileTo(key, f.Name, f.Data)
 		})
 	}
 
+	uploadAction := func() {
+		key := curKey()
+		if !isChatMode() {
+			pickPhoto(key, false)
+			return
+		}
+		attachmentKey = key
+		cx.DismissKeyboard()
+		showAttachments.Set(true)
+	}
+	selector := core.NewSignal(cx, "")
+	var selectorKey TermKey
+	openAgentSelector := func(effort bool) {
+		selectorKey = curKey()
+		cx.DismissKeyboard()
+		if effort {
+			selector.Set("思考强度")
+		} else {
+			selector.Set("模型")
+		}
+	}
 	sendOrInterruptNode := func(cx *core.Scope) core.Node {
 		return core.Show{
 			When: func() bool {
-				return isChatMode() &&
+				return isChatMode() && a.chatImages.Get()[curKey()].name == "" &&
 					curTerm().Terminal.StateWord() == "working" &&
 					strings.TrimSpace(a.Compose(curKey().String())) == ""
 			},
 			Then: func(cx *core.Scope) core.Node {
-				return ActionButton(cx, a, "session-interrupt-btn", "中断", ActionDanger, func() {
-					a.InterruptTo(curKey())
-				})
+				return base.Button{
+					TestID: "session-interrupt-btn",
+					Label:  "中断",
+					OnPress: func(core.PressEvent) {
+						playSelectionHaptic(cx)
+						a.InterruptTo(curKey())
+					},
+					Style: core.Style{
+						Width:          core.Pt(34),
+						Height:         core.Pt(34),
+						FlexShrink:     0,
+						CornerRadius:   17,
+						AlignItems:     core.AlignCenter,
+						JustifyContent: core.JustifyCenter,
+					},
+					StyleFunc: func() core.Style {
+						return core.Style{Background: a.paletteOf(cx).Accent}
+					},
+					Children: []core.Node{
+						ui.Icon(lucide.Square, 13, func() core.Color { return a.paletteOf(cx).AccentFg }),
+					},
+				}
 			},
 			Else: func(cx *core.Scope) core.Node {
-				return IconButton(cx, a, "session-send-btn", "发送", iconSend, true, sendComposerText)
+				if !isChatMode() {
+					return IconButton(cx, a, "session-send-btn", "发送", iconSend, true, sendComposerText)
+				}
+				empty := func() bool {
+					return strings.TrimSpace(a.Compose(curKey().String())) == "" && a.chatImages.Get()[curKey()].name == ""
+				}
+				return base.Button{
+					TestID:   "session-send-btn",
+					Label:    "发送",
+					Disabled: empty,
+					OnPress:  func(core.PressEvent) { sendComposerText() },
+					Style: core.Style{
+						Width:          core.Pt(34),
+						Height:         core.Pt(34),
+						FlexShrink:     0,
+						CornerRadius:   17,
+						AlignItems:     core.AlignCenter,
+						JustifyContent: core.JustifyCenter,
+					},
+					StyleFunc: func() core.Style {
+						p := a.paletteOf(cx)
+						if empty() {
+							return core.Style{Background: p.Fill}
+						}
+						return core.Style{Background: p.Accent}
+					},
+					Children: []core.Node{ui.Icon(lucide.ArrowUp, 17, func() core.Color {
+						p := a.paletteOf(cx)
+						if empty() {
+							return p.TextMuted
+						}
+						return p.AccentFg
+					})},
+				}
 			},
 		}
 	}
@@ -352,19 +521,32 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 			}
 		},
 		Children: []core.Node{
-			// 44px compact session top bar with FIXED right controls across modes so toggling 聊天 <-> 终端 NEVER shifts or deforms the header!
-			TopHeader(cx, a, func() string {
-				return curTerm().Terminal.Label()
-			}, leftNode, []core.Node{
-				modeSegmentPill,
-				IconButton(cx, a, "session-search-btn", "搜索", iconSearch, false, func() {
-					animateSpringLayout(cx)
-					showSearch.Set(!showSearch.Get())
-				}),
-				IconButton(cx, a, "session-tools-btn", "更多工具", iconMore, false, func() {
-					showTools.Set(true)
-				}),
-			}),
+			// 48px single flex-row Quiet Studio session header (Search moved into Tools sheet; fixed controls across modes).
+			core.View{
+				Style: core.Style{
+					PaddingEnv: core.EnvEdges{Top: core.EnvSafeArea},
+					Padding:    core.Symmetric(Tokens.Space1, Tokens.Space2),
+					Borders:    core.Edges{Bottom: 1},
+				},
+				StyleFunc: func() core.Style {
+					p := a.paletteOf(cx)
+					return core.Style{Background: p.Surface, BorderColor: p.Separator}
+				},
+				Children: []core.Node{
+					core.View{
+						Style: core.Style{
+							Direction:  core.Row,
+							AlignItems: core.AlignCenter,
+							Gap:        Tokens.Space1,
+							MinHeight:  core.Pt(Tokens.SizeTopbar),
+						},
+						Children: append(headerControls,
+							modeSegmentPill,
+							IconTap(cx, a, "session-tools-btn", "更多工具", iconMore, func() { showTools.Set(true) }),
+						),
+					},
+				},
+			},
 			ToastBanner(cx, a),
 			// Collapsible in-session search bar (mode-aware)
 			core.Show{
@@ -523,7 +705,7 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 										func(replyText string) {
 											quotedText.Set(replyText)
 											a.notifyToast("已引用回复到输入框")
-										},
+										}, composerInset.Get,
 									)
 								},
 							),
@@ -687,9 +869,14 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 							},
 						},
 					},
-					// Moshi Floating Liquid-Glass Composer overlay in Chat mode (hovers over blurred bottom edge!)
+					// Floating Quiet Studio Chat Composer: centered at ChatMaxWidth on wide screens, zero drag-handle clutter.
 					core.View{
 						PointerEvents: core.PointerEventsBoxNone,
+						OnLayout: func(b core.Bounds) {
+							if b.Size.Height > 0 {
+								composerInset.Set(b.Size.Height + 16)
+							}
+						},
 						StyleFunc: func() core.Style {
 							if !isChatMode() {
 								return core.Style{Display: core.DisplayNone}
@@ -699,64 +886,29 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 								Left:       core.Pt(12),
 								Right:      core.Pt(12),
 								Bottom:     core.Pt(8),
+								AlignItems: core.AlignCenter,
 								PaddingEnv: core.EnvEdges{Bottom: core.EnvKeyboard},
 								ZIndex:     5,
 							}
 						},
 						Children: []core.Node{
 							core.View{
-								TestID:        "chat-glass-composer",
-								PanActivation: core.PanActivation{ActiveOffsetY: 8, FailOffsetX: 16},
-								OnPan: func(ev core.PanEvent) {
-									if ev.Phase != core.GestureEnded {
-										return
-									}
-									// Moshi COMPOSER_SWIPE_DISMISS: swipe down on composer dismisses keyboard;
-									// swipe up expands into tall prompt editor!
-									if ev.Translation.Y > 26 {
-										if composerTall.Get() {
-											animateSpringLayout(cx)
-											composerTall.Set(false)
-										} else if cx != nil {
-											cx.DismissKeyboard()
-										}
-									} else if ev.Translation.Y < -32 && !composerTall.Get() {
-										animateSpringLayout(cx)
-										playSelectionHaptic(cx)
-										composerTall.Set(true)
-									}
-								},
+								TestID: "chat-glass-composer",
 								StyleFunc: func() core.Style {
 									pal := a.paletteOf(cx)
 									return core.Style{
-										Background:      pal.GlassSurface,
-										BackdropFilters: []core.Filter{core.Blur(24)},
-										GlassEffect:     core.GlassRegular,
-										CornerRadius:    core.Points(14),
-										BorderWidth:     1,
-										BorderColor:     pal.GlassBorder,
-										Padding:         core.Symmetric(core.Points(8), core.Points(10)),
-										Margin:          core.Edges{Bottom: max(0, cx.Env().SafeArea().Bottom-4)},
-										Gap:             core.Points(6),
+										Width:        core.Pct(100),
+										MaxWidth:     core.Pt(Tokens.ChatMaxWidth),
+										Background:   pal.GlassSurface,
+										CornerRadius: core.Points(22),
+										BorderWidth:  1,
+										BorderColor:  pal.GlassBorder,
+										Padding:      core.Symmetric(core.Points(10), core.Points(12)),
+										Margin:       core.Edges{Bottom: max(0, cx.Env().SafeArea().Bottom-4)},
+										Gap:          core.Points(6),
 									}
 								},
 								Children: []core.Node{
-									// Subtle Moshi resize pill handle
-									core.View{
-										Style: core.Style{AlignItems: core.AlignCenter},
-										Children: []core.Node{
-											core.View{
-												StyleFunc: func() core.Style {
-													return core.Style{
-														Width:        core.Pt(28),
-														Height:       core.Pt(3),
-														CornerRadius: 2,
-														Background:   a.paletteOf(cx).Fill,
-													}
-												},
-											},
-										},
-									},
 									// Optional Quoted Reply chip (commentOnSelection)
 									core.Show{
 										When: func() bool { return strings.TrimSpace(quotedText.Get()) != "" },
@@ -798,10 +950,10 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 														},
 														Style: core.Style{Padding: core.Symmetric(core.Points(2), core.Points(6))},
 														Children: []core.Node{
-															core.Text{
-																Content: "×",
+															core.Icon{
+																SVG: iconClose,
 																StyleFunc: func() core.Style {
-																	return core.Style{Color: a.paletteOf(cx).TextMuted, FontSize: Tokens.FontBody, FontWeight: core.FontWeightBold}
+																	return core.Style{Width: core.Pt(14), Height: core.Pt(14), Color: a.paletteOf(cx).TextMuted}
 																},
 															},
 														},
@@ -810,50 +962,100 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 											}
 										},
 									},
-									// Shared single-instance editor mounted inside Chat Glass Card ONLY when isChatMode()!
 									core.Show{
-										When: isChatMode,
-										Then: composerEditor,
-									},
-									// Bottom control row inside glass card: [图片] [短语] [展开长文] ... [>_ 终端] [中断/发送]
-									core.Show{
-										When: isChatMode,
+										When: func() bool { return isChatMode() && a.chatImages.Get()[curKey()].name != "" },
 										Then: func(cx *core.Scope) core.Node {
-											return core.View{
-												Style: core.Style{
-													Direction:      core.Row,
-													AlignItems:     core.AlignCenter,
-													JustifyContent: core.JustifySpaceBetween,
-													Gap:            Tokens.Space2,
-												},
-												Children: []core.Node{
-													core.View{
-														Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: core.Points(6)},
-														Children: []core.Node{
-															IconButton(cx, a, "session-upload-btn", "上传图片", iconImage, false, uploadAction),
-															IconButton(cx, a, "session-snippets-btn", "常用短语", iconSnippets, false, func() {
-																showSnippets.Set(true)
-															}),
-															IconButton(cx, a, "session-expand-composer-btn", "展开长文编辑", iconExpand, composerTall.Get(), func() {
-																animateSpringLayout(cx)
-																composerTall.Set(!composerTall.Get())
-															}),
-														},
-													},
-													core.View{
-														Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: core.Points(6)},
-														Children: []core.Node{
-															// Moshi signature thumb-level quick return to terminal (>_ 终端)!
-															FilterPill(cx, a, "chat-composer-vt-btn", func() string { return ">_ 终端" }, func() bool { return false }, nil, func() {
-																u.setSessionMode("vt")
-															}),
-															sendOrInterruptNode(cx),
-														},
-													},
-												},
-											}
+											return core.Dynamic(func(cx *core.Scope) core.Node {
+												key := curKey()
+												draft := a.chatImages.Get()[key]
+												chip := chat.Attachment{Label: draft.name}
+												if !draft.document {
+													chip.Image = core.ImageSource{Data: draft.data}
+												}
+												if !draft.sending {
+													chip.RemoveLabel = "移除附件"
+													chip.OnRemove = func() {
+														if !a.chatImages.Get()[key].sending {
+															a.setChatImage(key, chatImageDraft{})
+														}
+													}
+												}
+												children := []core.Node{chip}
+												if draft.sending {
+													children = append(children, ui.Spinner{Size: 16, Label: "正在发送附件"})
+												}
+												return core.View{TestID: "chat-image-attachment", Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: Tokens.Space2}, Children: children}
+											})
 										},
 									},
+									slashCommandBar(cx, a, func() string { return a.Compose(curKey().String()) }, curTerm, curChat, func() bool { return isChatMode() && quotedText.Get() == "" }),
+									core.Show{When: isChatMode, Then: composerEditor},
+									core.Show{When: isChatMode, Then: func(cx *core.Scope) core.Node {
+										return core.View{
+											PanActivation: core.PanActivation{ActiveOffsetY: 12, FailOffsetX: 16},
+											OnPan: func(ev core.PanEvent) {
+												if ev.Phase != core.GestureEnded {
+													return
+												}
+												if ev.Translation.Y > 26 {
+													if composerTall.Get() {
+														animateSpringLayout(cx)
+														composerTall.Set(false)
+													} else if cx != nil {
+														cx.DismissKeyboard()
+													}
+												} else if ev.Translation.Y < -32 && !composerTall.Get() {
+													animateSpringLayout(cx)
+													playSelectionHaptic(cx)
+													composerTall.Set(true)
+												}
+											},
+											Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: Tokens.Space1},
+											Children: []core.Node{
+												base.Button{
+													TestID:  "session-upload-btn",
+													Label:   "更多输入操作",
+													OnPress: func(core.PressEvent) { uploadAction() },
+													Style: core.Style{
+														Width:          core.Pt(32),
+														Height:         core.Pt(32),
+														FlexShrink:     0,
+														CornerRadius:   16,
+														AlignItems:     core.AlignCenter,
+														JustifyContent: core.JustifyCenter,
+													},
+													StyleFunc: func() core.Style {
+														return core.Style{Background: a.paletteOf(cx).SurfaceRaised}
+													},
+													Children: []core.Node{
+														ui.Icon(lucide.Plus, 16, func() core.Color { return a.paletteOf(cx).Text }),
+													},
+												},
+												core.Show{When: func() bool { return defaultSubmitMode(DetectHarnessKind(curTerm().Terminal)) != chatNormal }, Then: func(cx *core.Scope) core.Node {
+													return core.View{Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: core.Points(4), FlexShrink: 1, MinWidth: core.Pt(0)}, Children: []core.Node{
+														chat.Chip{TestID: "chat-model-selector", Text: "模型", Caret: true, OnPress: func() { openAgentSelector(false) }},
+														chat.Chip{TestID: "chat-effort-selector", Text: "思考强度", Caret: true, OnPress: func() { openAgentSelector(true) }},
+														chat.Chip{TestID: "chat-mode-toggle", TextFunc: func() string { return "忙时" + string(modeFor(DetectHarnessKind(curTerm().Terminal))) }, OnPress: func() {
+															kind := DetectHarnessKind(curTerm().Terminal)
+															next := chatSteer
+															if modeFor(kind) == next {
+																next = chatQueue
+															}
+															selectedMode.Set(submitChoice{curKey(), kind, next})
+														}},
+													}}
+												}},
+												core.View{Style: core.Style{FlexGrow: 1}},
+												renderDeliveryIndicator(cx, a, func() string {
+													if c := curChat(); c != nil {
+														return c.activity(curTerm().Terminal)
+													}
+													return ""
+												}),
+												sendOrInterruptNode(cx),
+											},
+										}
+									}},
 								},
 							},
 						},
@@ -874,7 +1076,9 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 					}
 				},
 				Children: []core.Node{
-					KeycapBar(cx, a, keycaps),
+					core.Show{When: func() bool { return supportedMux(curTerm().Terminal.Labels[muxKindLabel]) }, Then: func(cx *core.Scope) core.Node {
+						return KeycapBar(cx, a, append([]KeycapItem{{TestID: "keycap-mux", LabelFunc: func() string { return curTerm().Terminal.Labels[muxKindLabel] }, OnPress: func() { muxKey.Set(curKey()) }}}, keycaps...))
+					}, Else: func(cx *core.Scope) core.Node { return KeycapBar(cx, a, keycaps) }},
 					core.Show{
 						When: func() bool { return !isChatMode() && composerExpanded.Get() },
 						Then: func(cx *core.Scope) core.Node {
@@ -908,7 +1112,10 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 					},
 				},
 			},
-			// Moshi-inspired Quick Session Switcher Sheet (swipe-dismissable, grouped by NeedsYou -> Working -> Idle)
+			core.Show{When: func() bool { return selector.Get() != "" && selectorKey == curKey() && isChatMode() }, Then: func(cx *core.Scope) core.Node {
+				return mobileAgentPicker(cx, a, curTerm(), selector.Get() == "思考强度", func() { selector.Set("") })
+			}},
+			// Quiet Studio Quick Session Switcher Sheet (grouped GroupCards: 需要你 -> 运行中 -> 空闲与在线)
 			core.Show{
 				When: showSwitcher.Get,
 				Then: func(cx *core.Scope) core.Node {
@@ -934,10 +1141,14 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 						}
 						tCopy := fmt.Sprintf("%s · %d", title, len(list))
 						body = append(body, SectionHeader(cx, a, func() string { return tCopy }, nil))
-						for _, entry := range list {
+						var rows []core.Node
+						for i, entry := range list {
+							if i > 0 {
+								rows = append(rows, InsetDivider(cx, a, 34))
+							}
 							it := entry
 							isCur := it.Key == curKey()
-							body = append(body, core.View{
+							rows = append(rows, core.View{
 								TestID: "switcher-item-" + it.Key.String(),
 								Role:   core.RoleButton,
 								OnPress: func(core.PressEvent) {
@@ -949,26 +1160,31 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 								},
 								StyleFunc: func() core.Style {
 									pal := a.paletteOf(cx)
-									bg := pal.SurfaceRaised
-									bc := pal.Border
+									bg := core.Transparent
 									if isCur {
 										bg = pal.AccentSoft
-										bc = pal.Accent
 									}
 									return core.Style{
 										Direction:      core.Row,
 										AlignItems:     core.AlignCenter,
 										JustifyContent: core.JustifySpaceBetween,
-										Gap:            Tokens.Space2,
+										Gap:            Tokens.Space3,
 										Background:     bg,
-										CornerRadius:   Tokens.RadiusCard,
-										BorderWidth:    1,
-										BorderColor:    bc,
-										Padding:        core.Symmetric(core.Points(10), Tokens.Space3),
+										Padding:        core.Symmetric(core.Points(11), core.Points(14)),
 									}
 								},
 								Children: []core.Node{
-									HarnessIconBadge(cx, a, func() string { return it.Terminal.AppName() }),
+									core.View{
+										StyleFunc: func() core.Style {
+											return core.Style{
+												FlexShrink:   0,
+												Width:        core.Pt(8),
+												Height:       core.Pt(8),
+												CornerRadius: 4,
+												Background:   stateDotColor(a.paletteOf(cx), it.Terminal.StateWord()),
+											}
+										},
+									},
 									core.View{
 										Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinWidth: core.Pt(0), Gap: core.Points(2)},
 										Children: []core.Node{
@@ -979,7 +1195,7 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 													return core.Style{
 														Color:      a.paletteOf(cx).Text,
 														FontSize:   Tokens.FontRowTitle,
-														FontWeight: core.FontWeightSemibold,
+														FontWeight: core.FontWeightMedium,
 													}
 												},
 											},
@@ -996,10 +1212,21 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 											},
 										},
 									},
-									StatusBadge(cx, a, func() string { return it.Terminal.StateWord() }),
+									func() core.Node {
+										if isCur {
+											return core.Icon{
+												SVG: iconCheck,
+												StyleFunc: func() core.Style {
+													return core.Style{Width: core.Pt(16), Height: core.Pt(16), FlexShrink: 0, Color: a.paletteOf(cx).Text}
+												},
+											}
+										}
+										return StatusBadge(cx, a, func() string { return it.Terminal.StateWord() })
+									}(),
 								},
 							})
 						}
+						body = append(body, GroupCard(cx, a, "", rows))
 					}
 					appendGroup("需要你", waiting)
 					appendGroup("运行中", working)
@@ -1012,61 +1239,178 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 					}, body)
 				},
 			},
+			core.Show{When: func() bool { return showAttachments.Get() && attachmentKey == curKey() && isChatMode() }, Then: func(sheet *core.Scope) core.Node {
+				key := attachmentKey
+				close := func() { showAttachments.Set(false) }
+				expandLabel := "展开长文编辑"
+				if composerTall.Get() {
+					expandLabel = "收起长文编辑"
+				}
+				return SheetModal(sheet, a, "sheet-attachments", "输入工具", "attachments-close", close, []core.Node{
+					GroupCard(sheet, a, "", []core.Node{
+						SheetListRow(sheet, a, "attachment-photo", "相册", "", lucide.Images(), false, false, func() { close(); pickPhoto(key, true) }),
+						InsetDivider(sheet, a, 46),
+						SheetListRow(sheet, a, "attachment-camera", "拍照", "", lucide.Camera(), false, false, func() {
+							close()
+							cx.TakePhoto(core.PhotoOptions{MaxDimension: 2400}, func(f *core.PickedFile, err error) {
+								if err != nil {
+									a.notifyToast("无法拍照：" + err.Error())
+									return
+								}
+								if f != nil {
+									a.attachChatImage(key, f.Name, f.MIME, f.Data)
+								}
+							})
+						}),
+						InsetDivider(sheet, a, 46),
+						SheetListRow(sheet, a, "attachment-clipboard", "剪贴板图片", "", lucide.Clipboard(), false, false, func() {
+							close()
+							cx.ReadClipboardImage(func(im core.ClipboardImage, ok bool, err error) {
+								if err != nil {
+									a.notifyToast(err.Error())
+									return
+								}
+								if !ok {
+									a.notifyToast("剪贴板中没有图片")
+									return
+								}
+								a.attachChatImage(key, "clipboard.png", "image/png", im.PNG)
+							})
+						}),
+						InsetDivider(sheet, a, 46),
+						SheetListRow(sheet, a, "attachment-document", "选择文件", "", lucide.File(), false, false, func() {
+							close()
+							cx.PickFiles(core.PickFilesOptions{}, func(files []core.File, err error) {
+								if err != nil {
+									a.notifyToast(err.Error())
+									return
+								}
+								if len(files) == 0 {
+									return
+								}
+								f := files[0]
+								go func() {
+									data, err := readPickedAttachment(f)
+									a.post(func() {
+										if err != nil {
+											a.notifyToast(err.Error())
+											return
+										}
+										a.attachChatImage(key, f.Name, f.MIME, data)
+									})
+								}()
+							})
+						}),
+					}),
+					GroupCard(sheet, a, "", []core.Node{
+						SheetListRow(sheet, a, "session-snippets-btn", "语音与常用短语", "", lucide.TextQuote(), false, true, func() { close(); showSnippets.Set(true) }),
+						InsetDivider(sheet, a, 46),
+						SheetListRow(sheet, a, "session-expand-composer-btn", expandLabel, "", lucide.Maximize2(), false, false, func() { close(); animateSpringLayout(cx); composerTall.Set(!composerTall.Get()) }),
+					}),
+				})
+			}},
+			core.Show{When: func() bool { return showVoice.Get() != (TermKey{}) && showVoice.Get() == curKey() }, Then: func(cx *core.Scope) core.Node {
+				return dictationSheet(cx, a, curKey(), func() { showVoice.Set(TermKey{}) })
+			}},
+			core.Show{When: func() bool { return muxKey.Get() != (TermKey{}) && muxKey.Get() == curKey() && !isChatMode() }, Then: func(cx *core.Scope) core.Node {
+				return muxControls(cx, a, curTerm().Terminal.Labels[muxKindLabel], curKey(), func() { muxKey.Set(TermKey{}) })
+			}},
 			// Snippets bottom sheet
 			core.Show{
 				When: showSnippets.Get,
 				Then: func(cx *core.Scope) core.Node {
-					return SheetModal(cx, a, "sheet-snippets", "常用短语 (Snippets)", "sheet-snippets-close", func() {
+					return SheetModal(cx, a, "sheet-snippets", "语音与常用短语", "sheet-snippets-close", func() {
 						showSnippets.Set(false)
 					}, []core.Node{
-						core.Each(
-							func() []Snippet { return a.snippets.Get() },
-							func(s Snippet) string { return s.ID },
-							func(cx *core.Scope, item func() Snippet, _ func() int) core.Node {
-								sn0 := item()
-								return core.View{
-									TestID: "snippet-item-" + sn0.ID,
-									Role:   core.RoleButton,
-									OnPress: func(core.PressEvent) {
-										playSelectionHaptic(cx)
-										sn := item()
-										a.SetCompose(curKey().String(), sn.Text)
-										showSnippets.Set(false)
-									},
-									StyleFunc: func() core.Style {
-										pal := a.paletteOf(cx)
-										return core.Style{
-											Background:   pal.SurfaceRaised,
-											CornerRadius: Tokens.RadiusCtrl,
-											BorderWidth:  1,
-											BorderColor:  pal.Border,
-											Padding:      core.All(Tokens.Space3),
-											Gap:          core.Points(2),
+						GroupCard(cx, a, "", []core.Node{
+							SheetListRow(cx, a, "start-dictation", "语音输入", "", iconMic, false, true, func() { showSnippets.Set(false); showVoice.Set(curKey()) }),
+						}),
+						GroupCard(cx, a, "", []core.Node{
+							core.Each(
+								func() []Snippet {
+									list := a.snippets.Get()
+									if !isChatMode() {
+										return list
+									}
+									var items []Snippet
+									for _, v := range list {
+										if !v.Binding {
+											items = append(items, v)
 										}
-									},
-									Children: []core.Node{
-										core.Text{
-											ContentFunc: func() string { return item().Label },
-											StyleFunc: func() core.Style {
-												pal := a.paletteOf(cx)
-												return core.Style{Color: pal.Text, FontSize: Tokens.FontRowTitle, FontWeight: core.FontWeightSemibold}
+									}
+									return items
+								},
+								func(s Snippet) string { return s.ID },
+								func(cx *core.Scope, item func() Snippet, idx func() int) core.Node {
+									sn0 := item()
+									return core.View{
+										Children: []core.Node{
+											core.Show{
+												When: func() bool { return idx() > 0 },
+												Then: func(cx *core.Scope) core.Node { return InsetDivider(cx, a, 14) },
+											},
+											core.View{
+												TestID: "snippet-item-" + sn0.ID,
+												Role:   core.RoleButton,
+												OnPress: func(core.PressEvent) {
+													playSelectionHaptic(cx)
+													sn := item()
+													if sn.Binding {
+														seq, err := terminalBinding(sn.Text)
+														if err != nil {
+															a.notifyToast(err.Error())
+															return
+														}
+														st := curST()
+														if st == nil || !st.Attached() {
+															a.notifyToast("终端尚未接入")
+															return
+														}
+														if err := st.SendInput(seq, a.vtFontSize.Get()); err != nil {
+															a.notifyToast(err.Error())
+															return
+														}
+													} else {
+														a.SetCompose(curKey().String(), sn.Text)
+													}
+													showSnippets.Set(false)
+												},
+												Style: core.Style{
+													Padding: core.Symmetric(core.Points(11), core.Points(14)),
+													Gap:     core.Points(2),
+												},
+												Children: []core.Node{
+													core.Text{
+														ContentFunc: func() string { return item().Label },
+														StyleFunc: func() core.Style {
+															pal := a.paletteOf(cx)
+															return core.Style{Color: pal.Text, FontSize: Tokens.FontRowTitle, FontWeight: core.FontWeightMedium}
+														},
+													},
+													core.Text{
+														ContentFunc: func() string { return item().Text },
+														StyleFunc: func() core.Style {
+															pal := a.paletteOf(cx)
+															return core.Style{Color: pal.TextMuted, FontSize: Tokens.FontMonoMeta, FontFamily: core.FontMonospace}
+														},
+													},
+												},
 											},
 										},
-										core.Text{
-											ContentFunc: func() string { return item().Text },
-											StyleFunc: func() core.Style {
-												pal := a.paletteOf(cx)
-												return core.Style{Color: pal.TextMuted, FontSize: Tokens.FontMonoMeta, FontFamily: core.FontMonospace}
-											},
-										},
-									},
-								}
-							},
-						),
+									}
+								},
+							),
+						}),
 					})
 				},
 			},
-			// Tools / Links / Lifecycle bottom sheet (with Moshi's StripHerdrScrollbar clean copy!)
+			core.Show{When: func() bool { return projectKey.Get() != (TermKey{}) && projectKey.Get() == curKey() }, Then: func(cx *core.Scope) core.Node {
+				return projectSheet(cx, a, curTerm(), func() { projectKey.Set(TermKey{}) })
+			}},
+			core.Show{When: func() bool { return previewKey.Get() != (TermKey{}) && previewKey.Get() == curKey() }, Then: func(cx *core.Scope) core.Node {
+				return browserPreviewSheet(cx, a, curKey(), func() { previewKey.Set(TermKey{}) })
+			}},
+			// Quiet Studio Tools / Links / Lifecycle bottom sheet (GroupCard + SheetListRow, Search entry included)
 			core.Show{
 				When: showTools.Get,
 				Then: func(cx *core.Scope) core.Node {
@@ -1074,8 +1418,24 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 					if st := curST(); st != nil {
 						links = st.Screen().ExtractLinks()
 					}
-					body := []core.Node{
-						ActionButton(cx, a, "tool-copy-text", "复制干净屏幕文本（自动去滚动条）", ActionSecondary, func() {
+					primaryRows := []core.Node{
+						SheetListRow(cx, a, "session-search-btn", "搜索当前会话", "", iconSearch, false, false, func() {
+							showTools.Set(false)
+							animateSpringLayout(cx)
+							showSearch.Set(!showSearch.Get())
+						}),
+					}
+					if on, _ := SplitMachineAddr(curKey().Addr); on == "" {
+						primaryRows = append(primaryRows,
+							InsetDivider(cx, a, 46),
+							SheetListRow(cx, a, "tool-preview", "预览主机网页", "", iconGlobe, false, true, func() { showTools.Set(false); previewKey.Set(curKey()) }),
+						)
+					}
+					primaryRows = append(primaryRows,
+						InsetDivider(cx, a, 46),
+						SheetListRow(cx, a, "tool-project", "会话文件与 Git 差异", "", iconFolderGt, false, true, func() { showTools.Set(false); projectKey.Set(curKey()) }),
+						InsetDivider(cx, a, 46),
+						SheetListRow(cx, a, "tool-copy-text", "复制干净屏幕文本", "", iconCopy, false, false, func() {
 							if st := curST(); st != nil && cx != nil {
 								clean := StripHerdrScrollbar(st.Screen().PlainText())
 								cx.SetClipboard(clean)
@@ -1083,7 +1443,8 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 							}
 							showTools.Set(false)
 						}),
-						ActionButton(cx, a, "tool-pick-file", "上传本地文件到工作目录", ActionSecondary, func() {
+						InsetDivider(cx, a, 46),
+						SheetListRow(cx, a, "tool-pick-file", "上传本地文件到工作目录", "", iconUpload, false, false, func() {
 							showTools.Set(false)
 							if cx == nil {
 								return
@@ -1105,25 +1466,41 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 								a.UploadFileTo(curKey(), f.Name, data)
 							})
 						}),
-						ActionButton(cx, a, "tool-interrupt", "发送中断 (Interrupt)", ActionSecondary, func() {
+					)
+					dangerRows := []core.Node{
+						SheetListRow(cx, a, "tool-interrupt", "发送中断 (Interrupt)", "", iconStop, false, false, func() {
 							a.InterruptTo(curKey())
 							showTools.Set(false)
 						}),
-						ActionButton(cx, a, "tool-kill", "终止终端 (Kill)", ActionDanger, func() {
+						InsetDivider(cx, a, 46),
+						SheetListRow(cx, a, "tool-kill", "终止终端 (Kill)", "", iconOctagonX, true, false, func() {
 							a.KillTerminal(curKey())
 							showTools.Set(false)
 						}),
-						ActionButton(cx, a, "tool-rm", "清理已结束终端 (Rm)", ActionDanger, func() {
+						InsetDivider(cx, a, 46),
+						SheetListRow(cx, a, "tool-rm", "清理已结束终端 (Rm)", "", iconTrash, true, false, func() {
 							a.RemoveTerminal(curKey())
 							showTools.Set(false)
 							u.closeSession()
 						}),
 					}
+					body := []core.Node{
+						GroupCard(cx, a, "", primaryRows),
+						GroupCard(cx, a, "", dangerRows),
+					}
 					if len(links) > 0 {
 						body = append(body, SectionHeader(cx, a, func() string { return "识别到的链接与路径" }, nil))
+						var linkRows []core.Node
 						for i, l := range links {
+							if i > 0 {
+								linkRows = append(linkRows, InsetDivider(cx, a, 46))
+							}
 							link := l
-							body = append(body, ActionButton(cx, a, fmt.Sprintf("tool-link-%d", i), link, ActionGhost, func() {
+							ic := iconLink
+							if strings.HasPrefix(link, "http://") || strings.HasPrefix(link, "https://") {
+								ic = iconExtLink
+							}
+							linkRows = append(linkRows, SheetListRow(cx, a, fmt.Sprintf("tool-link-%d", i), link, "", ic, false, false, func() {
 								if strings.HasPrefix(link, "http://") || strings.HasPrefix(link, "https://") {
 									if cx != nil {
 										cx.OpenURL(link, nil)
@@ -1135,6 +1512,7 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 								showTools.Set(false)
 							}))
 						}
+						body = append(body, GroupCard(cx, a, "", linkRows))
 					}
 					return SheetModal(cx, a, "sheet-session-tools", "会话工具与链接", "sheet-session-tools-close", func() {
 						showTools.Set(false)
@@ -1161,15 +1539,15 @@ func sessionModeSegmentBtn(cx *core.Scope, a *App, testID, label string, activeF
 		Style: core.Style{Animated: pressAnimStyle(scale)},
 		StyleFunc: func() core.Style {
 			pal := a.paletteOf(cx)
-			bg := pal.SurfaceRaised
+			bg := core.Transparent
 			if activeFn() {
-				bg = pal.Accent
+				bg = pal.Surface
 			}
 			return core.Style{
 				FlexShrink:     0,
 				MinHeight:      core.Pt(26),
-				Padding:        core.Symmetric(core.Points(3), core.Points(9)),
-				CornerRadius:   Tokens.RadiusKey,
+				Padding:        core.Symmetric(core.Points(3), core.Points(11)),
+				CornerRadius:   Tokens.RadiusPill,
 				Background:     bg,
 				AlignItems:     core.AlignCenter,
 				JustifyContent: core.JustifyCenter,
@@ -1182,12 +1560,12 @@ func sessionModeSegmentBtn(cx *core.Scope, a *App, testID, label string, activeF
 					pal := a.paletteOf(cx)
 					fg := pal.TextSecondary
 					if activeFn() {
-						fg = pal.AccentFg
+						fg = pal.Text
 					}
 					return core.Style{
 						Color:      fg,
 						FontSize:   Tokens.FontCaption,
-						FontWeight: core.FontWeightSemibold,
+						FontWeight: core.FontWeightMedium,
 					}
 				},
 			},

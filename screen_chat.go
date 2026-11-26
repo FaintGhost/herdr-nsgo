@@ -2,10 +2,10 @@ package main
 
 import (
 	"fmt"
+	"github.com/nsgo-dev/nsgo/icons/lucide"
 	"math"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/nsgo-dev/nsgo/base/textview"
 	"github.com/nsgo-dev/nsgo/base/textview/highlight"
@@ -33,7 +33,7 @@ func RenderChatSession(
 	termFn func() AggregatedTerminal,
 	onSwitchToVT func(),
 ) core.Node {
-	return RenderChatSessionWithCallbacks(cx, a, chatCtrl, termFn, onSwitchToVT, nil, nil)
+	return RenderChatSessionWithCallbacks(cx, a, chatCtrl, termFn, onSwitchToVT, nil, nil, nil)
 }
 
 // RenderChatSessionWithCallbacks renders the conversation view with optional subagent navigation
@@ -46,7 +46,11 @@ func RenderChatSessionWithCallbacks(
 	onSwitchToVT func(),
 	onOpenSession func(TermKey),
 	onQuoteReply func(string),
+	composerInset func() core.Points,
 ) core.Node {
+	if composerInset == nil {
+		composerInset = func() core.Points { return 138 }
+	}
 	if chatCtrl == nil {
 		return core.View{
 			TestID: "chat-surface",
@@ -59,8 +63,14 @@ func RenderChatSessionWithCallbacks(
 	visibleLimit := core.NewSignal(cx, chatInitialVisibleItems)
 	diffSheet := core.NewSignalFunc(cx, (*activeDiffModal)(nil), func(x, y *activeDiffModal) bool { return x == y })
 
-	chatCtrl.SetScrollHook(func(_ bool) {
-		convState.JumpToLatest()
+	var lastScrollY core.Points
+	followAfterLayout := func(core.Bounds) {
+		if chatCtrl.scrolledUp == nil || !chatCtrl.scrolledUp.GetUntracked() {
+			convState.Scroll().ScrollToEnd(false)
+		}
+	}
+	chatCtrl.SetScrollHook(func(animated bool) {
+		convState.Scroll().ScrollToEnd(animated)
 	})
 
 	// Memoize filtered + windowed slice per (rev, query, limit) so multiple reactive readers
@@ -123,15 +133,16 @@ func RenderChatSessionWithCallbacks(
 		return tot
 	}
 
-	lastAssistantID := func() string {
-		vis := filteredItems()
-		for i := len(vis) - 1; i >= 0; i-- {
-			if vis[i].Role == RoleAssistant {
-				return vis[i].ID
+	// Bind live motion to the transcript tail even when a search hides later items.
+	liveItemID := core.NewMemo(cx, func() string {
+		if termFn().Terminal.StateWord() == "working" {
+			items := chatCtrl.Items()
+			if len(items) > 0 {
+				return items[len(items)-1].ID
 			}
 		}
 		return ""
-	}
+	}).Get
 
 	// Child sub-sessions spawned from this session (via herdr-core Terminal.Parent).
 	childSubsessions := func() []AggregatedTerminal {
@@ -174,6 +185,7 @@ func RenderChatSessionWithCallbacks(
 		},
 		Children: []core.Node{
 			core.Scroll{
+				TestID:      "chat-transcript-scroll",
 				Ref:         convState.Scroll(),
 				EdgeEffects: core.EdgeEffects{Top: core.EdgeEffectSoft, Bottom: core.EdgeEffectSoft},
 				Behavior:    core.ScrollBehavior{KeyboardDismissMode: core.KeyboardDismissInteractive},
@@ -186,17 +198,28 @@ func RenderChatSessionWithCallbacks(
 					if ev.Stale || chatCtrl.scrolledUp == nil {
 						return
 					}
-					distFromBottom := float32(ev.ContentSize.Height) - (float32(ev.Offset.Y) + float32(ev.Size.Height))
-					isUp := distFromBottom > 68
-					if chatCtrl.scrolledUp.Get() != isUp {
-						chatCtrl.scrolledUp.Set(isUp)
+					// A growing transcript increases the remaining distance even at an unchanged offset.
+					// Pause following only when the reader actually moves towards older messages.
+					remaining := ev.ContentSize.Height - ev.Offset.Y - ev.Size.Height
+					switch {
+					case remaining <= 2:
+						chatCtrl.scrolledUp.Set(false)
+					case ev.Offset.Y < lastScrollY:
+						chatCtrl.scrolledUp.Set(true)
 					}
+					lastScrollY = ev.Offset.Y
 				},
 				Children: []core.Node{
 					core.View{
-						Style: core.Style{
-							Padding: core.Edges{Top: Tokens.Space3, Right: Tokens.PagePadX, Bottom: 138, Left: Tokens.PagePadX},
-							Gap:     core.Points(10),
+						OnLayout: followAfterLayout,
+						StyleFunc: func() core.Style {
+							return core.Style{
+								Width:     core.Pct(100),
+								MaxWidth:  core.Pt(Tokens.ChatMaxWidth),
+								AlignSelf: core.AlignCenter,
+								Padding:   core.Edges{Top: Tokens.Space3, Right: Tokens.PagePadX, Bottom: composerInset(), Left: Tokens.PagePadX},
+								Gap:       core.Points(12),
+							}
 						},
 						Children: []core.Node{
 							// If viewing a child subagent terminal, offer 1-tap return to root session!
@@ -216,7 +239,7 @@ func RenderChatSessionWithCallbacks(
 									})
 								},
 							},
-							// Compact source & manual refresh meta bar (shows ⚡ 0ms snapshot status when cached!)
+							// Source of the transcript and manual refresh.
 							core.View{
 								Style: core.Style{
 									Direction:      core.Row,
@@ -247,17 +270,14 @@ func RenderChatSessionWithCallbacks(
 											}
 										},
 									},
-									FilterPill(cx, a, "chat-source-pill", func() string {
+									chat.Chip{TestID: "chat-source-pill", Icon: lucide.RefreshCw, Text: "刷新记录", TextFunc: func() string {
 										if chatCtrl.IsCachedSnapshot() {
-											return "秒开缓存 · 同步中"
+											return "同步中"
 										}
-										return chatCtrl.Source().Label() + " · 刷新"
-									}, func() bool {
-										return chatCtrl.Source() == SourceJSONL && !chatCtrl.IsCachedSnapshot()
-									}, nil, func() {
+										return chatCtrl.Source().Label()
+									}, OnPress: func() {
 										chatCtrl.RefreshAsync()
-										a.notifyToast("正在刷新对话记录…")
-									}),
+									}},
 								},
 							},
 							// Pagination loader: reveals buffered in-memory items in 0ms first, then fetches older remote JSONL lines
@@ -287,7 +307,7 @@ func RenderChatSessionWithCallbacks(
 							core.Show{
 								When: func() bool { return totalFilteredCount() == 0 && chatCtrl.Source() == SourceLoading },
 								Then: func(cx *core.Scope) core.Node {
-									return EmptyStateCard(cx, a, "正在同步会话记录…", "正在定位并拉取远端会话日志，马上呈现。", "", "", nil)
+									return ui.Skeleton{TestID: "chat-history-skeleton", Label: "正在同步会话记录", Lines: 3, Style: core.Style{Padding: core.All(Tokens.Space3)}}
 								},
 							},
 							core.Show{
@@ -310,19 +330,28 @@ func RenderChatSessionWithCallbacks(
 								func(it ChatTurnItem) string { return it.ID },
 								func(cx *core.Scope, itemFn func() ChatTurnItem, _ func() int) core.Node {
 									it0 := itemFn()
+									isLive := func() bool { return it0.ID == liveItemID() }
 									switch it0.Role {
 									case RoleUser:
 										return renderChatUserBubble(cx, a, itemFn)
 									case RoleThinking:
-										return renderChatThinkingPill(cx, a, chatCtrl, itemFn)
+										return chat.Reasoning{
+											TestID: "chat-thinking-" + it0.ID, Conversation: convState,
+											Text:  func() string { return itemFn().Text },
+											Label: func() string { return "思考中" }, Summary: func() string { return "思考过程" },
+											Status: func() chat.Status {
+												if isLive() {
+													return chat.Running
+												}
+												return chat.Completed
+											},
+										}
 									case RoleToolGroup:
-										return renderChatToolGroup(cx, a, chatCtrl, itemFn, func(title string, tc ChatToolCall) {
+										return renderChatToolGroup(cx, a, chatCtrl, itemFn, isLive, func(title string, tc ChatToolCall) {
 											diffSheet.Set(&activeDiffModal{Title: title, Tool: tc})
 										})
 									default:
-										return renderChatAssistantCard(cx, a, highlighter, itemFn, termFn, func() bool {
-											return termFn().Terminal.StateWord() == "working" && itemFn().ID == lastAssistantID()
-										}, onQuoteReply)
+										return renderChatAssistantCard(cx, a, highlighter, itemFn, termFn, isLive, onQuoteReply)
 									}
 								},
 							),
@@ -331,57 +360,6 @@ func RenderChatSessionWithCallbacks(
 								When: func() bool { return len(childSubsessions()) > 0 },
 								Then: func(cx *core.Scope) core.Node {
 									return renderSubagentStrip(cx, a, childSubsessions, onOpenSession)
-								},
-							},
-							// Live working status strip (OSC 7501 + animated 3-dot wave)
-							core.Show{
-								When: func() bool {
-									return termFn().Terminal.StateWord() == "working"
-								},
-								Then: func(cx *core.Scope) core.Node {
-									return core.View{
-										TestID: "chat-working-banner",
-										StyleFunc: func() core.Style {
-											pal := a.paletteOf(cx)
-											return core.Style{
-												Direction:    core.Row,
-												AlignItems:   core.AlignCenter,
-												Gap:          Tokens.Space2,
-												Background:   pal.AccentSoft,
-												CornerRadius: Tokens.RadiusCard,
-												BorderWidth:  1,
-												BorderColor:  pal.Accent,
-												Padding:      core.Symmetric(core.Points(9), Tokens.Space3),
-											}
-										},
-										Children: []core.Node{
-											renderWaveDots(cx, a),
-											core.Text{
-												MaxLines: 2,
-												ContentFunc: func() string {
-													t := termFn().Terminal
-													if t.Status != nil && strings.TrimSpace(t.Status.Msg) != "" {
-														return "正在执行 · " + firstLine(t.Status, t)
-													}
-													if t.Status != nil && strings.TrimSpace(t.Status.Title) != "" {
-														return "正在执行 · " + strings.TrimSpace(t.Status.Title)
-													}
-													return "Agent 正在思考与执行…"
-												},
-												StyleFunc: func() core.Style {
-													pal := a.paletteOf(cx)
-													return core.Style{
-														FlexGrow:   1,
-														FlexShrink: 1,
-														MinWidth:   core.Pt(0),
-														Color:      pal.Accent,
-														FontSize:   Tokens.FontCaption,
-														FontWeight: core.FontWeightSemibold,
-													}
-												},
-											},
-										},
-									}
 								},
 							},
 							// Inline permission / blocked card anchored directly at conversation bottom
@@ -408,10 +386,12 @@ func RenderChatSessionWithCallbacks(
 				},
 				Then: func(cx *core.Scope) core.Node {
 					return core.View{
-						Style: core.Style{
-							Position: core.Absolute,
-							Right:    core.Pt(16),
-							Bottom:   core.Pt(118),
+						StyleFunc: func() core.Style {
+							return core.Style{
+								Position: core.Absolute,
+								Right:    core.Pt(16),
+								Bottom:   core.Pt(composerInset()),
+							}
 						},
 						Children: []core.Node{
 							ActionButton(cx, a, "chat-scroll-bottom-fab", "↓ 最新", ActionPrimary, func() {
@@ -441,6 +421,17 @@ func RenderChatSessionWithCallbacks(
 	}
 }
 
+func renderDeliveryIndicator(cx *core.Scope, a *App, phase func() string) core.Node {
+	return core.Show{When: func() bool { return phase() != "" }, Then: func(cx *core.Scope) core.Node {
+		return core.View{TestID: "chat-delivery-status", Role: core.RoleStatus, Accessible: true, LabelFunc: phase,
+			Style: core.Style{Width: core.Pt(23), AlignItems: core.AlignCenter}, Children: []core.Node{
+				core.Show{When: func() bool { return phase() == "正在发送" }, Then: func(*core.Scope) core.Node {
+					return ui.Spinner{TestID: "chat-sending-indicator", Size: 15, Variant: ui.SpinnerSpokes, Tint: func() core.Color { return a.paletteOf(cx).Running }}
+				}, Else: func(cx *core.Scope) core.Node { return renderWaveDots(cx, a) }},
+			}}
+	}}
+}
+
 func renderWaveDots(cx *core.Scope, a *App) core.Node {
 	reduced := cx == nil || ui.ReduceMotion(cx)
 	var dots []core.Node
@@ -463,7 +454,7 @@ func renderWaveDots(cx *core.Scope, a *App) core.Node {
 		dots = append(dots, core.View{
 			Style: st,
 			StyleFunc: func() core.Style {
-				return core.Style{Background: a.paletteOf(cx).Accent}
+				return core.Style{Background: a.paletteOf(cx).Running}
 			},
 		})
 	}
@@ -503,85 +494,82 @@ func renderSubagentStrip(
 	childrenFn func() []AggregatedTerminal,
 	onOpenSession func(TermKey),
 ) core.Node {
-	return chat.GlassPanel{
-		TestID: "chat-subagent-strip",
-		Children: []core.Node{
-			core.View{
-				Style: core.Style{Gap: core.Points(6)},
-				Children: []core.Node{
-					core.View{
-						Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: core.Points(6)},
-						Children: []core.Node{
-							renderPulseDot(cx, func() core.Color { return a.paletteOf(cx).Accent }),
-							core.Icon{
-								SVG: iconSubagent,
-								StyleFunc: func() core.Style {
-									return core.Style{Width: core.Pt(14), Height: core.Pt(14), Color: a.paletteOf(cx).Accent}
-								},
+	return GroupCard(cx, a, "chat-subagent-strip", []core.Node{
+		core.View{
+			Style: core.Style{Padding: core.All(core.Points(12)), Gap: Tokens.Space2},
+			Children: []core.Node{
+				core.View{
+					Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: core.Points(6)},
+					Children: []core.Node{
+						renderPulseDot(cx, func() core.Color { return a.paletteOf(cx).Running }),
+						core.Icon{
+							SVG: iconSubagent,
+							StyleFunc: func() core.Style {
+								return core.Style{Width: core.Pt(14), Height: core.Pt(14), Color: a.paletteOf(cx).Running}
 							},
-							core.Text{
-								MaxLines: 1,
-								ContentFunc: func() string {
-									kids := childrenFn()
-									running := 0
-									for _, ch := range kids {
-										if ch.Terminal.StateWord() == "working" || ch.Terminal.NeedsYou() {
-											running++
-										}
+						},
+						core.Text{
+							MaxLines: 1,
+							ContentFunc: func() string {
+								kids := childrenFn()
+								running := 0
+								for _, ch := range kids {
+									if ch.Terminal.StateWord() == "working" || ch.Terminal.NeedsYou() {
+										running++
 									}
-									if running > 0 {
-										return fmt.Sprintf("子代理协作中 · %d/%d 活跃（点按跳转）", running, len(kids))
-									}
-									return fmt.Sprintf("派生子会话 · %d 个（点按查看）", len(kids))
-								},
-								StyleFunc: func() core.Style {
-									pal := a.paletteOf(cx)
-									return core.Style{
-										FlexGrow:   1,
-										FlexShrink: 1,
-										MinWidth:   core.Pt(0),
-										Color:      pal.Text,
-										FontSize:   Tokens.FontMonoMeta,
-										FontWeight: core.FontWeightSemibold,
-									}
-								},
+								}
+								if running > 0 {
+									return fmt.Sprintf("子代理协作中 · %d/%d 活跃（点按跳转）", running, len(kids))
+								}
+								return fmt.Sprintf("派生子会话 · %d 个（点按查看）", len(kids))
+							},
+							StyleFunc: func() core.Style {
+								pal := a.paletteOf(cx)
+								return core.Style{
+									FlexGrow:   1,
+									FlexShrink: 1,
+									MinWidth:   core.Pt(0),
+									Color:      pal.Text,
+									FontSize:   Tokens.FontMonoMeta,
+									FontWeight: core.FontWeightMedium,
+								}
 							},
 						},
 					},
-					core.Scroll{
-						Horizontal:    true,
-						NoShrink:      true,
-						HideIndicator: true,
-						Children: []core.Node{
-							core.View{
-								Style: core.Style{Direction: core.Row, Gap: core.Points(6)},
-								Children: []core.Node{
-									core.Each(
-										childrenFn,
-										func(ch AggregatedTerminal) string { return ch.Key.String() },
-										func(cx *core.Scope, chFn func() AggregatedTerminal, _ func() int) core.Node {
-											ch0 := chFn()
-											return FilterPill(cx, a, "subagent-chip-"+ch0.Key.String(), func() string {
-												cur := chFn()
-												_, _, stLbl := stateColor(a.paletteOf(cx), cur.Terminal.StateWord())
-												return fmt.Sprintf("%s · %s", cur.Terminal.Label(), stLbl)
-											}, func() bool {
-												return chFn().Terminal.StateWord() == "working" || chFn().Terminal.NeedsYou()
-											}, nil, func() {
-												if onOpenSession != nil {
-													onOpenSession(chFn().Key)
-												}
-											})
-										},
-									),
-								},
+				},
+				core.Scroll{
+					Horizontal:    true,
+					NoShrink:      true,
+					HideIndicator: true,
+					Children: []core.Node{
+						core.View{
+							Style: core.Style{Direction: core.Row, Gap: core.Points(6)},
+							Children: []core.Node{
+								core.Each(
+									childrenFn,
+									func(ch AggregatedTerminal) string { return ch.Key.String() },
+									func(cx *core.Scope, chFn func() AggregatedTerminal, _ func() int) core.Node {
+										ch0 := chFn()
+										return FilterPill(cx, a, "subagent-chip-"+ch0.Key.String(), func() string {
+											cur := chFn()
+											_, _, stLbl := stateColor(a.paletteOf(cx), cur.Terminal.StateWord())
+											return fmt.Sprintf("%s · %s", cur.Terminal.Label(), stLbl)
+										}, func() bool {
+											return chFn().Terminal.StateWord() == "working" || chFn().Terminal.NeedsYou()
+										}, nil, func() {
+											if onOpenSession != nil {
+												onOpenSession(chFn().Key)
+											}
+										})
+									},
+								),
 							},
 						},
 					},
 				},
 			},
 		},
-	}
+	})
 }
 
 func chatItemMatchesQuery(it ChatTurnItem, q string) bool {
@@ -612,17 +600,17 @@ func renderChatUserBubble(cx *core.Scope, a *App, itemFn func() ChatTurnItem) co
 								FlexShrink:   1,
 								MinWidth:     core.Pt(0),
 								MaxWidth:     core.Pt(540),
-								Background:   pal.AccentSoft,
-								CornerRadius: core.Points(13),
+								Background:   pal.SurfaceRaised,
 								BorderWidth:  1,
-								BorderColor:  pal.Accent,
-								Padding:      core.Symmetric(core.Points(9), Tokens.Space3),
+								BorderColor:  pal.Border,
+								CornerRadius: 16,
+								Padding:      core.Symmetric(core.Points(10), core.Points(14)),
 								Gap:          core.Points(4),
 							}
 						},
 						Children: []core.Node{
 							core.Show{
-								When: func() bool { return itemFn().FromAgent != "" || itemFn().Optimistic },
+								When: func() bool { it := itemFn(); return it.FromAgent != "" || it.DeliveryMode != "" },
 								Then: func(cx *core.Scope) core.Node {
 									return core.Text{
 										MaxLines: 1,
@@ -631,14 +619,14 @@ func renderChatUserBubble(cx *core.Scope, a *App, itemFn func() ChatTurnItem) co
 											if it.FromAgent != "" {
 												return "子会话汇报 · " + it.FromAgent
 											}
-											return "✦ 已即时发送 · 同步中"
+											return "忙时" + it.DeliveryMode
 										},
 										StyleFunc: func() core.Style {
 											pal := a.paletteOf(cx)
 											return core.Style{
-												Color:      pal.Accent,
+												Color:      pal.TextMuted,
 												FontSize:   Tokens.FontMonoMeta,
-												FontWeight: core.FontWeightSemibold,
+												FontWeight: core.FontWeightMedium,
 												FontFamily: core.FontMonospace,
 											}
 										},
@@ -653,7 +641,7 @@ func renderChatUserBubble(cx *core.Scope, a *App, itemFn func() ChatTurnItem) co
 									return core.Style{
 										Color:      pal.Text,
 										FontSize:   Tokens.FontBody,
-										LineHeight: core.Points(20),
+										LineHeight: core.Points(22),
 									}
 								},
 							},
@@ -665,98 +653,23 @@ func renderChatUserBubble(cx *core.Scope, a *App, itemFn func() ChatTurnItem) co
 	}
 }
 
-func renderChatThinkingPill(cx *core.Scope, a *App, chatCtrl *ChatSessionController, itemFn func() ChatTurnItem) core.Node {
-	it0 := itemFn()
-	itemID := it0.ID
-	scale := newPressScale(cx)
-	return core.View{
-		StyleFunc: func() core.Style {
-			pal := a.paletteOf(cx)
-			return core.Style{
-				Background:   pal.SurfaceRaised,
-				CornerRadius: Tokens.RadiusCtrl,
-				BorderWidth:  1,
-				BorderColor:  pal.Border,
-				Overflow:     core.Hidden,
-			}
-		},
-		Children: []core.Node{
-			core.View{
-				TestID:      "chat-thinking-" + itemID,
-				Role:        core.RoleButton,
-				OnPressDown: func(core.PressEvent) { pressSpringTo(cx, scale, 0.985) },
-				OnPressUp:   func(core.PressEvent) { pressSpringTo(cx, scale, 1.0) },
-				OnPress: func(core.PressEvent) {
-					pressSpringTo(cx, scale, 1.0)
-					playSelectionHaptic(cx)
-					animateSpringLayout(cx)
-					chatCtrl.ToggleExpanded(itemID)
-				},
-				Style: core.Style{
-					Direction:  core.Row,
-					AlignItems: core.AlignCenter,
-					Gap:        Tokens.Space2,
-					Padding:    core.Symmetric(core.Points(7), Tokens.Space3),
-					Animated:   pressAnimStyle(scale),
-				},
-				Children: []core.Node{
-					core.Text{
-						MaxLines: 1,
-						ContentFunc: func() string {
-							arrow := "▸"
-							if chatCtrl.IsExpanded(itemID) {
-								arrow = "▾"
-							}
-							n := utf8.RuneCountInString(itemFn().Text)
-							return fmt.Sprintf("✻ %s 思考过程 · %d 字", arrow, n)
-						},
-						StyleFunc: func() core.Style {
-							pal := a.paletteOf(cx)
-							return core.Style{
-								FlexGrow:   1,
-								FlexShrink: 1,
-								MinWidth:   core.Pt(0),
-								Color:      pal.TextMuted,
-								FontSize:   Tokens.FontMonoMeta,
-								FontWeight: core.FontWeightSemibold,
-								FontFamily: core.FontMonospace,
-							}
-						},
-					},
-				},
-			},
-			core.Show{
-				When: func() bool { return chatCtrl.IsExpanded(itemID) },
-				Then: func(cx *core.Scope) core.Node {
-					return core.View{
-						StyleFunc: func() core.Style {
-							pal := a.paletteOf(cx)
-							return core.Style{
-								Padding:     core.Symmetric(Tokens.Space2, Tokens.Space3),
-								Borders:     core.Edges{Top: 1},
-								BorderColor: pal.Separator,
-								Background:  pal.Surface,
-							}
-						},
-						Children: []core.Node{
-							core.Text{
-								Selectable:  core.SelectableOn,
-								ContentFunc: func() string { return itemFn().Text },
-								StyleFunc: func() core.Style {
-									pal := a.paletteOf(cx)
-									return core.Style{
-										Color:      pal.TextSecondary,
-										FontSize:   Tokens.FontCaption,
-										LineHeight: core.Points(18),
-									}
-								},
-							},
-						},
-					}
-				},
-			},
-		},
-	}
+func renderToolIndicator(cx *core.Scope, a *App, tool func() ChatToolCall, isLive func() bool) core.Node {
+	return core.Dynamic(func(cx *core.Scope) core.Node {
+		t := tool()
+		icon, label := lucide.Wrench, "未收到工具结果"
+		ink := func() core.Color { return a.paletteOf(cx).TextMuted }
+		switch {
+		case t.IsError:
+			icon, label = lucide.X, "工具执行失败"
+			ink = func() core.Color { return a.paletteOf(cx).Danger }
+		case t.HasResult || t.Output != "":
+			icon, label = lucide.Check, "工具已完成"
+			ink = func() core.Color { return a.paletteOf(cx).Running }
+		case isLive():
+			return ui.Spinner{Size: 14, Variant: ui.SpinnerSpokes, Label: "工具执行中", Tint: func() core.Color { return a.paletteOf(cx).Running }}
+		}
+		return core.View{Accessible: true, Label: label, Children: []core.Node{ui.Icon(icon, 14, ink)}}
+	})
 }
 
 type indexedChatTool struct {
@@ -798,6 +711,7 @@ func renderChatToolGroup(
 	a *App,
 	chatCtrl *ChatSessionController,
 	itemFn func() ChatTurnItem,
+	isLive func() bool,
 	onOpenDiff func(title string, tc ChatToolCall),
 ) core.Node {
 	groupID := itemFn().ID
@@ -829,15 +743,11 @@ func renderChatToolGroup(
 					return core.View{
 						StyleFunc: func() core.Style {
 							pal := a.paletteOf(cx)
-							bc := pal.Border
-							if getTC().IsError {
-								bc = pal.Danger
-							}
 							return core.Style{
-								Background:   pal.SurfaceRaised,
-								CornerRadius: Tokens.RadiusCtrl,
+								Background:   pal.Surface,
 								BorderWidth:  1,
-								BorderColor:  bc,
+								BorderColor:  pal.Border,
+								CornerRadius: core.Points(12),
 								Overflow:     core.Hidden,
 							}
 						},
@@ -856,30 +766,13 @@ func renderChatToolGroup(
 								Style: core.Style{
 									Direction:  core.Row,
 									AlignItems: core.AlignCenter,
-									Gap:        core.Points(6),
-									Padding:    core.Symmetric(core.Points(7), Tokens.Space3),
+									Gap:        Tokens.Space2,
+									MinHeight:  core.Pt(Tokens.SizeTouch),
+									Padding:    core.Symmetric(Tokens.Space2, core.Points(12)),
 									Animated:   pressAnimStyle(scale),
 								},
 								Children: []core.Node{
-									core.View{
-										StyleFunc: func() core.Style {
-											pal := a.paletteOf(cx)
-											tc := getTC()
-											c := pal.TextMuted
-											if tc.IsError {
-												c = pal.Danger
-											} else if tc.Output != "" || tc.HasDiff() {
-												c = pal.Accent
-											}
-											return core.Style{
-												FlexShrink:   0,
-												Width:        core.Pt(7),
-												Height:       core.Pt(7),
-												CornerRadius: 4,
-												Background:   c,
-											}
-										},
-									},
+									renderToolIndicator(cx, a, getTC, isLive),
 									core.Text{
 										MaxLines:    1,
 										ContentFunc: func() string { return singleLineClip(getTC().Name, 24) },
@@ -913,7 +806,7 @@ func renderChatToolGroup(
 											}
 										},
 									},
-									// Moshi-style DIFF capsule indicator when tool modified code
+									// Quiet Studio DIFF capsule indicator when tool modified code
 									core.Show{
 										When: func() bool { return getTC().HasDiff() },
 										Then: func(cx *core.Scope) core.Node {
@@ -922,9 +815,9 @@ func renderChatToolGroup(
 													pal := a.paletteOf(cx)
 													return core.Style{
 														FlexShrink:   0,
-														Background:   pal.AccentSoft,
+														Background:   pal.RunningSoft,
 														CornerRadius: core.Points(4),
-														Padding:      core.Symmetric(core.Points(1), core.Points(5)),
+														Padding:      core.Symmetric(core.Points(2), core.Points(6)),
 													}
 												},
 												Children: []core.Node{
@@ -932,9 +825,9 @@ func renderChatToolGroup(
 														Content: "DIFF",
 														StyleFunc: func() core.Style {
 															return core.Style{
-																Color:      a.paletteOf(cx).Accent,
+																Color:      a.paletteOf(cx).Running,
 																FontSize:   core.Points(10),
-																FontWeight: core.FontWeightBold,
+																FontWeight: core.FontWeightSemibold,
 																FontFamily: core.FontMonospace,
 															}
 														},
@@ -943,19 +836,22 @@ func renderChatToolGroup(
 											}
 										},
 									},
-									core.Text{
-										ContentFunc: func() string {
-											if chatCtrl.IsExpanded(expandKey) {
-												return "▾"
+									core.Show{
+										When: func() bool { return chatCtrl.IsExpanded(expandKey) },
+										Then: func(cx *core.Scope) core.Node {
+											return core.Icon{
+												SVG: iconChevronD,
+												StyleFunc: func() core.Style {
+													return core.Style{Width: core.Pt(14), Height: core.Pt(14), FlexShrink: 0, Color: a.paletteOf(cx).TextMuted}
+												},
 											}
-											return "▸"
 										},
-										StyleFunc: func() core.Style {
-											pal := a.paletteOf(cx)
-											return core.Style{
-												FlexShrink: 0,
-												Color:      pal.TextMuted,
-												FontSize:   Tokens.FontMonoMeta,
+										Else: func(cx *core.Scope) core.Node {
+											return core.Icon{
+												SVG: iconChevronR,
+												StyleFunc: func() core.Style {
+													return core.Style{Width: core.Pt(14), Height: core.Pt(14), FlexShrink: 0, Color: a.paletteOf(cx).TextMuted}
+												},
 											}
 										},
 									},
@@ -968,10 +864,9 @@ func renderChatToolGroup(
 										StyleFunc: func() core.Style {
 											pal := a.paletteOf(cx)
 											return core.Style{
-												Padding:     core.Symmetric(Tokens.Space2, Tokens.Space3),
+												Padding:     core.All(core.Points(12)),
 												Borders:     core.Edges{Top: 1},
 												BorderColor: pal.Separator,
-												Background:  pal.Surface,
 												Gap:         core.Points(6),
 											}
 										},
@@ -1055,7 +950,10 @@ func renderChatToolGroup(
 														ContentFunc: func() string {
 															out := getTC().Output
 															if out == "" {
-																return "（执行中或无输出）"
+																if getTC().HasResult {
+																	return "无输出"
+																}
+																return "尚无输出"
 															}
 															return out
 														},
@@ -1097,155 +995,76 @@ func renderChatAssistantCard(
 ) core.Node {
 	cardID := itemFn().ID
 
-	return core.View{
-		TestID: "chat-assistant-" + cardID,
-		StyleFunc: func() core.Style {
-			pal := a.paletteOf(cx)
-			return core.Style{
-				Direction:    core.Row,
-				Background:   pal.Surface,
-				CornerRadius: Tokens.RadiusCard,
-				BorderWidth:  1,
-				BorderColor:  pal.Border,
-				Overflow:     core.Hidden,
-			}
-		},
+	return core.View{TestID: "chat-assistant-" + cardID,
+		Style: core.Style{MinWidth: core.Pt(0), Gap: 4, Padding: core.Edges{Top: 4, Bottom: 6}},
 		Children: []core.Node{
-			core.View{
-				StyleFunc: func() core.Style {
-					pal := a.paletteOf(cx)
-					return core.Style{
-						Width:      core.Pt(3),
-						Background: pal.Accent,
-					}
-				},
-			},
-			core.View{
-				Style: core.Style{
-					FlexGrow:   1,
-					FlexShrink: 1,
-					MinWidth:   core.Pt(0),
-					Padding:    core.Symmetric(core.Points(10), Tokens.Space3),
-					Gap:        Tokens.Space2,
-				},
-				Children: []core.Node{
-					// Header: Harness dot + Model name + Copy/Quote actions
-					core.View{
-						Style: core.Style{
-							Direction:      core.Row,
-							AlignItems:     core.AlignCenter,
-							JustifyContent: core.JustifySpaceBetween,
-							Gap:            core.Points(6),
-						},
-						Children: []core.Node{
-							core.View{
-								Style: core.Style{
-									Direction:  core.Row,
-									AlignItems: core.AlignCenter,
-									Gap:        core.Points(6),
-									FlexGrow:   1,
-									FlexShrink: 1,
-									MinWidth:   core.Pt(0),
-								},
-								Children: []core.Node{
-									core.View{
-										StyleFunc: func() core.Style {
-											pal := a.paletteOf(cx)
-											return core.Style{
-												FlexShrink:   0,
-												Width:        core.Pt(7),
-												Height:       core.Pt(7),
-												CornerRadius: 4,
-												Background:   pal.Accent,
-											}
-										},
-									},
-									core.Text{
-										MaxLines: 1,
-										ContentFunc: func() string {
-											it := itemFn()
-											if it.Model != "" {
-												return it.Model
-											}
-											if app := termFn().Terminal.AppName(); app != "" {
-												return app
-											}
-											return "Agent"
-										},
-										StyleFunc: func() core.Style {
-											pal := a.paletteOf(cx)
-											return core.Style{
-												FlexGrow:   1,
-												FlexShrink: 1,
-												MinWidth:   core.Pt(0),
-												Color:      pal.TextSecondary,
-												FontSize:   Tokens.FontMonoMeta,
-												FontWeight: core.FontWeightSemibold,
-												FontFamily: core.FontMonospace,
-											}
-										},
-									},
-								},
-							},
-							// Official NSGo chat.Actions (copy with receipt) + Moshi quote-reply action
-							chat.Actions{
-								TestID: "chat-actions-" + cardID,
-								Text:   func() string { return itemFn().Text },
-								Children: func() []core.Node {
-									if onQuoteReply == nil {
-										return nil
-									}
-									return []core.Node{
-										chat.IconAction{
-											TestID: "chat-quote-" + cardID,
-											Label:  "引用回复",
-											Icon:   func() *core.SVG { return iconQuote },
-											OnPress: func() {
-												playSelectionHaptic(cx)
-												onQuoteReply(itemFn().Text)
-											},
-										},
-									}
-								}(),
-							},
-						},
+			core.Dynamic(func(cx *core.Scope) core.Node {
+				isStreaming := streamingFn != nil && streamingFn()
+				return ui.TextView{
+					MarkdownFunc: func() string { return itemFn().Text },
+					Highlighter:  highlighter,
+					Selectable:   true,
+					Options:      textview.Options{Streaming: isStreaming},
+					StyleOf: func(part textview.Part) core.Style {
+						if part == textview.PartRoot {
+							return core.Style{FontSize: Tokens.FontBody, LineHeight: 23, Color: a.paletteOf(cx).Text}
+						}
+						return core.Style{}
 					},
-					// Official NSGo GFM Markdown + Chroma syntax highlighting + streaming TextView!
-					core.Dynamic(func(cx *core.Scope) core.Node {
-						isStreaming := streamingFn != nil && streamingFn()
-						return ui.TextView{
-							MarkdownFunc: func() string { return itemFn().Text },
-							Highlighter:  highlighter,
-							Selectable:   true,
-							Options:      textview.Options{Streaming: isStreaming},
-							CodeBlockActions: []textview.CodeAction{
-								{ID: textview.CopyAction, Label: "复制"},
-							},
-							RenderCodeBlockAction: func(_ *core.Scope, act textview.CodeBlockAction) core.Node {
-								return core.Text{
-									ContentFunc: func() string {
-										if act.Done() {
-											return "✓ 已复制"
-										}
-										return "复制"
-									},
+					CodeBlockActions: []textview.CodeAction{
+						{ID: textview.CopyAction, Label: "复制"},
+					},
+					RenderCodeBlockAction: func(_ *core.Scope, act textview.CodeBlockAction) core.Node {
+						return core.Text{
+							ContentFunc: func() string {
+								if act.Done() {
+									return "✓ 已复制"
 								}
-							},
-							OnLinkPress: func(ev textview.LinkPressEvent) {
-								u := strings.TrimSpace(ev.URL)
-								if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
-									if cx != nil {
-										cx.OpenURL(u, nil)
-									}
-								} else if u != "" && cx != nil {
-									cx.SetClipboard(u)
-									a.notifyToast("已复制链接：" + u)
-								}
+								return "复制"
 							},
 						}
-					}),
+					},
+					OnLinkPress: func(ev textview.LinkPressEvent) {
+						u := strings.TrimSpace(ev.URL)
+						if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+							if cx != nil {
+								cx.OpenURL(u, nil)
+							}
+						} else if u != "" && cx != nil {
+							cx.SetClipboard(u)
+							a.notifyToast("已复制链接：" + u)
+						}
+					},
+				}
+			}),
+			core.View{Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: 8}, Children: []core.Node{
+				core.Text{MaxLines: 1, ContentFunc: func() string {
+					if model := itemFn().Model; model != "" {
+						return model
+					}
+					return termFn().Terminal.AppName()
+				}, Style: core.Style{FlexShrink: 1, MinWidth: core.Pt(0), FontSize: 11}, StyleFunc: ui.Colored(func() core.Color { return a.paletteOf(cx).TextMuted })},
+				chat.Actions{
+					TestID: "chat-actions-" + cardID,
+					Text:   func() string { return itemFn().Text },
+					Children: func() []core.Node {
+						if onQuoteReply == nil {
+							return nil
+						}
+						return []core.Node{
+							chat.IconAction{
+								TestID: "chat-quote-" + cardID,
+								Label:  "引用回复",
+								Icon:   func() *core.SVG { return iconQuote },
+								OnPress: func() {
+									playSelectionHaptic(cx)
+									onQuoteReply(itemFn().Text)
+								},
+							},
+						}
+					}(),
 				},
-			},
+			}},
 		},
 	}
 }
