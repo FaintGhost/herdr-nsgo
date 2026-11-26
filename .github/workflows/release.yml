@@ -4,9 +4,6 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
-    paths-ignore:
-      - "README.md"
-      - "docs/**"
   workflow_dispatch:
     inputs:
       version:
@@ -65,12 +62,15 @@ jobs:
           echo "Building release ${TAG} (version ${VERSION})"
 
       - name: Restore Android signing key
-        if: ${{ secrets.ANDROID_DEBUG_PEM_B64 != '' }}
+        env:
+          ANDROID_DEBUG_PEM_B64: ${{ secrets.ANDROID_DEBUG_PEM_B64 }}
         shell: bash
         run: |
-          mkdir -p .nsgo/android
-          printf '%s' "${{ secrets.ANDROID_DEBUG_PEM_B64 }}" | base64 -d > .nsgo/android/debug.pem
-          chmod 600 .nsgo/android/debug.pem
+          if [[ -n "$ANDROID_DEBUG_PEM_B64" ]]; then
+            mkdir -p .nsgo/android
+            printf '%s' "$ANDROID_DEBUG_PEM_B64" | base64 -d > .nsgo/android/debug.pem
+            chmod 600 .nsgo/android/debug.pem
+          fi
 
       - name: Generate release notes
         shell: bash
