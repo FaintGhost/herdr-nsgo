@@ -48,7 +48,7 @@ func (u *uiController) instancesScreen(cx *core.Scope, wide bool) core.Node {
 		},
 		Children: []core.Node{
 			TopHeader(cx, a, func() string { return "实例" }, nil, headerRight),
-			ToastBanner(cx, a),
+			SyncStatusBanner(cx, a),
 			core.Scroll{
 				EdgeEffects: core.EdgeEffects{Top: core.EdgeEffectSoft, Bottom: core.EdgeEffectSoft},
 				Style:       core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0)},
@@ -216,38 +216,49 @@ func (u *uiController) instanceCard(cx *core.Scope, itemFn func() InstanceSnapsh
 								},
 							},
 						},
-						core.Text{
-							ContentFunc: func() string {
-								s := itemFn()
-								if s.Online {
-									if s.LatencyMS > 0 {
-										return fmt.Sprintf("%dms · %d 会话", s.LatencyMS, len(s.Terminals))
-									}
-									return fmt.Sprintf("在线 · %d 会话", len(s.Terminals))
-								}
-								if s.State == stateDialing {
-									return "连接中…"
-								}
-								return "离线"
-							},
-							StyleFunc: func() core.Style {
-								pal := a.paletteOf(cx)
-								s := itemFn()
-								fg := pal.TextMuted
-								if s.Online {
-									fg = pal.Running
-								} else if s.State == stateFailed {
-									fg = pal.Danger
-								} else if s.State == stateDialing {
-									fg = pal.Warn
-								}
-								return core.Style{
-									FlexShrink: 0,
-									Color:      fg,
-									FontSize:   Tokens.FontMonoMeta,
-									FontFamily: core.FontMonospace,
-									FontWeight: core.FontWeightMedium,
-								}
+						core.View{
+							Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: core.Points(6), FlexShrink: 0},
+							Children: []core.Node{
+								core.Show{
+									When: func() bool { return itemFn().State == stateDialing },
+									Then: func(cx *core.Scope) core.Node {
+										return ui.Spinner{Size: 12, Variant: ui.SpinnerSpokes, Label: "连接中", Tint: func() core.Color { return a.paletteOf(cx).Warn }}
+									},
+								},
+								core.Text{
+									ContentFunc: func() string {
+										s := itemFn()
+										if s.Online {
+											if s.LatencyMS > 0 {
+												return fmt.Sprintf("%dms · %d 会话", s.LatencyMS, len(s.Terminals))
+											}
+											return fmt.Sprintf("在线 · %d 会话", len(s.Terminals))
+										}
+										if s.State == stateDialing {
+											return "连接中…"
+										}
+										return "离线"
+									},
+									StyleFunc: func() core.Style {
+										pal := a.paletteOf(cx)
+										s := itemFn()
+										fg := pal.TextMuted
+										if s.Online {
+											fg = pal.Running
+										} else if s.State == stateFailed {
+											fg = pal.Danger
+										} else if s.State == stateDialing {
+											fg = pal.Warn
+										}
+										return core.Style{
+											FlexShrink: 0,
+											Color:      fg,
+											FontSize:   Tokens.FontMonoMeta,
+											FontFamily: core.FontMonospace,
+											FontWeight: core.FontWeightMedium,
+										}
+									},
+								},
 							},
 						},
 					},

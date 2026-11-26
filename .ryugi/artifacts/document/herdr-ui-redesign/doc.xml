@@ -764,7 +764,7 @@
   <p id="Ldt3iuuz">实现完成后按 <code>ryugi:verifying</code> 运行完整测试并逐屏核对：</p>
   <ul id="lYPqgHnR">
     <li><b>自动化验证</b>：<code>go test -v -race ./...</code>（含 <code>TestPaletteWCAGContrast</code>、<code>TestNoRawColorsInScreens</code>、<code>TestTokenCatalogComplete</code> 及全套 <code>nsgotest</code> 窄屏 <code>390×844</code> + 宽屏 <code>960×720</code> UI 测试）与 <code>go tool nsgo build -target android_arm64</code>。</li>
-    <li><b>视觉对照矩阵</b>：首页 ↔ <code>lay-home-float</code> / <code>flow-home</code>；会话 Chat ↔ <code>lay-session-clean</code> / <code>flow-chat</code>；会话 VT ↔ <code>flow-vt</code>；宽屏分栏 ↔ <code>lay-wide-rail</code>；待办 ↔ <code>flow-inbox</code>；统一抽屉 ↔ <code>flow-sheets</code>；新建会话 ↔ <code>flow-new-session</code>；实例池 ↔ <code>flow-instances</code>；设置与图鉴 ↔ <code>flow-settings</code>；冷启动引导 ↔ <code>flow-onboarding</code>。</li>
+    <li><b>视觉对照矩阵</b>：<ref artboard="herdr-ui-redesign" to="24hBfv73dXzJY99KKo16i" group="verify-home">核验 1 · 首页</ref>；<ref artboard="herdr-ui-redesign" to="24hBfv73dXzJY99KKo16i" group="verify-session">核验 2 · 会话页与抽屉</ref>；<ref artboard="herdr-ui-redesign" to="24hBfv73dXzJY99KKo16i" group="verify-wide">核验 3 · 宽屏三栏</ref>；<ref artboard="herdr-ui-redesign" to="24hBfv73dXzJY99KKo16i" group="verify-tabs-settings">核验 4 · 待办 / 实例 / 设置 / Tokens 图鉴</ref>。</li>
   </ul>
   <h2 id="KNkggAVc">10. 留给实现者的自主权（Builder Discretion）</h2>
   <ul id="78gCk6DH">

@@ -6,6 +6,7 @@ import (
 
 	"github.com/nsgo-dev/nsgo/core"
 	"github.com/nsgo-dev/nsgo/ui"
+	"github.com/nsgo-dev/nsgo/updater"
 )
 
 // settingsScreen renders the Quiet Studio Settings page (Appearance, Terminal, Security & TOFU,
@@ -73,7 +74,6 @@ func (u *uiController) settingsScreen(cx *core.Scope) core.Node {
 				}),
 				nil,
 			),
-			ToastBanner(cx, a),
 			core.Scroll{
 				EdgeEffects: core.EdgeEffects{Top: core.EdgeEffectSoft, Bottom: core.EdgeEffectSoft},
 				Style:       core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0)},
@@ -93,11 +93,11 @@ func (u *uiController) settingsScreen(cx *core.Scope) core.Node {
 									Gap:      Tokens.SectionGap,
 								},
 								Children: []core.Node{
-									// 1. Appearance
+									// 1. Appearance & Personalization
 									core.View{
 										Style: core.Style{Gap: Tokens.Space2},
 										Children: []core.Node{
-											SectionHeader(cx, a, func() string { return "外观与主题" }, nil),
+											SectionHeader(cx, a, func() string { return "外观与个性化" }, nil),
 											GroupCard(cx, a, "", []core.Node{
 												core.View{
 													Style: core.Style{
@@ -118,7 +118,27 @@ func (u *uiController) settingsScreen(cx *core.Scope) core.Node {
 													},
 												},
 												InsetDivider(cx, a, 14),
-												toggleRow("settings-vt-dark", "终端画布始终暗色", "亮色主题下仍使用 #09090b 暗色 VT 画布",
+												SheetListRowFunc(cx, a, "settings-open-theme",
+													func() string { return "主题外观" },
+													func() string {
+														return fmt.Sprintf("%s · %s", a.themePreset.Get().Label(), a.vtColorScheme.Get().Label())
+													},
+													iconPalette, false, true, func() {
+														u.subPage.Set("settings-theme")
+													},
+												),
+												InsetDivider(cx, a, 46),
+												SheetListRowFunc(cx, a, "settings-open-fonts",
+													func() string { return "字体与字号" },
+													func() string {
+														return fmt.Sprintf("%s · %s · %.0fpx", a.bodyFont.Get().ShortLabel(), a.monoFont.Get().ShortLabel(), a.vtFontSize.Get())
+													},
+													iconType, false, true, func() {
+														u.subPage.Set("settings-fonts")
+													},
+												),
+												InsetDivider(cx, a, 14),
+												toggleRow("settings-vt-dark", "终端画布始终暗色", "亮色主题下仍保持深色终端画布",
 													func() bool { return a.vtThemeMode.Get() == VTAlwaysDark },
 													func(v bool) {
 														if v {
@@ -168,7 +188,51 @@ func (u *uiController) settingsScreen(cx *core.Scope) core.Node {
 													},
 												},
 												InsetDivider(cx, a, 14),
-												toggleRow("settings-observe-default", "默认观察模式打开终端", "查看会话时不改变桌面端 PTY 尺寸，发送输入或点「适配列宽」才 RESIZE",
+												core.View{
+													Style: core.Style{
+														Padding: core.Symmetric(core.Points(12), core.Points(14)),
+														Gap:     Tokens.Space2,
+													},
+													Children: []core.Node{
+														core.View{
+															Style: core.Style{
+																Direction:      core.Row,
+																AlignItems:     core.AlignCenter,
+																JustifyContent: core.JustifySpaceBetween,
+																Gap:            Tokens.Space2,
+															},
+															Children: []core.Node{
+																core.Text{
+																	Content: "发送消息默认行为",
+																	StyleFunc: func() core.Style {
+																		pal := a.paletteOf(cx)
+																		return core.Style{Color: pal.Text, FontSize: Tokens.FontRowTitle, FontWeight: core.FontWeightMedium}
+																	},
+																},
+																core.View{
+																	Style: core.Style{Direction: core.Row, Gap: Tokens.Space1},
+																	Children: []core.Node{
+																		FilterPill(cx, a, "settings-send-mode-queue", func() string { return "等待" }, func() bool {
+																			return a.DefaultSendMode() == chatQueue
+																		}, nil, func() { a.SetDefaultSendMode(chatQueue) }),
+																		FilterPill(cx, a, "settings-send-mode-steer", func() string { return "插队" }, func() bool {
+																			return a.DefaultSendMode() == chatSteer
+																		}, nil, func() { a.SetDefaultSendMode(chatSteer) }),
+																	},
+																},
+															},
+														},
+														core.Text{
+															Content: "Agent 忙碌时发出消息的默认方式；等待中的消息可随时点按插队",
+															StyleFunc: func() core.Style {
+																pal := a.paletteOf(cx)
+																return core.Style{Color: pal.TextMuted, FontSize: Tokens.FontCaption}
+															},
+														},
+													},
+												},
+												InsetDivider(cx, a, 14),
+												toggleRow("settings-observe-default", "默认观察模式打开终端", "默认保持远端终端原有尺寸",
 													a.observeDefault.Get, a.SetObserveDefault,
 												),
 												InsetDivider(cx, a, 14),
@@ -176,14 +240,90 @@ func (u *uiController) settingsScreen(cx *core.Scope) core.Node {
 													a.frameCacheOn.Get, a.SetFrameCacheOn,
 												),
 												InsetDivider(cx, a, 14),
-												toggleRow("settings-notify", "Agent 阻塞/权限系统通知", "当任意实例出现「等你审批」或「出错」时弹出本地通知",
+												toggleRow("settings-notify", "Agent 通知提醒", "需要批准权限、出错或任务完成时弹出系统通知",
 													a.notifyAlerts.Get, func(v bool) {
 														a.SetNotifyAlerts(v)
-														if v && cx != nil {
-															cx.RequestNotificationPermission(nil)
+														if v {
+															a.RequestNotificationPermissionIfNeeded(true)
 														}
 													},
 												),
+												core.Show{
+													When: func() bool {
+														if !a.notifyAlerts.Get() {
+															return false
+														}
+														p := a.notifPerm.Get()
+														return p == core.NotificationsNotAsked || p == core.NotificationsDenied
+													},
+													Then: func(cx *core.Scope) core.Node {
+														return core.View{
+															Style: core.Style{
+																Padding: core.Edges{Left: 14, Right: 14, Bottom: 12},
+															},
+															Children: []core.Node{
+																core.View{
+																	TestID: "settings-notify-perm-btn",
+																	Role:   core.RoleButton,
+																	OnPress: func(core.PressEvent) {
+																		playSelectionHaptic(cx)
+																		a.RequestNotificationPermissionIfNeeded(true)
+																	},
+																	StyleFunc: func() core.Style {
+																		pal := a.paletteOf(cx)
+																		bg := pal.WarnSoft
+																		if a.notifPerm.Get() == core.NotificationsNotAsked {
+																			bg = pal.AccentSoft
+																		}
+																		return core.Style{
+																			Direction:      core.Row,
+																			AlignItems:     core.AlignCenter,
+																			JustifyContent: core.JustifySpaceBetween,
+																			Gap:            Tokens.Space2,
+																			Background:     bg,
+																			CornerRadius:   Tokens.RadiusCtrl,
+																			Padding:        core.Symmetric(Tokens.Space2, Tokens.Space3),
+																		}
+																	},
+																	Children: []core.Node{
+																		core.Text{
+																			ContentFunc: func() string {
+																				if a.notifPerm.Get() == core.NotificationsDenied {
+																					return "系统通知权限已关闭 · 点按前往系统设置开启"
+																				}
+																				return "尚未授予系统通知权限 · 点按立即授权"
+																			},
+																			StyleFunc: func() core.Style {
+																				pal := a.paletteOf(cx)
+																				fg := pal.Warn
+																				if a.notifPerm.Get() == core.NotificationsNotAsked {
+																					fg = pal.Text
+																				}
+																				return core.Style{
+																					FlexShrink: 1,
+																					Color:      fg,
+																					FontSize:   Tokens.FontCaption,
+																					FontWeight: core.FontWeightMedium,
+																				}
+																			},
+																		},
+																		core.Icon{
+																			SVG: iconChevronR,
+																			StyleFunc: func() core.Style {
+																				pal := a.paletteOf(cx)
+																				fg := pal.Warn
+																				if a.notifPerm.Get() == core.NotificationsNotAsked {
+																					fg = pal.TextMuted
+																				}
+																				return core.Style{Width: core.Pt(14), Height: core.Pt(14), Color: fg, FlexShrink: 0}
+																			},
+																		},
+																	},
+																},
+															},
+														}
+													},
+												},
 											}),
 										},
 									},
@@ -436,12 +576,90 @@ func (u *uiController) settingsScreen(cx *core.Scope) core.Node {
 										},
 									},
 
-									// 5. About & Runtime Design Tokens Gallery
+									// 5. App Updates, About & Runtime Design Tokens Gallery
 									core.View{
 										Style: core.Style{Gap: Tokens.Space2},
 										Children: []core.Node{
-											SectionHeader(cx, a, func() string { return "关于与设计系统" }, nil),
+											SectionHeader(cx, a, func() string { return "应用更新与关于" }, nil),
 											GroupCard(cx, a, "", []core.Node{
+												core.View{
+													Style: core.Style{
+														Direction:      core.Row,
+														AlignItems:     core.AlignCenter,
+														JustifyContent: core.JustifySpaceBetween,
+														Gap:            Tokens.Space3,
+														Padding:        core.Symmetric(core.Points(12), core.Points(14)),
+													},
+													Children: []core.Node{
+														core.View{
+															Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinWidth: core.Pt(0), Gap: core.Points(2)},
+															Children: []core.Node{
+																core.Text{
+																	ContentFunc: func() string {
+																		st := updater.Status(cx)
+																		switch st.Phase {
+																		case updater.PhaseDownloading:
+																			if frac := st.Fraction(); frac > 0 {
+																				return fmt.Sprintf("正在下载更新 · %.0f%%", frac*100)
+																			}
+																			return "正在下载更新…"
+																		case updater.PhaseInstalling:
+																			return "正在拉起系统安装器…"
+																		}
+																		if st.Available != "" {
+																			return "发现新版本 v" + strings.TrimPrefix(st.Available, "v")
+																		}
+																		return "检查应用更新"
+																	},
+																	StyleFunc: func() core.Style {
+																		pal := a.paletteOf(cx)
+																		return core.Style{Color: pal.Text, FontSize: Tokens.FontRowTitle, FontWeight: core.FontWeightMedium}
+																	},
+																},
+																core.Text{
+																	ContentFunc: func() string {
+																		st := updater.Status(cx)
+																		if st.Available != "" {
+																			return "已通过 Ed25519 签名验证，点击右侧立即升级"
+																		}
+																		return "自动从 GitHub Releases 检查并安装签名版本"
+																	},
+																	StyleFunc: func() core.Style {
+																		pal := a.paletteOf(cx)
+																		return core.Style{Color: pal.TextMuted, FontSize: Tokens.FontCaption}
+																	},
+																},
+															},
+														},
+														ActionButtonFunc(cx, a, "settings-check-update-btn", func() string {
+															st := updater.Status(cx)
+															if st.Phase == updater.PhaseDownloading {
+																return "下载中…"
+															}
+															if st.Phase == updater.PhaseInstalling {
+																return "安装中…"
+															}
+															if st.Available != "" {
+																return "立即更新"
+															}
+															return "检查更新"
+														}, ActionSecondary, func() {
+															if cx != nil {
+																updater.Check(cx)
+															}
+														}),
+													},
+												},
+												InsetDivider(cx, a, 14),
+												toggleRow("settings-auto-update", "自动检查新版本", "后台静默检查 GitHub Releases 新版本并提醒更新",
+													func() bool { return updater.Status(cx).AutomaticChecks },
+													func(v bool) {
+														if cx != nil {
+															updater.SetAutomaticChecks(cx, v)
+														}
+													},
+												),
+												InsetDivider(cx, a, 14),
 												core.View{
 													Style: core.Style{Padding: core.Symmetric(core.Points(12), core.Points(14))},
 													Children: []core.Node{

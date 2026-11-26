@@ -27,35 +27,49 @@ const (
 	legacyHostsKey = "herdr-nsgo.hosts"
 	prefsKey       = "herdr-nsgo.prefs.v1"
 	snippetsKey    = "herdr-nsgo.snippets.v1"
-	localPrivKeyID = "herdr-nsgo.local.ed25519.priv"
-	localPubKeyKey = "herdr-nsgo.local.ed25519.pub"
+	localPrivKeyID    = "herdr-nsgo.local.ed25519.priv"
+	localPubKeyKey    = "herdr-nsgo.local.ed25519.pub"
+	doneAckStorageKey = "herdr-nsgo.done.ack.v1"
 )
 
 // Snippet is a reusable quick-send command or prompt template.
 type Snippet struct {
-	ID    string `json:"id"`
-	Label string `json:"label"`
-	Text  string `json:"text"`
+	ID      string `json:"id"`
+	Label   string `json:"label"`
+	Binding bool   `json:"binding,omitzero"`
+	Text    string `json:"text"`
 }
 
-// AppPrefs persists user appearance and terminal behavior settings.
+// AppPrefs persists user appearance, font, and terminal behavior settings.
 type AppPrefs struct {
-	ThemeMode      ThemeMode   `json:"theme_mode"`
-	VTThemeMode    VTThemeMode `json:"vt_theme_mode"`
-	VTFontSize     float32     `json:"vt_font_size"`
-	ObserveDefault bool        `json:"observe_default"`
-	FrameCacheOn   bool        `json:"frame_cache_on"`
-	NotifyAlerts   bool        `json:"notify_alerts"`
+	ThemeMode       ThemeMode      `json:"theme_mode"`
+	ThemePreset     ThemePreset    `json:"theme_preset,omitempty"`
+	VTThemeMode     VTThemeMode    `json:"vt_theme_mode"`
+	VTColorScheme   VTColorScheme  `json:"vt_color_scheme,omitempty"`
+	VTFontSize      float32        `json:"vt_font_size"`
+	BodyFont        BodyFontPreset `json:"body_font,omitempty"`
+	MonoFont        MonoFontPreset `json:"mono_font,omitempty"`
+	BodyFontSize    float32        `json:"body_font_size,omitempty"`
+	ObserveDefault  bool           `json:"observe_default"`
+	FrameCacheOn    bool           `json:"frame_cache_on"`
+	NotifyAlerts    bool           `json:"notify_alerts"`
+	DefaultSendMode chatSubmitMode `json:"default_send_mode,omitempty"`
 }
 
 func defaultPrefs() AppPrefs {
 	return AppPrefs{
-		ThemeMode:      ThemeLight,
-		VTThemeMode:    VTFollowTheme,
-		VTFontSize:     12,
-		ObserveDefault: true,
-		FrameCacheOn:   true,
-		NotifyAlerts:   true,
+		ThemeMode:       ThemeLight,
+		ThemePreset:     PresetStudio,
+		VTThemeMode:     VTFollowTheme,
+		VTColorScheme:   VTSchemeGraphite,
+		VTFontSize:      12,
+		BodyFont:        BodyFontSans,
+		MonoFont:        MonoFontJetBrains,
+		BodyFontSize:    15,
+		ObserveDefault:  true,
+		FrameCacheOn:    true,
+		NotifyAlerts:    true,
+		DefaultSendMode: chatQueue,
 	}
 }
 
@@ -69,11 +83,61 @@ func defaultSnippets() []Snippet {
 	}
 }
 
+type toastKind uint8
+
+const (
+	toastInfo toastKind = iota
+	toastSuccess
+	toastWarn
+	toastError
+)
+
+type toastNotice struct {
+	Msg  string
+	Kind toastKind
+	Seq  uint64
+}
+
+func classifyToastKind(msg string) toastKind {
+	s := strings.TrimSpace(msg)
+	low := strings.ToLower(s)
+	for _, kw := range []string{"失败", "错误", "无法", "超过", "尚未连上", "已断连", "不在", "未连接", "尚未接入", "error", "failed", "timeout", "refused", "denied"} {
+		if strings.Contains(low, kw) {
+			return toastError
+		}
+	}
+	for _, kw := range []string{"已发送拒绝", "状态已变化", "离线", "请先", "剪贴板中没有", "未连上"} {
+		if strings.Contains(low, kw) {
+			return toastWarn
+		}
+	}
+	if strings.HasPrefix(s, "已") {
+		return toastSuccess
+	}
+	return toastInfo
+}
+
+func toastDurationFor(kind toastKind, msg string) time.Duration {
+	switch kind {
+	case toastError:
+		return 4000 * time.Millisecond
+	case toastWarn:
+		return 2800 * time.Millisecond
+	case toastSuccess:
+		return 2000 * time.Millisecond
+	default:
+		if strings.HasPrefix(strings.TrimSpace(msg), "正在") {
+			return 5000 * time.Millisecond
+		}
+		return 2400 * time.Millisecond
+	}
+}
+
 // App owns the multi-instance CorePool, secrets, TOFU store, preferences, LRU frame cache,
 // snippets, and reactive NSGo signals read by all 8 screens.
 type App struct {
-	cx      *core.Scope
-	secrets SecretBackend
+	cx        *core.Scope
+	secrets   SecretBackend
 	tofu      *TOFUStore
 	pool      *CorePool
 	cache     *FrameCache
@@ -86,30 +150,56 @@ type App struct {
 	searchQuery          *core.Signal[string]
 	inboxFilter          *core.Signal[string]
 	themeMode            *core.Signal[ThemeMode]
+	themePreset          *core.Signal[ThemePreset]
 	vtThemeMode          *core.Signal[VTThemeMode]
+	vtColorScheme        *core.Signal[VTColorScheme]
 	vtFontSize           *core.Signal[float32]
+	bodyFont             *core.Signal[BodyFontPreset]
+	monoFont             *core.Signal[MonoFontPreset]
+	bodyFontSize         *core.Signal[float32]
 	observeDefault       *core.Signal[bool]
 	frameCacheOn         *core.Signal[bool]
 	notifyAlerts         *core.Signal[bool]
+	notifPerm            *core.Signal[core.NotificationPermission]
+	defaultSendMode      *core.Signal[chatSubmitMode]
 	snippets             *core.Signal[[]Snippet]
 	tofuRecords          *core.Signal[[]TOFURecord]
 	localPubKey          *core.Signal[string]
 	toastMsg             *core.Signal[string]
+	toast                *core.Signal[toastNotice]
+	resuming             *core.Signal[bool]
+	showingHomeCache     *core.Signal[bool]
+	sessionModels        *core.Signal[map[TermKey]string]
+	sessionEfforts       *core.Signal[map[TermKey]string]
+	catalogRev           *core.Signal[uint64]
+	completedReports     *core.Signal[map[TermKey]bool]
+	ackDone              *core.Signal[map[string]string]
 
 	// Compatibility signals for legacy tests / v0.1.0 screens until Task 6 removes screens.go
-	conn     *core.Signal[string]
-	problem  *core.Signal[string]
-	coreName *core.Signal[string]
-	terms    *core.Signal[[]Terminal]
-	machines *core.Signal[[]MachineView]
-	texts    *core.Signal[map[string]string]
-	composes *core.Signal[map[string]string]
-	filter   *core.Signal[string]
+	conn       *core.Signal[string]
+	problem    *core.Signal[string]
+	coreName   *core.Signal[string]
+	terms      *core.Signal[[]Terminal]
+	machines   *core.Signal[[]MachineView]
+	texts      *core.Signal[map[string]string]
+	composes   *core.Signal[map[string]string]
+	chatImages *core.Signal[map[TermKey]chatImageDraft]
+	filter     *core.Signal[string]
 
 	mu                 sync.Mutex
 	hosts              []Host
 	cachedSnaps        []InstanceSnapshot
 	cachedAgg          []AggregatedTerminal
+	lastHomeSave          time.Time
+	resumeGen             uint64
+	toastSeq              uint64
+	toastTimer            *time.Timer
+	toastDurationOverride time.Duration
+	notifPrompted         bool
+	catalogFetchInFly     map[string]bool
+	catalogFetchedAt   map[string]time.Time
+	prevTermStates     map[TermKey]string
+	activeSessionKey   TermKey
 	alerts             *alertTracker
 	onNotify           func(TermKey)
 	onPoolSync         func()
@@ -134,30 +224,50 @@ func NewApp(cx *core.Scope) *App {
 		searchQuery:          core.NewSignal(cx, ""),
 		inboxFilter:          core.NewSignal(cx, ""),
 		themeMode:            core.NewSignal(cx, prefs.ThemeMode),
+		themePreset:          core.NewSignal(cx, prefs.ThemePreset),
 		vtThemeMode:          core.NewSignal(cx, prefs.VTThemeMode),
+		vtColorScheme:        core.NewSignal(cx, prefs.VTColorScheme),
 		vtFontSize:           core.NewSignal(cx, prefs.VTFontSize),
+		bodyFont:             core.NewSignal(cx, prefs.BodyFont),
+		monoFont:             core.NewSignal(cx, prefs.MonoFont),
+		bodyFontSize:         core.NewSignal(cx, prefs.BodyFontSize),
 		observeDefault:       core.NewSignal(cx, prefs.ObserveDefault),
 		frameCacheOn:         core.NewSignal(cx, prefs.FrameCacheOn),
 		notifyAlerts:         core.NewSignal(cx, prefs.NotifyAlerts),
+		notifPerm:            core.NewSignal(cx, core.NotificationsNotAsked),
+		defaultSendMode:      core.NewSignal(cx, prefs.DefaultSendMode),
 		snippets:             core.NewSignalFunc(cx, loadSnippets(cx), nil),
 		tofuRecords:          core.NewSignalFunc(cx, []TOFURecord(nil), nil),
 		localPubKey:          core.NewSignal(cx, ""),
 		toastMsg:             core.NewSignal(cx, ""),
+		toast:                core.NewSignal(cx, toastNotice{}),
+		resuming:             core.NewSignal(cx, false),
+		showingHomeCache:     core.NewSignal(cx, false),
+		sessionModels:        core.NewSignalFunc(cx, map[TermKey]string{}, nil),
+		sessionEfforts:       core.NewSignalFunc(cx, map[TermKey]string{}, nil),
+		catalogRev:           core.NewSignal(cx, uint64(0)),
+		completedReports:     core.NewSignalFunc(cx, map[TermKey]bool{}, nil),
+		ackDone:              core.NewSignalFunc(cx, loadDoneAcks(cx), nil),
+		catalogFetchInFly:    make(map[string]bool),
+		catalogFetchedAt:     make(map[string]time.Time),
+		prevTermStates:       make(map[TermKey]string),
 
-		conn:     core.NewSignal(cx, stateOff),
-		problem:  core.NewSignal(cx, ""),
-		coreName: core.NewSignal(cx, ""),
-		terms:    core.NewSignalFunc(cx, []Terminal(nil), nil),
-		machines: core.NewSignalFunc(cx, []MachineView(nil), nil),
-		texts:    core.NewSignalFunc(cx, map[string]string{}, nil),
-		composes: core.NewSignalFunc(cx, map[string]string{}, nil),
-		filter:   core.NewSignal(cx, ""),
+		conn:       core.NewSignal(cx, stateOff),
+		problem:    core.NewSignal(cx, ""),
+		coreName:   core.NewSignal(cx, ""),
+		terms:      core.NewSignalFunc(cx, []Terminal(nil), nil),
+		machines:   core.NewSignalFunc(cx, []MachineView(nil), nil),
+		texts:      core.NewSignalFunc(cx, map[string]string{}, nil),
+		composes:   core.NewSignalFunc(cx, map[string]string{}, nil),
+		chatImages: core.NewSignalFunc(cx, map[TermKey]chatImageDraft{}, nil),
+		filter:     core.NewSignal(cx, ""),
 	}
 
 	if cx != nil {
-		cx.SetTheme(AppTheme())
+		cx.SetTheme(AppThemeFor(prefs.ThemePreset))
 		ApplyAppearance(cx, prefs.ThemeMode)
 	}
+	a.transcriptResolver.SetSnapshotStore(a.snapshots)
 
 	a.tofuRecords.Set(a.tofu.List())
 	a.tofu.OnChange(func() {
@@ -176,7 +286,15 @@ func NewApp(cx *core.Scope) *App {
 	})
 
 	if cx != nil {
-		cx.Cleanup(func() { a.pool.Close() })
+		cx.Cleanup(func() {
+			a.mu.Lock()
+			if a.toastTimer != nil {
+				a.toastTimer.Stop()
+				a.toastTimer = nil
+			}
+			a.mu.Unlock()
+			a.pool.Close()
+		})
 		cx.OnNotificationPress(func(id string) {
 			if inst, addr, ok := strings.Cut(id, "::"); ok {
 				a.mu.Lock()
@@ -187,11 +305,52 @@ func NewApp(cx *core.Scope) *App {
 				}
 			}
 		})
+		if !cx.Env().Simulated() {
+			a.RefreshNotificationPermission()
+			if prefs.NotifyAlerts {
+				time.AfterFunc(600*time.Millisecond, func() {
+					a.RequestNotificationPermissionIfNeeded(false)
+				})
+			}
+		}
 	}
 
 	hosts := a.loadHosts()
 	a.hosts = hosts
 	if len(hosts) > 0 {
+		// 0ms cold-start Frame-0 restore: show last known sessions (marked connecting) immediately while SSH dials.
+		if cached, ok := a.snapshots.LoadHome(); ok && len(cached) > 0 {
+			agg := AggregateTerminals(cached)
+			a.cachedSnaps = cached
+			a.cachedAgg = agg
+			a.instances.Set(cached)
+			a.aggTerms.Set(agg)
+			a.conn.Set(stateDialing)
+			a.showingHomeCache.Set(true)
+		} else {
+			// Seed dialing placeholders immediately so the UI shows connecting skeleton instead of an empty flash.
+			dialing := make([]InstanceSnapshot, 0, len(hosts))
+			for _, h := range hosts {
+				if !h.IsEnabled() {
+					continue
+				}
+				name := h.Label
+				if name == "" {
+					name = h.Target
+				}
+				dialing = append(dialing, InstanceSnapshot{
+					InstanceID:   h.EffectiveID(),
+					InstanceName: name,
+					Target:       h.Target,
+					User:         h.User,
+					State:        stateDialing,
+					Online:       false,
+				})
+			}
+			a.cachedSnaps = dialing
+			a.instances.Set(dialing)
+			a.conn.Set(stateDialing)
+		}
 		a.pool.SetHosts(hosts)
 	}
 	return a
@@ -270,17 +429,77 @@ func (a *App) syncPoolToSignals() {
 		}
 
 		a.mu.Lock()
-		a.cachedSnaps = snaps
-		a.cachedAgg = agg
+		prevOnline := 0
+		for _, old := range a.cachedSnaps {
+			if old.Online {
+				prevOnline++
+			}
+		}
+		prevTermCount := len(a.cachedAgg)
+		nowOnline := 0
+		anyDialing := false
+		for _, s := range snaps {
+			if s.Online {
+				nowOnline++
+			} else if s.State == stateDialing {
+				anyDialing = true
+			}
+		}
+		// Keep cached home sessions visible on cold start until at least one instance comes online or stops dialing.
+		useCachedHome := a.showingHomeCache.Get() && nowOnline == 0 && anyDialing && len(agg) == 0 && len(a.cachedAgg) > 0
+		if useCachedHome {
+			// Merge live dialing/error states into cached instances without wiping their cached terminals yet.
+			byID := make(map[string]InstanceSnapshot, len(snaps))
+			for _, s := range snaps {
+				byID[s.InstanceID] = s
+			}
+			merged := make([]InstanceSnapshot, 0, len(a.cachedSnaps))
+			for _, old := range a.cachedSnaps {
+				if live, ok := byID[old.InstanceID]; ok {
+					cp := live
+					if len(cp.Terminals) == 0 {
+						cp.Terminals = old.Terminals
+					}
+					merged = append(merged, cp)
+				}
+			}
+			if len(merged) > 0 {
+				snaps = merged
+				agg = AggregateTerminals(merged)
+			}
+		} else {
+			if nowOnline > 0 || !anyDialing {
+				a.showingHomeCache.Set(false)
+			}
+			a.cachedSnaps = snaps
+			a.cachedAgg = agg
+		}
+		shouldPersistHome := nowOnline > 0 && time.Since(a.lastHomeSave) >= 4*time.Second
+		if shouldPersistHome {
+			a.lastHomeSave = time.Now()
+		}
 		a.mu.Unlock()
+
+		// Smooth spring layout transition whenever transitioning from skeleton/offline into live populated sessions.
+		if (prevOnline == 0 && nowOnline > 0) || (prevTermCount == 0 && len(agg) > 0) {
+			animateSpringLayout(a.cx)
+		}
 
 		a.instances.Set(snaps)
 		a.aggTerms.Set(agg)
+		a.trackCompletionTransitions(agg)
 		a.terms.Set(flatTerms)
 		a.machines.Set(flatMachines)
 		a.conn.Set(connState)
 		a.problem.Set(problem)
 		a.coreName.Set(coreName)
+		if nowOnline > 0 && !anyDialing && a.resuming.Get() {
+			animateSpringLayout(a.cx)
+			a.resuming.Set(false)
+		}
+		if shouldPersistHome && a.snapshots != nil {
+			a.snapshots.SaveHome(snaps)
+		}
 
 		// Compute deduplicated notifications strictly on the UI thread.
 		for _, alert := range a.alerts.diff(snaps, agg) {
@@ -296,12 +515,75 @@ func (a *App) syncPoolToSignals() {
 	})
 }
 
+func (a *App) RefreshNotificationPermission() {
+	if a.cx == nil || a.cx.Env().Simulated() {
+		return
+	}
+	a.post(func() {
+		a.cx.NotificationPermission(func(p core.NotificationPermission) {
+			a.post(func() { a.notifPerm.Set(p) })
+		})
+	})
+}
+
+func (a *App) RequestNotificationPermissionIfNeeded(force bool) {
+	if a.cx == nil || a.cx.Env().Simulated() {
+		return
+	}
+	a.post(func() {
+		a.cx.NotificationPermission(func(p core.NotificationPermission) {
+			a.post(func() {
+				a.notifPerm.Set(p)
+				switch p {
+				case core.NotificationsGranted, core.NotificationsUnavailable:
+					return
+				case core.NotificationsNotAsked:
+					a.mu.Lock()
+					if !force && (a.notifPrompted || !a.notifyAlerts.GetUntracked()) {
+						a.mu.Unlock()
+						return
+					}
+					a.notifPrompted = true
+					a.mu.Unlock()
+					a.cx.RequestNotificationPermission(func(next core.NotificationPermission) {
+						a.post(func() {
+							a.notifPerm.Set(next)
+							if next == core.NotificationsGranted && force {
+								a.notifyToast("已开启系统通知权限")
+							}
+						})
+					})
+				case core.NotificationsDenied:
+					if force {
+						a.cx.OpenPermissionSettings(core.PermissionNotifications, nil)
+						a.notifyToast("请在系统设置中开启通知权限")
+					}
+				}
+			})
+		})
+	})
+}
+
 func (a *App) dispatchAlertNotification(at AggregatedTerminal) {
 	if a.cx == nil || !a.notifyAlerts.Get() {
 		return
 	}
-	title := fmt.Sprintf("%s · %s", at.Terminal.Label(), attentionWhy(at.Terminal))
+	// Do not push a completion notification for the session the user is actively viewing right now.
+	a.mu.Lock()
+	activeKey := a.activeSessionKey
+	a.mu.Unlock()
+	if !at.Terminal.NeedsYou() && activeKey == at.Key {
+		return
+	}
+	reason := attentionWhy(at.Terminal)
+	if !at.Terminal.NeedsYou() {
+		reason = "已完成"
+	}
+	title := fmt.Sprintf("%s · %s", at.Terminal.Label(), reason)
 	body := firstLine(at.Terminal.Status, at.Terminal)
+	if strings.TrimSpace(body) == "" {
+		body = "点按查看最新结果"
+	}
 	_ = a.cx.ShowNotification(core.Notification{
 		ID:    at.Key.String(),
 		Title: title,
@@ -542,6 +824,94 @@ func (a *App) TestConnection(ctx context.Context, h Host) (HelloResult, int64, e
 // Reconnect wakes all pool instances (or a specific one via ReconnectInstance).
 func (a *App) Reconnect() { a.pool.WakeAll() }
 
+// HasOfflineEnabledInstance reports whether any enabled host is currently disconnected or dialing.
+func (a *App) HasOfflineEnabledInstance() bool {
+	snaps := a.instances.GetUntracked()
+	if len(snaps) == 0 {
+		return len(a.Hosts()) > 0
+	}
+	for _, s := range snaps {
+		if !s.Online {
+			return true
+		}
+	}
+	return false
+}
+
+// OnForegroundResume decides whether returning to active focus needs a visible reconnect sync.
+// Brief focus drops (e.g. pulling down Android's notification shade) while all SSH instances are
+// still online must NOT flash the "正在同步" banner.
+func (a *App) OnForegroundResume(wasBackground bool, away time.Duration) bool {
+	if len(a.Hosts()) == 0 {
+		return false
+	}
+	needsSync := a.HasOfflineEnabledInstance() ||
+		(wasBackground && away >= 8*time.Second) ||
+		away >= 20*time.Second
+	if !needsSync {
+		return false
+	}
+	a.BeginResumeSync()
+	return true
+}
+
+// BeginResumeSync marks a foreground-resume / manual-refresh sync cycle with immediate visual feedback
+// and a bounded safety timeout so the syncing indicator never gets stuck if an instance is unreachable.
+func (a *App) BeginResumeSync() {
+	if len(a.Hosts()) == 0 {
+		return
+	}
+	a.mu.Lock()
+	a.resumeGen++
+	gen := a.resumeGen
+	a.mu.Unlock()
+	a.post(func() {
+		animateSpringLayout(a.cx)
+		a.resuming.Set(true)
+	})
+	a.pool.WakeAll()
+	time.AfterFunc(4500*time.Millisecond, func() {
+		a.mu.Lock()
+		same := a.resumeGen == gen
+		a.mu.Unlock()
+		if same {
+			a.post(func() {
+				if a.resuming.Get() {
+					animateSpringLayout(a.cx)
+					a.resuming.Set(false)
+				}
+			})
+		}
+	})
+}
+
+// SyncStatus returns (active, label) describing any in-progress cold-start dial or background-resume sync.
+func (a *App) SyncStatus() (bool, string) {
+	snaps := a.instances.Get()
+	var dialing []string
+	online := 0
+	for _, s := range snaps {
+		if s.Online {
+			online++
+		} else if s.State == stateDialing {
+			dialing = append(dialing, s.InstanceName)
+		}
+	}
+	if len(dialing) > 0 {
+		if len(dialing) == 1 {
+			return true, "正在连接 " + dialing[0] + "…"
+		}
+		return true, fmt.Sprintf("正在连接 %d 台开发机…", len(dialing))
+	}
+	if a.resuming.Get() {
+		if online > 0 {
+			return true, "正在同步最新会话…"
+		}
+		return true, "正在恢复连接…"
+	}
+	return false, ""
+}
+
 // ReconnectInstance reconnects a specific instance ID.
 func (a *App) ReconnectInstance(id string) { a.pool.ReconnectInstance(id) }
 
@@ -604,6 +974,201 @@ func (a *App) Attention() []Terminal {
 	return out
 }
 
+// AggregatedCompleted returns unread Agent completion reports matching inboxFilter
+// (both explicit "done" status / finished agent sessions and live working -> idle/done transitions).
+func (a *App) AggregatedCompleted() []AggregatedTerminal {
+	q := strings.ToLower(strings.TrimSpace(a.inboxFilter.Get()))
+	liveDone := a.completedReports.Get()
+	acks := a.ackDone.Get()
+	var out []AggregatedTerminal
+	for _, item := range a.aggTerms.Get() {
+		if !a.isUnreadCompletion(item, liveDone, acks) {
+			continue
+		}
+		if q != "" {
+			hay := strings.ToLower(item.Terminal.Label() + " " + item.Terminal.CurrentDir() + " " + item.InstanceName + " " + item.Key.Addr)
+			if !strings.Contains(hay, q) {
+				continue
+			}
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+// InboxBadgeCount returns unfiltered counts of urgent (NeedsYou) items and unread completion reports.
+func (a *App) InboxBadgeCount() (urgent int, done int) {
+	liveDone := a.completedReports.Get()
+	acks := a.ackDone.Get()
+	for _, item := range a.aggTerms.Get() {
+		if item.Terminal.NeedsYou() {
+			urgent++
+		} else if a.isUnreadCompletion(item, liveDone, acks) {
+			done++
+		}
+	}
+	return urgent, done
+}
+
+func (a *App) isUnreadCompletion(item AggregatedTerminal, liveDone map[TermKey]bool, acks map[string]string) bool {
+	if item.Terminal.NeedsYou() {
+		return false
+	}
+	if !isExplicitCompletionTerminal(item.Terminal) && !liveDone[item.Key] {
+		return false
+	}
+	if acks != nil && acks[item.Key.String()] == completionSignature(item.Terminal) {
+		return false
+	}
+	return true
+}
+
+func (a *App) trackCompletionTransitions(agg []AggregatedTerminal) {
+	a.mu.Lock()
+	activeKey := a.activeSessionKey
+	if a.prevTermStates == nil {
+		a.prevTermStates = make(map[TermKey]string)
+	}
+	var newlyDone []TermKey
+	var resumedWorking []TermKey
+	seen := make(map[TermKey]bool, len(agg))
+	for _, item := range agg {
+		seen[item.Key] = true
+		cur := item.Terminal.StateWord()
+		prev := a.prevTermStates[item.Key]
+		if cur == "working" {
+			resumedWorking = append(resumedWorking, item.Key)
+		} else if prev == "working" && (cur == "idle" || cur == "done") && item.Key != activeKey {
+			newlyDone = append(newlyDone, item.Key)
+		}
+		a.prevTermStates[item.Key] = cur
+	}
+	for k := range a.prevTermStates {
+		if !seen[k] {
+			delete(a.prevTermStates, k)
+		}
+	}
+	a.mu.Unlock()
+
+	if len(newlyDone) == 0 && len(resumedWorking) == 0 {
+		return
+	}
+	curLive := a.completedReports.GetUntracked()
+	changed := false
+	next := make(map[TermKey]bool, len(curLive)+len(newlyDone))
+	for k, v := range curLive {
+		if seen[k] && v {
+			next[k] = true
+		} else {
+			changed = true
+		}
+	}
+	for _, k := range resumedWorking {
+		if next[k] {
+			delete(next, k)
+			changed = true
+		}
+	}
+	for _, k := range newlyDone {
+		if !next[k] {
+			next[k] = true
+			changed = true
+		}
+	}
+	if changed {
+		a.completedReports.Set(next)
+	}
+}
+
+// SetActiveSession records the currently viewed session and marks its completion report read.
+func (a *App) SetActiveSession(key TermKey) {
+	a.mu.Lock()
+	a.activeSessionKey = key
+	a.mu.Unlock()
+	if key != (TermKey{}) {
+		a.AcknowledgeCompleted(key)
+	}
+}
+
+// AcknowledgeCompleted marks a completed session report as read so it clears from Inbox.
+func (a *App) AcknowledgeCompleted(key TermKey) {
+	if key == (TermKey{}) {
+		return
+	}
+	live := a.completedReports.GetUntracked()
+	if live[key] {
+		nextLive := make(map[TermKey]bool, len(live))
+		for k, v := range live {
+			if k != key && v {
+				nextLive[k] = true
+			}
+		}
+		a.completedReports.Set(nextLive)
+	}
+	if at, ok := a.FindTerminal(key); ok && !at.Terminal.NeedsYou() {
+		sig := completionSignature(at.Terminal)
+		acks := a.ackDone.GetUntracked()
+		if acks[key.String()] != sig {
+			nextAcks := make(map[string]string, len(acks)+1)
+			for k, v := range acks {
+				nextAcks[k] = v
+			}
+			nextAcks[key.String()] = sig
+			a.ackDone.Set(nextAcks)
+			saveDoneAcks(a.cx, nextAcks)
+		}
+	}
+}
+
+// AcknowledgeAllCompleted marks all currently unread completion reports as read.
+func (a *App) AcknowledgeAllCompleted() {
+	done := a.AggregatedCompleted()
+	if len(done) == 0 {
+		return
+	}
+	a.completedReports.Set(map[TermKey]bool{})
+	acks := a.ackDone.GetUntracked()
+	nextAcks := make(map[string]string, len(acks)+len(done))
+	for k, v := range acks {
+		nextAcks[k] = v
+	}
+	for _, it := range done {
+		nextAcks[it.Key.String()] = completionSignature(it.Terminal)
+	}
+	a.ackDone.Set(nextAcks)
+	saveDoneAcks(a.cx, nextAcks)
+}
+
+func loadDoneAcks(cx *core.Scope) map[string]string {
+	out := make(map[string]string)
+	if cx == nil {
+		return out
+	}
+	if raw, ok := cx.Storage().GetItem(doneAckStorageKey); ok && raw != "" {
+		_ = json.Unmarshal([]byte(raw), &out)
+	}
+	return out
+}
+
+func saveDoneAcks(cx *core.Scope, acks map[string]string) {
+	if cx == nil {
+		return
+	}
+	if len(acks) > 100 {
+		trimmed := make(map[string]string, 100)
+		for k, v := range acks {
+			trimmed[k] = v
+			if len(trimmed) >= 100 {
+				break
+			}
+		}
+		acks = trimmed
+	}
+	if raw, err := json.Marshal(acks); err == nil {
+		cx.Storage().SetItem(doneAckStorageKey, string(raw))
+	}
+}
+
 // SeedSnapshots sets both reactive signals and thread-safe cached snapshots (used in headless UI tests).
 func (a *App) SeedSnapshots(snaps []InstanceSnapshot) {
 	agg := AggregateTerminals(snaps)
@@ -611,8 +1176,11 @@ func (a *App) SeedSnapshots(snaps []InstanceSnapshot) {
 	a.cachedSnaps = snaps
 	a.cachedAgg = agg
 	a.mu.Unlock()
+	a.showingHomeCache.Set(false)
+	a.resuming.Set(false)
 	a.instances.Set(snaps)
 	a.aggTerms.Set(agg)
+	a.trackCompletionTransitions(agg)
 }
 
 // FindTerminalSafe locates an AggregatedTerminal without touching NSGo reactive signals (safe on any goroutine).
@@ -706,10 +1274,18 @@ func (a *App) SendTo(key TermKey, text string) {
 
 // SendToWithCallback sends text + Enter via terminal.send and invokes onDone (if non-nil) with any error.
 func (a *App) SendToWithCallback(key TermKey, text string, onDone func(error)) {
+	a.sendChatWithMode(key, text, "", chatNormal, onDone)
+}
+
+func (a *App) sendChatWithMode(key TermKey, text, kind string, mode chatSubmitMode, onDone func(error)) {
 	if strings.TrimSpace(text) == "" {
 		return
 	}
-	c := a.clientForKey(key)
+	// A command or model selector must only reach the core owning this address.
+	c := a.pool.ClientFor(key.InstanceID)
+	if key.InstanceID == "" {
+		c = a.clientForKey(key)
+	}
 	if c == nil {
 		err := errors.New("该实例尚未连上，先检查实例连接。")
 		a.notifyToast(err.Error())
@@ -719,11 +1295,12 @@ func (a *App) SendToWithCallback(key TermKey, text string, onDone func(error)) {
 		return
 	}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		// hc can hold a send while the terminal has an unfinished draft (60s by default).
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
-		_, err := c.Send(ctx, key.Addr, text)
+		err := c.submitChat(ctx, key.Addr, text, kind, mode)
 		if err != nil {
-			a.notifyToast(explain(err))
+			a.notifyToast(chatSendError(err))
 		}
 		if onDone != nil {
 			onDone(err)
@@ -874,20 +1451,20 @@ func (a *App) UploadFileTo(key TermKey, name string, data []byte) {
 				prev += " "
 			}
 			a.setCompose(key.String(), prev+res.Path)
-			a.toastMsg.Set("已上传：" + res.Path)
+			a.notifyToast("已上传：" + res.Path)
 		})
 	}()
 }
 
 // Legacy single-address helpers retained for screens.go compatibility until Task 6.
-func (a *App) Watch(addr string)                      {}
-func (a *App) Unwatch(addr string)                    {}
-func (a *App) Send(addr, text string)                 { a.SendTo(TermKey{Addr: addr}, text) }
-func (a *App) Press(addr string, keys ...string)      { a.PressTo(TermKey{Addr: addr}, keys...) }
-func (a *App) Interrupt(addr string)                  { a.InterruptTo(TermKey{Addr: addr}) }
-func (a *App) Text(addr string) string                { return a.texts.Get()[addr] }
-func (a *App) Compose(key string) string              { return a.composes.Get()[key] }
-func (a *App) SetCompose(key, text string)            { a.setCompose(key, text) }
+func (a *App) Watch(addr string)                 {}
+func (a *App) Unwatch(addr string)               {}
+func (a *App) Send(addr, text string)            { a.SendTo(TermKey{Addr: addr}, text) }
+func (a *App) Press(addr string, keys ...string) { a.PressTo(TermKey{Addr: addr}, keys...) }
+func (a *App) Interrupt(addr string)             { a.InterruptTo(TermKey{Addr: addr}) }
+func (a *App) Text(addr string) string           { return a.texts.Get()[addr] }
+func (a *App) Compose(key string) string         { return a.composes.Get()[key] }
+func (a *App) SetCompose(key, text string)       { a.setCompose(key, text) }
 
 func (a *App) setCompose(key, text string) {
 	next := make(map[string]string, len(a.composes.Get())+1)
@@ -899,7 +1476,82 @@ func (a *App) setCompose(key, text string) {
 }
 
 func (a *App) notifyToast(msg string) {
-	a.post(func() { a.toastMsg.Set(msg) })
+	a.notifyToastWithKind(msg, classifyToastKind(msg))
+}
+
+func (a *App) notifyToastWithKind(msg string, kind toastKind) {
+	clean := strings.TrimSpace(msg)
+	if clean == "" {
+		a.dismissToast()
+		return
+	}
+	a.mu.Lock()
+	a.toastSeq++
+	seq := a.toastSeq
+	if a.toastTimer != nil {
+		a.toastTimer.Stop()
+		a.toastTimer = nil
+	}
+	dur := a.toastDurationOverride
+	if dur <= 0 {
+		dur = toastDurationFor(kind, clean)
+	}
+	a.toastTimer = time.AfterFunc(dur, func() {
+		a.mu.Lock()
+		if a.toastSeq != seq {
+			a.mu.Unlock()
+			return
+		}
+		a.toastTimer = nil
+		a.mu.Unlock()
+		a.post(func() {
+			if cur := a.toast.GetUntracked(); cur.Seq != seq {
+				return
+			}
+			a.toast.Set(toastNotice{})
+			a.toastMsg.Set("")
+		})
+	})
+	a.mu.Unlock()
+
+	a.post(func() {
+		a.toast.Set(toastNotice{Msg: clean, Kind: kind, Seq: seq})
+		a.toastMsg.Set(clean)
+		if a.cx != nil && !a.cx.Env().Simulated() {
+			switch kind {
+			case toastSuccess:
+				a.cx.PlayHaptic(core.HapticSuccess)
+			case toastWarn:
+				a.cx.PlayHaptic(core.HapticWarning)
+			case toastError:
+				a.cx.PlayHaptic(core.HapticError)
+			}
+		}
+	})
+}
+
+func (a *App) dismissToast() {
+	a.stopToastTimer()
+	a.post(func() {
+		a.toast.Set(toastNotice{})
+		a.toastMsg.Set("")
+	})
+}
+
+func (a *App) dismissToastSync() {
+	a.stopToastTimer()
+	a.toast.Set(toastNotice{})
+	a.toastMsg.Set("")
+}
+
+func (a *App) stopToastTimer() {
+	a.mu.Lock()
+	a.toastSeq++
+	if a.toastTimer != nil {
+		a.toastTimer.Stop()
+		a.toastTimer = nil
+	}
+	a.mu.Unlock()
 }
 
 // ---------------------------------------------------------------------------
@@ -913,14 +1565,32 @@ func loadPrefs(cx *core.Scope) AppPrefs {
 	if raw, ok := cx.Storage().GetItem(prefsKey); ok && raw != "" {
 		_ = json.Unmarshal([]byte(raw), &p)
 	}
-	if p.VTFontSize < 10 || p.VTFontSize > 15 {
+	if p.VTFontSize < 10 || p.VTFontSize > 16 {
 		p.VTFontSize = 12
+	}
+	if p.BodyFontSize < 13 || p.BodyFontSize > 19 {
+		p.BodyFontSize = 15
 	}
 	if p.ThemeMode == "" {
 		p.ThemeMode = ThemeLight
 	}
+	if p.ThemePreset == "" {
+		p.ThemePreset = PresetStudio
+	}
 	if p.VTThemeMode == "" {
 		p.VTThemeMode = VTFollowTheme
+	}
+	if p.VTColorScheme == "" {
+		p.VTColorScheme = VTSchemeGraphite
+	}
+	if p.BodyFont == "" {
+		p.BodyFont = BodyFontSans
+	}
+	if p.MonoFont == "" {
+		p.MonoFont = MonoFontJetBrains
+	}
+	if p.DefaultSendMode != chatQueue && p.DefaultSendMode != chatSteer {
+		p.DefaultSendMode = chatQueue
 	}
 	return p
 }
@@ -930,12 +1600,18 @@ func (a *App) savePrefs() {
 		return
 	}
 	p := AppPrefs{
-		ThemeMode:      a.themeMode.Get(),
-		VTThemeMode:    a.vtThemeMode.Get(),
-		VTFontSize:     a.vtFontSize.Get(),
-		ObserveDefault: a.observeDefault.Get(),
-		FrameCacheOn:   a.frameCacheOn.Get(),
-		NotifyAlerts:   a.notifyAlerts.Get(),
+		ThemeMode:       a.themeMode.Get(),
+		ThemePreset:     a.themePreset.Get(),
+		VTThemeMode:     a.vtThemeMode.Get(),
+		VTColorScheme:   a.vtColorScheme.Get(),
+		VTFontSize:      a.vtFontSize.Get(),
+		BodyFont:        a.bodyFont.Get(),
+		MonoFont:        a.monoFont.Get(),
+		BodyFontSize:    a.bodyFontSize.Get(),
+		ObserveDefault:  a.observeDefault.Get(),
+		FrameCacheOn:    a.frameCacheOn.Get(),
+		NotifyAlerts:    a.notifyAlerts.Get(),
+		DefaultSendMode: a.defaultSendMode.Get(),
 	}
 	if raw, err := json.Marshal(p); err == nil {
 		a.cx.Storage().SetItem(prefsKey, string(raw))
@@ -948,8 +1624,27 @@ func (a *App) SetThemeMode(m ThemeMode) {
 	a.savePrefs()
 }
 
+func (a *App) SetThemePreset(p ThemePreset) {
+	if p == "" {
+		p = PresetStudio
+	}
+	a.themePreset.Set(p)
+	if a.cx != nil {
+		a.cx.SetTheme(AppThemeFor(p))
+	}
+	a.savePrefs()
+}
+
 func (a *App) SetVTThemeMode(m VTThemeMode) {
 	a.vtThemeMode.Set(m)
+	a.savePrefs()
+}
+
+func (a *App) SetVTColorScheme(s VTColorScheme) {
+	if s == "" {
+		s = VTSchemeGraphite
+	}
+	a.vtColorScheme.Set(s)
 	a.savePrefs()
 }
 
@@ -957,11 +1652,53 @@ func (a *App) SetVTFontSize(sz float32) {
 	if sz < 10 {
 		sz = 10
 	}
-	if sz > 15 {
-		sz = 15
+	if sz > 16 {
+		sz = 16
 	}
 	a.vtFontSize.Set(sz)
 	a.savePrefs()
+}
+
+func (a *App) SetBodyFont(f BodyFontPreset) {
+	if f == "" {
+		f = BodyFontSans
+	}
+	a.bodyFont.Set(f)
+	a.savePrefs()
+}
+
+func (a *App) SetMonoFont(f MonoFontPreset) {
+	if f == "" {
+		f = MonoFontJetBrains
+	}
+	a.monoFont.Set(f)
+	a.savePrefs()
+}
+
+func (a *App) SetBodyFontSize(sz float32) {
+	if sz < 13 {
+		sz = 13
+	}
+	if sz > 19 {
+		sz = 19
+	}
+	a.bodyFontSize.Set(sz)
+	a.savePrefs()
+}
+
+// BodyFontFamily returns the reactive reading typeface stack for Chat & prose.
+func (a *App) BodyFontFamily() string {
+	return ResolveBodyFontFamily(a.bodyFont.Get(), a.monoFont.Get())
+}
+
+// MonoFontFamily returns the reactive monospace typeface stack for code blocks & VT terminals.
+func (a *App) MonoFontFamily() string {
+	return ResolveMonoFontFamily(a.monoFont.Get())
+}
+
+// BodyFontSize returns the user's configured reading body font size in points.
+func (a *App) BodyFontSize() core.Points {
+	return core.Points(a.bodyFontSize.Get())
 }
 
 func (a *App) SetObserveDefault(v bool) {
@@ -977,6 +1714,62 @@ func (a *App) SetFrameCacheOn(v bool) {
 func (a *App) SetNotifyAlerts(v bool) {
 	a.notifyAlerts.Set(v)
 	a.savePrefs()
+}
+
+// DefaultSendMode returns the user's preferred behavior when sending messages to a busy agent (chatQueue or chatSteer).
+func (a *App) DefaultSendMode() chatSubmitMode {
+	if a == nil || a.defaultSendMode == nil {
+		return chatQueue
+	}
+	m := a.defaultSendMode.Get()
+	if m != chatQueue && m != chatSteer {
+		return chatQueue
+	}
+	return m
+}
+
+// SetDefaultSendMode updates and persists the default message send behavior (等待 / 插队).
+func (a *App) SetDefaultSendMode(m chatSubmitMode) {
+	if m != chatQueue && m != chatSteer {
+		m = chatQueue
+	}
+	a.defaultSendMode.Set(m)
+	a.savePrefs()
+}
+
+// EffectiveSendMode resolves the submit mode for a harness kind using the user's Settings default.
+func (a *App) EffectiveSendMode(kind string) chatSubmitMode {
+	if defaultSubmitMode(kind) == chatNormal {
+		return chatNormal
+	}
+	return a.DefaultSendMode()
+}
+
+// SteerQueuedChat promotes a previously queued message by interrupting the current turn cleanly.
+func (a *App) SteerQueuedChat(key TermKey, onDone func(error)) {
+	c := a.pool.ClientFor(key.InstanceID)
+	if key.InstanceID == "" {
+		c = a.clientForKey(key)
+	}
+	if c == nil {
+		if onDone != nil {
+			onDone(nil)
+		}
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		err := c.steerQueuedChat(ctx, key.Addr)
+		if err != nil {
+			a.notifyToast("插队失败：" + explain(err))
+		} else {
+			a.notifyToast("已插队优先处理")
+		}
+		if onDone != nil {
+			onDone(err)
+		}
+	}()
 }
 
 func loadSnippets(cx *core.Scope) []Snippet {

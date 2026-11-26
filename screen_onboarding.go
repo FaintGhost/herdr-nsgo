@@ -93,7 +93,6 @@ func (u *uiController) onboardingScreen(cx *core.Scope) core.Node {
 					u.subPage.Set("settings")
 				}),
 			}),
-			ToastBanner(cx, a),
 			core.Scroll{
 				EdgeEffects: core.EdgeEffects{Top: core.EdgeEffectSoft, Bottom: core.EdgeEffectSoft},
 				Style:       core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0)},

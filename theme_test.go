@@ -17,13 +17,23 @@ func colorHex(c core.Color) string {
 }
 
 func TestPaletteWCAGContrast(t *testing.T) {
-	palettes := []struct {
+	type palCase struct {
 		name string
 		p    Palette
 		vt   VTPalette
-	}{
-		{"light", LightPalette(), LightVTPalette()},
-		{"dark", DarkPalette(), DarkVTPalette()},
+	}
+	var palettes []palCase
+	for _, preset := range AllThemePresets() {
+		palettes = append(palettes,
+			palCase{string(preset) + "-light", PaletteFor(preset, false), LightVTPalette()},
+			palCase{string(preset) + "-dark", PaletteFor(preset, true), DarkVTPalette()},
+		)
+	}
+	for _, scheme := range AllVTColorSchemes() {
+		if scheme == VTSchemeGraphite {
+			continue
+		}
+		palettes = append(palettes, palCase{"vt-" + string(scheme), DarkPalette(), VTPaletteFor(DarkPalette(), VTAlwaysDark, scheme)})
 	}
 	for _, tc := range palettes {
 		t.Run(tc.name, func(t *testing.T) {
@@ -103,6 +113,17 @@ func TestThemePaletteColorsMatchSpec(t *testing.T) {
 	}
 	if at.Dark.AccentHover == at.Dark.Accent || at.Dark.AccentPressed == at.Dark.Accent {
 		t.Errorf("AppTheme Dark AccentHover/AccentPressed must differentiate from Accent")
+	}
+	for _, role := range []string{"track", "knob", "accentFill", "inset", "raised", "code", "line", "field", "fieldBorder"} {
+		if at.Light.Colors[role] == 0 {
+			t.Errorf("AppTheme Light.Colors[%q] must be populated for ui.Switch / ui.TextView", role)
+		}
+		if at.Dark.Colors[role] == 0 {
+			t.Errorf("AppTheme Dark.Colors[%q] must be populated for ui.Switch / ui.TextView", role)
+		}
+	}
+	if at.Light.Colors["track"] == at.Light.Colors["accentFill"] || at.Dark.Colors["track"] == at.Dark.Colors["accentFill"] {
+		t.Errorf("AppTheme switch track and accentFill must contrast clearly")
 	}
 }
 

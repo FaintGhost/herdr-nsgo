@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -15,6 +16,12 @@ import (
 )
 
 func main() { nsgo.Run(Root) }
+
+const (
+	maxWarmChatControllers = 6
+	maxPrefetchedSessions  = 8
+	prefetchTTL            = 60 * time.Second
+)
 
 // uiController owns reactive navigation, modal state, and the active SessionTerminal / ChatSessionController lifecycle.
 type uiController struct {
@@ -31,6 +38,16 @@ type uiController struct {
 	showQRModal     *core.Signal[bool]
 	editingHost     *core.Signal[Host]
 	attachGen       atomic.Uint64
+
+	// Warm in-memory ChatSessionController LRU for 0ms parent<->child & recent session switching.
+	warmChats      map[TermKey]*ChatSessionController
+	warmOrder      []TermKey
+	pendingAttach  func() // deferred VT attach triggered early if user switches to VT mode
+
+	// Off-UI-thread prefetched transcripts for child sub-sessions / parent session.
+	prefetchMu    sync.Mutex
+	warmPrefetch  map[TermKey]prefetchedTranscript
+	prefetchInFly map[TermKey]bool
 }
 
 // Root is the NSGo entry point.
@@ -59,6 +76,9 @@ func rootWithController(cx *core.Scope, app *App) (core.Node, *uiController) {
 		showAddInstance: core.NewSignal(cx, false),
 		showQRModal:     core.NewSignal(cx, false),
 		editingHost:     core.NewSignal(cx, Host{UseLocalKey: true}),
+		warmChats:       make(map[TermKey]*ChatSessionController),
+		warmPrefetch:    make(map[TermKey]prefetchedTranscript),
+		prefetchInFly:   make(map[TermKey]bool),
 	}
 
 	app.OnPoolSync(func() {
@@ -79,22 +99,67 @@ func rootWithController(cx *core.Scope, app *App) (core.Node, *uiController) {
 	})
 
 	if cx != nil {
-		// Release active VT attach stream on app exit.
+		// Release active VT attach stream and warm chat controllers on app exit.
 		cx.Cleanup(func() {
 			u.closeSession()
+			u.closeAllWarmChats()
 		})
 
 		// Foreground wakeup & network change fast reconnect (<500ms wakeup target).
-		var lastLifecycle core.Lifecycle = core.LifecycleActive
+		// Ignore brief focus drops (e.g. pulling down the notification shade) when all SSH instances are already online.
+		lastLifecycle := core.LifecycleActive
+		wasBackground := false
+		var inactiveSince time.Time
 		cx.Effect(func() {
 			lc := cx.Env().Lifecycle()
-			if lc == core.LifecycleActive && lastLifecycle != core.LifecycleActive {
-				app.Reconnect()
+			switch lc {
+			case core.LifecycleBackground:
+				wasBackground = true
+				if inactiveSince.IsZero() {
+					inactiveSince = time.Now()
+				}
+			case core.LifecycleInactive:
+				if inactiveSince.IsZero() {
+					inactiveSince = time.Now()
+				}
+			case core.LifecycleActive:
+				if lastLifecycle != core.LifecycleActive {
+					away := time.Duration(0)
+					if !inactiveSince.IsZero() {
+						away = time.Since(inactiveSince)
+					}
+					bg := wasBackground
+					wasBackground = false
+					inactiveSince = time.Time{}
+					app.RefreshNotificationPermission()
+					didSync := app.OnForegroundResume(bg, away)
+					if chat := u.activeChat.Get(); chat != nil {
+						if didSync {
+							chat.ManualRefreshAsync()
+						} else {
+							chat.RefreshAsync()
+						}
+					}
+				}
 			}
 			lastLifecycle = lc
 		})
-		cx.OnNetworkChange(func(core.Network) {
-			app.Reconnect()
+		var lastNet core.Network
+		var netSeen bool
+		cx.OnNetworkChange(func(n core.Network) {
+			if !netSeen {
+				netSeen = true
+				lastNet = n
+				if app.HasOfflineEnabledInstance() {
+					app.BeginResumeSync()
+				}
+				return
+			}
+			if n == lastNet && !app.HasOfflineEnabledInstance() {
+				return
+			}
+			lastNet = n
+			app.BeginResumeSync()
 		})
 
 		// Native Android hardware/gesture back press handling.
@@ -111,7 +176,7 @@ func rootWithController(cx *core.Scope, app *App) (core.Node, *uiController) {
 				u.showQRModal.Set(false)
 				return true
 			}
-			if u.subPage.Get() == "tokens" {
+			if sp := u.subPage.Get(); sp == "tokens" || sp == "settings-theme" || sp == "settings-fonts" {
 				u.subPage.Set("settings")
 				return true
 			}
@@ -187,71 +252,78 @@ func rootWithController(cx *core.Scope, app *App) (core.Node, *uiController) {
 			}
 		},
 		Children: []core.Node{
-			// Main page layer: Settings / Tokens -> Onboarding (if 0 instances) -> Wide Split Pane or Compact Phone Shell
+			// Main page layer: Settings / Theme / Fonts / Tokens -> Onboarding (if 0 instances) -> Wide Split Pane or Compact Phone Shell
 			core.Show{
-				When: func() bool { return u.subPage.Get() == "tokens" },
-				Then: func(cx *core.Scope) core.Node { return u.tokensGalleryScreen(cx) },
+				When: func() bool { return u.subPage.Get() != "" },
+				Then: func(cx *core.Scope) core.Node {
+					return core.Dynamic(func(cx *core.Scope) core.Node {
+						switch u.subPage.Get() {
+						case "tokens":
+							return u.tokensGalleryScreen(cx)
+						case "settings-theme":
+							return u.settingsThemeScreen(cx)
+						case "settings-fonts":
+							return u.settingsFontsScreen(cx)
+						default:
+							return u.settingsScreen(cx)
+						}
+					})
+				},
 				Else: func(cx *core.Scope) core.Node {
 					return core.Show{
-						When: func() bool { return u.subPage.Get() == "settings" },
-						Then: func(cx *core.Scope) core.Node { return u.settingsScreen(cx) },
+						When: func() bool { return !hasAnyInstance() },
+						Then: func(cx *core.Scope) core.Node { return u.onboardingScreen(cx) },
 						Else: func(cx *core.Scope) core.Node {
 							return core.Show{
-								When: func() bool { return !hasAnyInstance() },
-								Then: func(cx *core.Scope) core.Node { return u.onboardingScreen(cx) },
-								Else: func(cx *core.Scope) core.Node {
-									return core.Show{
-										When: isWide,
-										Then: func(cx *core.Scope) core.Node {
-											// Wide >=680px 3-pane layout (56px WideNavRail + 280px Sidebar + Right Live Session Pane)
-											return core.View{
-												TestID: "split-pane-layout",
-												Style:  core.Style{Direction: core.Row, FlexGrow: 1, Width: core.Pct(100), Height: core.Pct(100)},
+								When: isWide,
+								Then: func(cx *core.Scope) core.Node {
+									// Wide >=680px 3-pane layout (56px WideNavRail + 280px Sidebar + Right Live Session Pane)
+									return core.View{
+										TestID: "split-pane-layout",
+										Style:  core.Style{Direction: core.Row, FlexGrow: 1, Width: core.Pct(100), Height: core.Pct(100)},
+										Children: []core.Node{
+											WideNavRail(cx, app, u.activeTab, func() {
+												u.subPage.Set("settings")
+											}),
+											core.View{
+												StyleFunc: func() core.Style {
+													pal := app.paletteOf(cx)
+													return core.Style{
+														Width:       core.Pt(Tokens.SidebarWidth),
+														Height:      core.Pct(100),
+														Borders:     core.Edges{Right: 1},
+														BorderColor: pal.Separator,
+														Overflow:    core.Hidden,
+													}
+												},
+												Children: []core.Node{tabContent(cx, true)},
+											},
+											core.View{
+												Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinWidth: core.Pt(0), Height: core.Pct(100)},
 												Children: []core.Node{
-													WideNavRail(cx, app, u.activeTab, func() {
-														u.subPage.Set("settings")
-													}),
-													core.View{
-														StyleFunc: func() core.Style {
-															pal := app.paletteOf(cx)
-															return core.Style{
-																Width:       core.Pt(Tokens.SidebarWidth),
-																Height:      core.Pct(100),
-																Borders:     core.Edges{Right: 1},
-																BorderColor: pal.Separator,
-																Overflow:    core.Hidden,
-															}
-														},
-														Children: []core.Node{tabContent(cx, true)},
-													},
-													core.View{
-														Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinWidth: core.Pt(0), Height: core.Pct(100)},
-														Children: []core.Node{
-															core.Show{
-																When: func() bool { return u.activeSession.Get() != (TermKey{}) },
-																Then: func(cx *core.Scope) core.Node { return u.sessionScreen(cx, false) },
-																Else: func(cx *core.Scope) core.Node {
-																	return core.View{
-																		Style: core.Style{FlexGrow: 1, AlignItems: core.AlignCenter, JustifyContent: core.JustifyCenter, Padding: core.All(Tokens.Space6)},
-																		Children: []core.Node{
-																			EmptyStateCard(cx, app, "选择一个会话开始查看", "点击左侧任意会话即可在此实时查看对话流与完整 VT 终端。", "", "", nil),
-																		},
-																	}
+													core.Show{
+														When: func() bool { return u.activeSession.Get() != (TermKey{}) },
+														Then: func(cx *core.Scope) core.Node { return u.sessionScreen(cx, false) },
+														Else: func(cx *core.Scope) core.Node {
+															return core.View{
+																Style: core.Style{FlexGrow: 1, AlignItems: core.AlignCenter, JustifyContent: core.JustifyCenter, Padding: core.All(Tokens.Space6)},
+																Children: []core.Node{
+																	EmptyStateCard(cx, app, "选择一个会话开始查看", "点击左侧任意会话即可在此实时查看对话流与完整 VT 终端。", "", "", nil),
 																},
-															},
+															}
 														},
 													},
 												},
-											}
+											},
 										},
-										Else: func(cx *core.Scope) core.Node {
-											// Compact phone layout: Session pushes full-screen over floating 3-Tab shell
-											return core.Show{
-												When: func() bool { return u.activeSession.Get() != (TermKey{}) },
-												Then: func(cx *core.Scope) core.Node { return u.sessionScreen(cx, true) },
-												Else: phoneTabShell,
-											}
-										},
+									}
+								},
+								Else: func(cx *core.Scope) core.Node {
+									// Compact phone layout: Session pushes full-screen over floating 3-Tab shell
+									return core.Show{
+										When: func() bool { return u.activeSession.Get() != (TermKey{}) },
+										Then: func(cx *core.Scope) core.Node { return u.sessionScreen(cx, true) },
+										Else: phoneTabShell,
 									}
 								},
 							}
@@ -272,6 +344,8 @@ func rootWithController(cx *core.Scope, app *App) (core.Node, *uiController) {
 				When: u.showQRModal.Get,
 				Then: func(cx *core.Scope) core.Node { return u.qrPairingModal(cx) },
 			},
+			// Root-level floating toast overlay (zero layout shift across all screens & sheets)
+			FloatingToastOverlay(cx, app),
 		},
 	}, u
 }
@@ -289,6 +363,13 @@ func (u *uiController) setSessionMode(mode string) {
 		u.sessionModes[cur] = mode
 	}
 	u.sessionMode.Set(mode)
+	if mode == "vt" {
+		if fn := u.pendingAttach; fn != nil {
+			u.pendingAttach = nil
+			fn()
+		}
+		return
+	}
 	if mode == "chat" {
 		if chat := u.activeChat.Get(); chat != nil && chat.Source() == SourceLoading {
 			chat.RefreshAsync()
@@ -296,14 +377,202 @@ func (u *uiController) setSessionMode(mode string) {
 	}
 }
 
-// openSession attaches to key (in observe mode by default), pre-seeding from LRU FrameCache & SnapshotStore,
-// and initializes the root-scoped ChatSessionController.
+func (u *uiController) parkWarmChat(key TermKey, chat *ChatSessionController) {
+	if key == (TermKey{}) || chat == nil || chat.isClosed() {
+		return
+	}
+	chat.PauseLoop()
+	if u.warmChats == nil {
+		u.warmChats = make(map[TermKey]*ChatSessionController)
+	}
+	if existing, ok := u.warmChats[key]; ok && existing != chat {
+		existing.Close()
+	}
+	u.warmChats[key] = chat
+	kept := u.warmOrder[:0]
+	for _, k := range u.warmOrder {
+		if k != key {
+			kept = append(kept, k)
+		}
+	}
+	kept = append(kept, key)
+	if len(kept) > maxWarmChatControllers {
+		evict := kept[0]
+		kept = append([]TermKey(nil), kept[1:]...)
+		if old, ok := u.warmChats[evict]; ok {
+			delete(u.warmChats, evict)
+			old.Close()
+		}
+	}
+	u.warmOrder = kept
+}
+
+func (u *uiController) takeWarmChat(key TermKey) *ChatSessionController {
+	chat, ok := u.warmChats[key]
+	if !ok || chat == nil || chat.isClosed() {
+		delete(u.warmChats, key)
+		return nil
+	}
+	delete(u.warmChats, key)
+	kept := u.warmOrder[:0]
+	for _, k := range u.warmOrder {
+		if k != key {
+			kept = append(kept, k)
+		}
+	}
+	u.warmOrder = kept
+	return chat
+}
+
+func (u *uiController) closeAllWarmChats() {
+	for k, c := range u.warmChats {
+		if c != nil {
+			c.Close()
+		}
+		delete(u.warmChats, k)
+	}
+	u.warmOrder = nil
+}
+
+func (u *uiController) takePrefetched(key TermKey) (prefetchedTranscript, bool) {
+	u.prefetchMu.Lock()
+	defer u.prefetchMu.Unlock()
+	p, ok := u.warmPrefetch[key]
+	if !ok {
+		return prefetchedTranscript{}, false
+	}
+	delete(u.warmPrefetch, key)
+	if time.Since(p.FetchedAt) > prefetchTTL {
+		return prefetchedTranscript{}, false
+	}
+	return p, true
+}
+
+// prefetchRelatedSessions warms child sub-sessions (and parent) off the UI thread after a brief delay
+// so the active session gets first crack at the SSH mux while sibling/child switches become 0ms.
+func (u *uiController) prefetchRelatedSessions(activeKey TermKey) {
+	if u.app == nil || u.app.TranscriptBackend() == nil {
+		return
+	}
+	cur, ok := u.app.FindTerminal(activeKey)
+	if !ok {
+		return
+	}
+	var targets []AggregatedTerminal
+	seen := map[TermKey]bool{activeKey: true}
+	all := u.app.aggTerms.GetUntracked()
+
+	// 1. Direct child sub-sessions of activeKey (highest priority).
+	for _, it := range all {
+		if it.Key.InstanceID != activeKey.InstanceID || seen[it.Key] {
+			continue
+		}
+		if it.Terminal.Parent != nil && strings.TrimSpace(*it.Terminal.Parent) == activeKey.Addr && IsAgentTerminal(it.Terminal) {
+			seen[it.Key] = true
+			targets = append(targets, it)
+		}
+	}
+	// 2. Parent session if activeKey is itself a child sub-session.
+	if cur.Terminal.Parent != nil {
+		if pAddr := strings.TrimSpace(*cur.Terminal.Parent); pAddr != "" {
+			pk := TermKey{InstanceID: activeKey.InstanceID, Addr: pAddr}
+			if !seen[pk] {
+				if pt, ok := u.app.FindTerminal(pk); ok && IsAgentTerminal(pt.Terminal) {
+					seen[pk] = true
+					targets = append(targets, pt)
+				}
+			}
+		}
+	}
+	if len(targets) == 0 {
+		return
+	}
+	if len(targets) > 3 {
+		targets = targets[:3]
+	}
+
+	// Skip targets that are already warm in memory or freshly prefetched.
+	var toFetch []AggregatedTerminal
+	u.prefetchMu.Lock()
+	for _, t := range targets {
+		if _, isWarm := u.warmChats[t.Key]; isWarm {
+			continue
+		}
+		if p, ok := u.warmPrefetch[t.Key]; ok && time.Since(p.FetchedAt) < prefetchTTL {
+			continue
+		}
+		if u.prefetchInFly[t.Key] {
+			continue
+		}
+		u.prefetchInFly[t.Key] = true
+		toFetch = append(toFetch, t)
+	}
+	u.prefetchMu.Unlock()
+	if len(toFetch) == 0 {
+		return
+	}
+
+	backend := u.app.TranscriptBackend()
+	resolver := u.app.transcriptResolver
+	snapshots := u.app.snapshots
+	gen := u.attachGen.Load()
+
+	time.AfterFunc(220*time.Millisecond, func() {
+		defer func() {
+			u.prefetchMu.Lock()
+			for _, t := range toFetch {
+				delete(u.prefetchInFly, t.Key)
+			}
+			u.prefetchMu.Unlock()
+		}()
+		if u.attachGen.Load() != gen {
+			return
+		}
+		var wg sync.WaitGroup
+		for _, target := range toFetch {
+			wg.Add(1)
+			go func(at AggregatedTerminal) {
+				defer wg.Done()
+				ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+				defer cancel()
+				if pref, ok := PrefetchTranscript(ctx, at.Key, at.Terminal, backend, resolver, snapshots); ok {
+					u.prefetchMu.Lock()
+					if len(u.warmPrefetch) >= maxPrefetchedSessions {
+						var oldestKey TermKey
+						var oldestAt time.Time
+						for k, v := range u.warmPrefetch {
+							if oldestKey == (TermKey{}) || v.FetchedAt.Before(oldestAt) {
+								oldestKey = k
+								oldestAt = v.FetchedAt
+							}
+						}
+						delete(u.warmPrefetch, oldestKey)
+					}
+					u.warmPrefetch[at.Key] = pref
+					u.prefetchMu.Unlock()
+				}
+			}(target)
+		}
+		wg.Wait()
+	})
+}
+
+// openSession attaches to key (in observe mode by default), reusing warm controllers / prefetched sub-sessions
+// for 0ms parent<->child switching and deferring VT attach in Chat mode so Chat first paint gets full bandwidth.
 // Always binds SessionTerminal and ChatSessionController signals to the root app scope (u.app.cx),
 // never an ephemeral row/button child scope that gets disposed on navigation.
 func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 	prevKey := u.activeSession.Get()
+	u.pendingAttach = nil
 	if prevChat := u.activeChat.Get(); prevChat != nil {
-		prevChat.Close()
+		if prevKey != (TermKey{}) && prevKey != key {
+			u.parkWarmChat(prevKey, prevChat)
+		} else if prevKey == key {
+			// Re-opening same key: keep warm temporarily so we reuse below.
+			u.parkWarmChat(prevKey, prevChat)
+		} else {
+			prevChat.Close()
+		}
 		u.activeChat.Set(nil)
 	}
 	if prev := u.activeTerm.Get(); prev != nil {
@@ -316,6 +585,7 @@ func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 		}
 	}
 	u.activeSession.Set(key)
+	u.app.SetActiveSession(key)
 
 	// Determine initial mode: remembered per-session choice -> Agent="chat" / Shell="vt".
 	mode, remembered := u.sessionModes[key]
@@ -344,21 +614,31 @@ func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 	observe := u.app.observeDefault.Get()
 	st := NewSessionTerminal(rootCX, key, 100, 32, observe, cache, enableGhostty)
 
-	chatCtrl := NewChatSessionController(
-		rootCX,
-		key,
-		u.app.TranscriptBackend(),
-		u.app.transcriptResolver,
-		func() string { return st.Screen().PlainText() },
-	)
-	if u.app.frameCacheOn.Get() && u.app.snapshots != nil {
-		var live *Terminal
-		if u.app.pool.ClientFor(key.InstanceID) != nil {
-			if at, ok := u.app.FindTerminal(key); ok {
-				live = &at.Terminal
-			}
+	chatCtrl := u.takeWarmChat(key)
+	reusedWarm := chatCtrl != nil
+	if reusedWarm {
+		chatCtrl.SetVTFallback(func() string { return st.Screen().PlainText() })
+	} else {
+		chatCtrl = NewChatSessionController(
+			rootCX,
+			key,
+			u.app.TranscriptBackend(),
+			u.app.transcriptResolver,
+			func() string { return st.Screen().PlainText() },
+		)
+		hydrated := false
+		if pref, ok := u.takePrefetched(key); ok {
+			hydrated = chatCtrl.HydratePrefetch(pref)
 		}
-		chatCtrl.SeedFromSnapshot(u.app.snapshots, live)
+		if !hydrated && u.app.frameCacheOn.Get() && u.app.snapshots != nil {
+			var live *Terminal
+			if u.app.pool.ClientFor(key.InstanceID) != nil {
+				if at, ok := u.app.FindTerminal(key); ok {
+					live = &at.Terminal
+				}
+			}
+			chatCtrl.SeedFromSnapshot(u.app.snapshots, live)
+		}
 	}
 
 	attachWithMode := func(obs bool, cols, rows int) {
@@ -480,16 +760,48 @@ func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 	st.SetReattach(attachWithMode)
 	u.activeTerm.Set(st)
 	u.activeChat.Set(chatCtrl)
-	chatCtrl.StartLoop()
-	attachWithMode(observe, 100, 32)
+	if reusedWarm {
+		chatCtrl.ResumeLoop()
+	} else {
+		chatCtrl.StartLoop()
+	}
+	if at, ok := u.app.FindTerminal(key); ok {
+		u.app.PrefetchAgentCatalog(key, at.Terminal, nil)
+	}
+	if mode == "chat" {
+		// Defer VT attach briefly in Chat mode so the JSONL first paint gets 100% of SSH channel priority.
+		openGen := u.attachGen.Add(1)
+		var fired atomic.Bool
+		doAttach := func() {
+			if !fired.CompareAndSwap(false, true) {
+				return
+			}
+			if u.attachGen.Load() != openGen {
+				return
+			}
+			attachWithMode(observe, 100, 32)
+		}
+		u.pendingAttach = doAttach
+		time.AfterFunc(320*time.Millisecond, func() {
+			u.app.post(doAttach)
+		})
+	} else {
+		attachWithMode(observe, 100, 32)
+	}
+	u.prefetchRelatedSessions(key)
 }
 
-// closeSession releases the active VT attach stream, stops Chat tailing, and updates the LRU & persistent snapshot caches.
+// closeSession releases the active VT attach stream, parks Chat in the warm LRU, and updates persistent snapshot caches.
 func (u *uiController) closeSession() {
 	u.attachGen.Add(1)
+	u.pendingAttach = nil
 	curKey := u.activeSession.Get()
 	if prevChat := u.activeChat.Get(); prevChat != nil {
-		prevChat.Close()
+		if curKey != (TermKey{}) {
+			u.parkWarmChat(curKey, prevChat)
+		} else {
+			prevChat.Close()
+		}
 		u.activeChat.Set(nil)
 	}
 	if prev := u.activeTerm.Get(); prev != nil {
@@ -502,4 +814,5 @@ func (u *uiController) closeSession() {
 		}
 	}
 	u.activeSession.Set(TermKey{})
+	u.app.SetActiveSession(TermKey{})
 }

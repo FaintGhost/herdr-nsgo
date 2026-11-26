@@ -93,23 +93,19 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 		return qb.String()
 	}
 
-	type submitChoice struct {
-		key  TermKey
-		kind string
-		mode chatSubmitMode
-	}
-	selectedMode := core.NewSignal(cx, submitChoice{})
-	modeFor := func(kind string) chatSubmitMode {
-		choice := selectedMode.Get()
-		if choice.key == curKey() && choice.kind == kind {
-			return choice.mode
+	modeFor := func(kind string, term Terminal) chatSubmitMode {
+		// Wait/Steer queue semantics only apply while the Agent is actively busy ("working").
+		// When the Agent is idle or done, send normally without showing "等待中" / "插队".
+		if term.StateWord() != "working" {
+			return chatNormal
 		}
-		return defaultSubmitMode(kind)
+		return a.EffectiveSendMode(kind)
 	}
 	sendComposerText := func() {
 		k := curKey()
-		kind := DetectHarnessKind(curTerm().Terminal)
-		mode := modeFor(kind)
+		term := curTerm().Terminal
+		kind := DetectHarnessKind(term)
+		mode := modeFor(kind, term)
 		draft := a.Compose(k.String())
 		raw := strings.TrimSpace(draft)
 		if strings.HasPrefix(raw, "/") {
@@ -270,16 +266,42 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 		},
 		Children: []core.Node{
 			core.View{
-				StyleFunc: func() core.Style {
-					return core.Style{
-						FlexShrink:   0,
-						Width:        core.Pt(8),
-						Height:       core.Pt(8),
-						CornerRadius: 4,
-						Background:   stateDotColor(a.paletteOf(cx), curTerm().Terminal.StateWord()),
-					}
+				Style: core.Style{
+					FlexShrink:     0,
+					Width:          core.Pt(12),
+					Height:         core.Pt(12),
+					AlignItems:     core.AlignCenter,
+					JustifyContent: core.JustifyCenter,
+				},
+				Children: []core.Node{
+					core.Show{
+						When: func() bool {
+							ch := curChat()
+							return isChatMode() && ch != nil && ch.IsActivelySyncing()
+						},
+						Then: func(cx *core.Scope) core.Node {
+							return ui.Spinner{
+								TestID: "session-header-sync-spinner",
+								Size:   12,
+								Label:  "同步中",
+							}
+						},
+						Else: func(cx *core.Scope) core.Node {
+							return core.View{
+								StyleFunc: func() core.Style {
+									return core.Style{
+										Width:        core.Pt(8),
+										Height:       core.Pt(8),
+										CornerRadius: 4,
+										Background:   stateDotColor(a.paletteOf(cx), curTerm().Terminal.StateWord()),
+									}
+								},
+							}
+						},
+					},
 				},
 			},
+			HarnessBrandIcon(cx, a, func() Terminal { return curTerm().Terminal }, "", 15),
 			core.Text{
 				ContentFunc: func() string { return curTerm().Terminal.Label() },
 				MaxLines:    1,
@@ -536,6 +558,79 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 		}
 	}
 
+	latestTranscriptModel := func() string {
+		ch := curChat()
+		if ch == nil {
+			return ""
+		}
+		if ch.rev != nil {
+			_ = ch.rev.Get()
+		}
+		items := ch.Items()
+		for i := len(items) - 1; i >= 0; i-- {
+			if m, _ := splitModelAndEffort(items[i].Model); m != "" {
+				return m
+			}
+		}
+		return ""
+	}
+	latestTranscriptEffort := func() string {
+		ch := curChat()
+		if ch == nil {
+			return ""
+		}
+		if ch.rev != nil {
+			_ = ch.rev.Get()
+		}
+		items := ch.Items()
+		for i := len(items) - 1; i >= 0; i-- {
+			if e := strings.TrimSpace(items[i].Effort); e != "" {
+				return e
+			}
+			if _, e := splitModelAndEffort(items[i].Model); e != "" {
+				return e
+			}
+		}
+		return ""
+	}
+	activeModelChipLabel := func() string {
+		if a.catalogRev != nil {
+			_ = a.catalogRev.Get()
+		}
+		k := curKey()
+		if m := a.SessionModel(k); m != "" {
+			return ShortModelLabel(m)
+		}
+		if m := latestTranscriptModel(); m != "" {
+			return ShortModelLabel(m)
+		}
+		kind := DetectHarnessKind(curTerm().Terminal)
+		if cat := a.InstantCatalogFor(k.InstanceID, kind, ""); cat.DefaultModel != "" {
+			return ShortModelLabel(cat.DefaultModel)
+		}
+		return "模型"
+	}
+	activeEffortChipLabel := func() string {
+		if a.catalogRev != nil {
+			_ = a.catalogRev.Get()
+		}
+		k := curKey()
+		if e := a.SessionEffort(k); e != "" {
+			return formatEffortChipLabel(e)
+		}
+		if e := latestTranscriptEffort(); e != "" {
+			return formatEffortChipLabel(e)
+		}
+		kind := DetectHarnessKind(curTerm().Terminal)
+		if cat := a.InstantCatalogFor(k.InstanceID, kind, ""); cat.DefaultEffort != "" {
+			return formatEffortChipLabel(cat.DefaultEffort)
+		}
+		if def := defaultEffortForKind(kind); def != "" {
+			return formatEffortChipLabel(def)
+		}
+		return "思考强度"
+	}
+
 	return core.View{
 		TestID: "screen-session",
 		StyleFunc: func() core.Style {
@@ -575,7 +670,7 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 					},
 				},
 			},
-			ToastBanner(cx, a),
+			SyncStatusBanner(cx, a),
 			// Collapsible in-session search bar (mode-aware)
 			core.Show{
 				When: showSearch.Get,
@@ -690,16 +785,11 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 			core.View{
 				Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0), Position: core.Relative, Overflow: core.Hidden},
 				Children: []core.Node{
-					// Layer 1: Chat View (always mounted & laid out while session is open)
+					// Layer 1: Chat View (uses DisplayNone when in VT mode so Android View.GONE never blocks VT touches)
 					core.View{
 						StyleFunc: func() core.Style {
-							vis := core.VisibilityVisible
-							pe := core.PointerEventsAuto
-							z := 2
 							if !isChatMode() {
-								vis = core.VisibilityHidden
-								pe = core.PointerEventsNone
-								z = 0
+								return core.Style{Display: core.DisplayNone}
 							}
 							return core.Style{
 								Position:      core.Absolute,
@@ -707,9 +797,8 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 								Right:         core.Pt(0),
 								Bottom:        core.Pt(0),
 								Left:          core.Pt(0),
-								Visibility:    vis,
-								PointerEvents: pe,
-								ZIndex:        z,
+								PointerEvents: core.PointerEventsAuto,
+								ZIndex:        2,
 							}
 						},
 						Children: []core.Node{
@@ -739,16 +828,11 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 							),
 						},
 					},
-					// Layer 2: Terminal View + dedicated VT sub-bar (always mounted & laid out while session is open)
+					// Layer 2: Terminal View + dedicated VT sub-bar (uses DisplayNone when in Chat mode so Android View.GONE never blocks Chat long-press text selection!)
 					core.View{
 						StyleFunc: func() core.Style {
-							vis := core.VisibilityVisible
-							pe := core.PointerEventsAuto
-							z := 2
 							if isChatMode() {
-								vis = core.VisibilityHidden
-								pe = core.PointerEventsNone
-								z = 0
+								return core.Style{Display: core.DisplayNone}
 							}
 							return core.Style{
 								Position:      core.Absolute,
@@ -756,9 +840,8 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 								Right:         core.Pt(0),
 								Bottom:        core.Pt(0),
 								Left:          core.Pt(0),
-								Visibility:    vis,
-								PointerEvents: pe,
-								ZIndex:        z,
+								PointerEvents: core.PointerEventsAuto,
+								ZIndex:        2,
 							}
 						},
 						Children: []core.Node{
@@ -790,15 +873,14 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 												cols = curTerm().Terminal.Cols
 												rows = curTerm().Terminal.Rows
 											}
-											obs := st == nil || (st.observeSig != nil && st.observeSig.Get()) || (st.observeSig == nil && st.Observe())
-											modeNote := "已适配手机列宽"
-											if obs {
-												modeNote = "观察模式 · 不改桌面列宽"
-											}
+											addr := curKey().Addr
 											if cols > 0 && rows > 0 {
-												return fmt.Sprintf("%d×%d · %s", cols, rows, modeNote)
+												if addr != "" {
+													return fmt.Sprintf("%s · %d×%d", addr, cols, rows)
+												}
+												return fmt.Sprintf("%d×%d", cols, rows)
 											}
-											return modeNote
+											return addr
 										},
 										StyleFunc: func() core.Style {
 											pal := a.paletteOf(cx)
@@ -815,9 +897,9 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 									FilterPill(cx, a, "session-fit-toggle", func() string {
 										st := curST()
 										if st == nil || (st.observeSig != nil && st.observeSig.Get()) || (st.observeSig == nil && st.Observe()) {
-											return "观察中"
+											return "观察"
 										}
-										return "适配列宽"
+										return "已适配"
 									}, func() bool {
 										st := curST()
 										return st != nil && !st.Observe()
@@ -829,9 +911,9 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 										nextObserve := !st.Observe()
 										st.SetObserve(nextObserve, a.vtFontSize.Get())
 										if nextObserve {
-											a.notifyToast("已切换为观察模式（不改动远端桌面尺寸）")
+											a.notifyToast("已切换为观察模式")
 										} else {
-											a.notifyToast("已适配手机列宽（发送 RESIZE）")
+											a.notifyToast("已适配窗口尺寸")
 										}
 									}),
 								},
@@ -849,12 +931,13 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 										},
 										func(st *SessionTerminal) *SessionTerminal { return st },
 										func(cx *core.Scope, item func() *SessionTerminal, _ func() int) core.Node {
-											return RenderSessionTerminalVisible(
+											return RenderSessionTerminalConfigured(
 												cx,
 												item(),
 												func() Palette { return a.paletteOf(cx) },
 												func() VTPalette { return a.vtPaletteOf(cx) },
 												a.vtFontSize.Get,
+												a.MonoFontFamily,
 												func() bool { return !isChatMode() },
 											)
 										},
@@ -1063,7 +1146,29 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 														ui.Icon(lucide.Plus, 16, func() core.Color { return a.paletteOf(cx).Text }),
 													},
 												},
-												core.Show{When: func() bool { return defaultSubmitMode(DetectHarnessKind(curTerm().Terminal)) != chatNormal }, Then: func(cx *core.Scope) core.Node {
+												base.Button{
+													TestID: "composer-voice-btn",
+													Label:  "语音输入",
+													OnPress: func(core.PressEvent) {
+														playSelectionHaptic(cx)
+														showVoice.Set(curKey())
+													},
+													Style: core.Style{
+														Width:          core.Pt(32),
+														Height:         core.Pt(32),
+														FlexShrink:     0,
+														CornerRadius:   16,
+														AlignItems:     core.AlignCenter,
+														JustifyContent: core.JustifyCenter,
+													},
+													StyleFunc: func() core.Style {
+														return core.Style{Background: a.paletteOf(cx).SurfaceRaised}
+													},
+													Children: []core.Node{
+														ui.Icon(lucide.Mic, 15, func() core.Color { return a.paletteOf(cx).TextSecondary }),
+													},
+												},
+												core.Show{When: func() bool { return supportsModelEffortPicker(DetectHarnessKind(curTerm().Terminal)) }, Then: func(cx *core.Scope) core.Node {
 													return core.Scroll{
 														Horizontal:    true,
 														HideIndicator: true,
@@ -1072,16 +1177,8 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 															core.View{
 																Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: core.Points(4)},
 																Children: []core.Node{
-																	chat.Chip{TestID: "chat-model-selector", Text: "模型", Caret: true, OnPress: func() { openAgentSelector(false) }},
-																	chat.Chip{TestID: "chat-effort-selector", Text: "思考强度", Caret: true, OnPress: func() { openAgentSelector(true) }},
-																	chat.Chip{TestID: "chat-mode-toggle", TextFunc: func() string { return "忙时" + string(modeFor(DetectHarnessKind(curTerm().Terminal))) }, OnPress: func() {
-																		kind := DetectHarnessKind(curTerm().Terminal)
-																		next := chatSteer
-																		if modeFor(kind) == next {
-																			next = chatQueue
-																		}
-																		selectedMode.Set(submitChoice{curKey(), kind, next})
-																	}},
+																	chat.Chip{TestID: "chat-model-selector", Text: "模型", TextFunc: activeModelChipLabel, Caret: true, OnPress: func() { openAgentSelector(false) }},
+																	chat.Chip{TestID: "chat-effort-selector", Text: "思考强度", TextFunc: activeEffortChipLabel, Caret: true, OnPress: func() { openAgentSelector(true) }},
 																},
 															},
 														},
@@ -1155,7 +1252,7 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 				},
 			},
 			core.Show{When: func() bool { return selector.Get() != "" && selectorKey == curKey() && isChatMode() }, Then: func(cx *core.Scope) core.Node {
-				return mobileAgentPicker(cx, a, curTerm(), selector.Get() == "思考强度", func() { selector.Set("") })
+				return mobileAgentPicker(cx, a, curTerm(), latestTranscriptModel(), selector.Get() == "思考强度", func() { selector.Set("") })
 			}},
 			// Quiet Studio Quick Session Switcher Sheet (grouped GroupCards: 需要你 -> 运行中 -> 空闲与在线)
 			core.Show{

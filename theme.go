@@ -16,6 +16,46 @@ const (
 	ThemeSystem ThemeMode = "system"
 )
 
+// ThemePreset selects one of the 4 complete Light/Dark workspace palettes.
+type ThemePreset string
+
+const (
+	PresetStudio  ThemePreset = "studio"
+	PresetPaper   ThemePreset = "paper"
+	PresetNordic  ThemePreset = "nordic"
+	PresetEmerald ThemePreset = "emerald"
+)
+
+func AllThemePresets() []ThemePreset {
+	return []ThemePreset{PresetStudio, PresetPaper, PresetNordic, PresetEmerald}
+}
+
+func (p ThemePreset) Label() string {
+	switch p {
+	case PresetPaper:
+		return "Warm Paper"
+	case PresetNordic:
+		return "Nordic Slate"
+	case PresetEmerald:
+		return "Emerald Lab"
+	default:
+		return "Quiet Studio"
+	}
+}
+
+func (p ThemePreset) Desc() string {
+	switch p {
+	case PresetPaper:
+		return "纸墨暖调护眼"
+	case PresetNordic:
+		return "北欧蓝灰冷静"
+	case PresetEmerald:
+		return "翠绿极客工坊"
+	default:
+		return "纯石墨极简"
+	}
+}
+
 // VTThemeMode selects whether the VT terminal canvas follows the app theme or stays dark.
 type VTThemeMode string
 
@@ -23,6 +63,33 @@ const (
 	VTFollowTheme VTThemeMode = "follow"
 	VTAlwaysDark  VTThemeMode = "dark"
 )
+
+// VTColorScheme selects the terminal ANSI & background palette.
+type VTColorScheme string
+
+const (
+	VTSchemeGraphite   VTColorScheme = "graphite"
+	VTSchemeTokyo      VTColorScheme = "tokyo"
+	VTSchemeCatppuccin VTColorScheme = "catppuccin"
+	VTSchemeGruvbox    VTColorScheme = "gruvbox"
+)
+
+func AllVTColorSchemes() []VTColorScheme {
+	return []VTColorScheme{VTSchemeGraphite, VTSchemeTokyo, VTSchemeCatppuccin, VTSchemeGruvbox}
+}
+
+func (s VTColorScheme) Label() string {
+	switch s {
+	case VTSchemeTokyo:
+		return "Tokyo Night"
+	case VTSchemeCatppuccin:
+		return "Catppuccin"
+	case VTSchemeGruvbox:
+		return "Gruvbox"
+	default:
+		return "Graphite"
+	}
+}
 
 // Palette holds every semantic color role from the Quiet Studio design system.
 // No UI file may construct raw core.RGB/core.RGBA colors directly; all colors come from here.
@@ -228,27 +295,38 @@ func DarkVTPalette() VTPalette {
 	}
 }
 
-// GhosttyTerminalThemes converts our Light & Dark VT palettes into base/terminal.Theme values.
-func GhosttyTerminalThemes() (light, dark *terminal.Theme) {
-	toTermTheme := func(v VTPalette) *terminal.Theme {
-		th := &terminal.Theme{
-			Background: v.Bg,
-			Foreground: v.Fg,
-			Cursor:     v.Cursor,
-			CursorText: v.Bg,
-			Selection:  core.RGBA(uint32(v.Accent)>>8, 0.22),
-		}
-		th.Palette = v.ANSI
-		return th
+// GhosttyThemeFor converts any VTPalette into a base/terminal.Theme (keeping color math in theme.go).
+func GhosttyThemeFor(v VTPalette) *terminal.Theme {
+	th := &terminal.Theme{
+		Background: v.Bg,
+		Foreground: v.Fg,
+		Cursor:     v.Cursor,
+		CursorText: v.Bg,
+		Selection:  core.RGBA(uint32(v.Accent)>>8, 0.22),
 	}
-	return toTermTheme(LightVTPalette()), toTermTheme(DarkVTPalette())
+	th.Palette = v.ANSI
+	return th
 }
 
-// AppTheme builds the NSGo core.Theme matching our settled Quiet Studio tokens so built-in ui controls stay consistent.
+// GhosttyTerminalThemes converts our Light & Dark VT palettes into base/terminal.Theme values.
+func GhosttyTerminalThemes() (light, dark *terminal.Theme) {
+	return GhosttyThemeFor(LightVTPalette()), GhosttyThemeFor(DarkVTPalette())
+}
+
+// AppTheme builds the NSGo core.Theme matching our default Quiet Studio tokens.
 func AppTheme() *core.Theme {
-	lp, dp := LightPalette(), DarkPalette()
+	return AppThemeFor(PresetStudio)
+}
+
+// AppThemeFor builds the NSGo core.Theme matching preset's Light & Dark palettes.
+// Crucially, it preserves and updates core.DefaultTheme().Light.Colors / Dark.Colors so ui.Switch (track/knob/accentFill),
+// ui.TextView (inset/code/line/raised), and ui.Diff render with crisp high-contrast tokens on every platform.
+func AppThemeFor(preset ThemePreset) *core.Theme {
+	lp, dp := PaletteFor(preset, false), PaletteFor(preset, true)
 	t := core.DefaultTheme().Clone()
 	t.Radius = Tokens.RadiusCtrl
+
+	lightRoles := t.Light.Colors
 	t.Light = core.Palette{
 		Background:     lp.Bg,
 		Surface:        lp.Surface,
@@ -267,7 +345,28 @@ func AppTheme() *core.Theme {
 		Selection:      lp.AccentSoft,
 		Focus:          lp.Accent,
 		Scrollbar:      lp.Fill,
+		Colors:         lightRoles,
 	}
+	for name, c := range map[string]core.Color{
+		"inset":       lp.SurfaceRaised,
+		"raised":      lp.Surface,
+		"field":       lp.Surface,
+		"fieldBorder": lp.Border,
+		"line":        lp.Separator,
+		"faint":       lp.TextMuted,
+		"accentFill":  lp.Running, // Emerald/Semantic ON track gives crisp contrast with white knob
+		"light":       lp.Accent,
+		"onLight":     lp.AccentFg,
+		"track":       lp.Fill,
+		"knob":        lp.Surface,
+		"code":        lp.Text,
+		"info":        LightVTPalette().Blue,
+		"down":        lp.Danger,
+	} {
+		t.Light.SetColor(name, c)
+	}
+
+	darkRoles := t.Dark.Colors
 	t.Dark = core.Palette{
 		Background:     dp.Bg,
 		Surface:        dp.Surface,
@@ -286,31 +385,293 @@ func AppTheme() *core.Theme {
 		Selection:      dp.AccentSoft,
 		Focus:          dp.Accent,
 		Scrollbar:      dp.Fill,
+		Colors:         darkRoles,
+	}
+	for name, c := range map[string]core.Color{
+		"inset":       dp.SurfaceRaised,
+		"raised":      dp.SurfaceRaised,
+		"field":       dp.Surface,
+		"fieldBorder": dp.Border,
+		"line":        dp.Separator,
+		"faint":       dp.TextMuted,
+		"accentFill":  dp.Running, // High-contrast ON track distinct from dark track & light knob
+		"light":       dp.Accent,
+		"onLight":     dp.AccentFg,
+		"track":       dp.Fill,
+		"knob":        dp.Text,
+		"code":        dp.Text,
+		"info":        DarkVTPalette().Blue,
+		"down":        dp.Danger,
+	} {
+		t.Dark.SetColor(name, c)
 	}
 	return t
 }
 
-// ThemeOf resolves the active Palette for the requested ThemeMode.
-func ThemeOf(cx *core.Scope, mode ThemeMode) Palette {
-	switch mode {
-	case ThemeDark:
-		return DarkPalette()
-	case ThemeLight:
-		return LightPalette()
+// PaletteFor returns the WCAG-AA verified Light or Dark palette for a ThemePreset.
+func PaletteFor(preset ThemePreset, dark bool) Palette {
+	switch preset {
+	case PresetPaper:
+		if dark {
+			return Palette{
+				Dark:          true,
+				Bg:            core.RGB(0x141210),
+				Surface:       core.RGB(0x1e1b18),
+				SurfaceRaised: core.RGB(0x2a2520),
+				Fill:          core.RGB(0x3a332c),
+				Separator:     core.RGBA(0xf4efe6, 0.085),
+				Border:        core.RGBA(0xf4efe6, 0.105),
+				Text:          core.RGB(0xf4efe6),
+				TextSecondary: core.RGB(0xb8afa3),
+				TextMuted:     core.RGB(0x9a9083),
+				Accent:        core.RGB(0xe2a678),
+				AccentHover:   core.RGB(0xeab58c),
+				AccentPressed: core.RGB(0xd19263),
+				AccentFg:      core.RGB(0x1a1410),
+				AccentSoft:    core.RGBA(0xe2a678, 0.14),
+				Running:       core.RGB(0x4ade80),
+				RunningSoft:   core.RGBA(0x4ade80, 0.14),
+				Warn:          core.RGB(0xfbbf24),
+				WarnSoft:      core.RGBA(0xfbbf24, 0.14),
+				Danger:        core.RGB(0xf87171),
+				DangerSoft:    core.RGBA(0xf87171, 0.14),
+				GlassSurface:  core.RGBA(0x1e1b18, 0.88),
+				GlassBorder:   core.RGBA(0xf4efe6, 0.12),
+				Overlay:       core.RGBA(0x000000, 0.58),
+			}
+		}
+		return Palette{
+			Dark:          false,
+			Bg:            core.RGB(0xf7f4ee),
+			Surface:       core.RGB(0xfffdf9),
+			SurfaceRaised: core.RGB(0xece6da),
+			Fill:          core.RGB(0xdfd7c8),
+			Separator:     core.RGBA(0x231f1b, 0.08),
+			Border:        core.RGBA(0x231f1b, 0.095),
+			Text:          core.RGB(0x231f1b),
+			TextSecondary: core.RGB(0x544b41),
+			TextMuted:     core.RGB(0x6a6054),
+			Accent:        core.RGB(0x7c4a2d),
+			AccentHover:   core.RGB(0x8e5635),
+			AccentPressed: core.RGB(0x663c24),
+			AccentFg:      core.RGB(0xffffff),
+			AccentSoft:    core.RGBA(0x7c4a2d, 0.10),
+			Running:       core.RGB(0x146c43),
+			RunningSoft:   core.RGBA(0x146c43, 0.11),
+			Warn:          core.RGB(0x9a4500),
+			WarnSoft:      core.RGBA(0x9a4500, 0.10),
+			Danger:        core.RGB(0xb91c1c),
+			DangerSoft:    core.RGBA(0xb91c1c, 0.10),
+			GlassSurface:  core.RGBA(0xfffdf9, 0.86),
+			GlassBorder:   core.RGBA(0x231f1b, 0.095),
+			Overlay:       core.RGBA(0x231f1b, 0.34),
+		}
+
+	case PresetNordic:
+		if dark {
+			return Palette{
+				Dark:          true,
+				Bg:            core.RGB(0x0b1120),
+				Surface:       core.RGB(0x131c31),
+				SurfaceRaised: core.RGB(0x1e293b),
+				Fill:          core.RGB(0x334155),
+				Separator:     core.RGBA(0xf1f5f9, 0.085),
+				Border:        core.RGBA(0xf1f5f9, 0.105),
+				Text:          core.RGB(0xf1f5f9),
+				TextSecondary: core.RGB(0x94a3b8),
+				TextMuted:     core.RGB(0x8496b0),
+				Accent:        core.RGB(0x60a5fa),
+				AccentHover:   core.RGB(0x93c5fd),
+				AccentPressed: core.RGB(0x3b82f6),
+				AccentFg:      core.RGB(0x0b1120),
+				AccentSoft:    core.RGBA(0x60a5fa, 0.15),
+				Running:       core.RGB(0x34d399),
+				RunningSoft:   core.RGBA(0x34d399, 0.14),
+				Warn:          core.RGB(0xfbbf24),
+				WarnSoft:      core.RGBA(0xfbbf24, 0.14),
+				Danger:        core.RGB(0xf87171),
+				DangerSoft:    core.RGBA(0xf87171, 0.14),
+				GlassSurface:  core.RGBA(0x131c31, 0.88),
+				GlassBorder:   core.RGBA(0xf1f5f9, 0.12),
+				Overlay:       core.RGBA(0x000000, 0.58),
+			}
+		}
+		return Palette{
+			Dark:          false,
+			Bg:            core.RGB(0xeef3f8),
+			Surface:       core.RGB(0xffffff),
+			SurfaceRaised: core.RGB(0xe2e8f0),
+			Fill:          core.RGB(0xcbd5e1),
+			Separator:     core.RGBA(0x0f172a, 0.075),
+			Border:        core.RGBA(0x0f172a, 0.09),
+			Text:          core.RGB(0x0f172a),
+			TextSecondary: core.RGB(0x475569),
+			TextMuted:     core.RGB(0x5b6b80),
+			Accent:        core.RGB(0x1d4ed8),
+			AccentHover:   core.RGB(0x2563eb),
+			AccentPressed: core.RGB(0x1e40af),
+			AccentFg:      core.RGB(0xffffff),
+			AccentSoft:    core.RGBA(0x1d4ed8, 0.10),
+			Running:       core.RGB(0x0d7a5f),
+			RunningSoft:   core.RGBA(0x0d7a5f, 0.11),
+			Warn:          core.RGB(0xa64b00),
+			WarnSoft:      core.RGBA(0xa64b00, 0.10),
+			Danger:        core.RGB(0xc81e1e),
+			DangerSoft:    core.RGBA(0xc81e1e, 0.10),
+			GlassSurface:  core.RGBA(0xffffff, 0.86),
+			GlassBorder:   core.RGBA(0x0f172a, 0.09),
+			Overlay:       core.RGBA(0x0f172a, 0.34),
+		}
+
+	case PresetEmerald:
+		if dark {
+			return Palette{
+				Dark:          true,
+				Bg:            core.RGB(0x0b1210),
+				Surface:       core.RGB(0x121e1a),
+				SurfaceRaised: core.RGB(0x1b2c26),
+				Fill:          core.RGB(0x283f37),
+				Separator:     core.RGBA(0xecf5f1, 0.085),
+				Border:        core.RGBA(0xecf5f1, 0.105),
+				Text:          core.RGB(0xecf5f1),
+				TextSecondary: core.RGB(0x9cb8ae),
+				TextMuted:     core.RGB(0x82a397),
+				Accent:        core.RGB(0x34d399),
+				AccentHover:   core.RGB(0x6ee7b7),
+				AccentPressed: core.RGB(0x10b981),
+				AccentFg:      core.RGB(0x081410),
+				AccentSoft:    core.RGBA(0x34d399, 0.15),
+				Running:       core.RGB(0x34d399),
+				RunningSoft:   core.RGBA(0x34d399, 0.14),
+				Warn:          core.RGB(0xfbbf24),
+				WarnSoft:      core.RGBA(0xfbbf24, 0.14),
+				Danger:        core.RGB(0xf87171),
+				DangerSoft:    core.RGBA(0xf87171, 0.14),
+				GlassSurface:  core.RGBA(0x121e1a, 0.88),
+				GlassBorder:   core.RGBA(0xecf5f1, 0.12),
+				Overlay:       core.RGBA(0x000000, 0.58),
+			}
+		}
+		return Palette{
+			Dark:          false,
+			Bg:            core.RGB(0xf2f7f5),
+			Surface:       core.RGB(0xffffff),
+			SurfaceRaised: core.RGB(0xe3efea),
+			Fill:          core.RGB(0xcfe2da),
+			Separator:     core.RGBA(0x0e1c17, 0.075),
+			Border:        core.RGBA(0x0e1c17, 0.09),
+			Text:          core.RGB(0x0e1c17),
+			TextSecondary: core.RGB(0x3f574e),
+			TextMuted:     core.RGB(0x556d64),
+			Accent:        core.RGB(0x0d7a5f),
+			AccentHover:   core.RGB(0x0f8f6f),
+			AccentPressed: core.RGB(0x0a624c),
+			AccentFg:      core.RGB(0xffffff),
+			AccentSoft:    core.RGBA(0x0d7a5f, 0.10),
+			Running:       core.RGB(0x0f766e),
+			RunningSoft:   core.RGBA(0x0f766e, 0.11),
+			Warn:          core.RGB(0xa64b00),
+			WarnSoft:      core.RGBA(0xa64b00, 0.10),
+			Danger:        core.RGB(0xc81e1e),
+			DangerSoft:    core.RGBA(0xc81e1e, 0.10),
+			GlassSurface:  core.RGBA(0xffffff, 0.86),
+			GlassBorder:   core.RGBA(0x0e1c17, 0.09),
+			Overlay:       core.RGBA(0x0e1c17, 0.34),
+		}
+
 	default:
-		if cx != nil && cx.Dark() {
+		if dark {
 			return DarkPalette()
 		}
 		return LightPalette()
 	}
 }
 
-// VTPaletteOf resolves the active VT canvas palette given app Palette and VTThemeMode.
-func VTPaletteOf(pal Palette, vtMode VTThemeMode) VTPalette {
-	if vtMode == VTAlwaysDark || pal.Dark {
-		return DarkVTPalette()
+// ThemeOf resolves the active default Quiet Studio Palette for the requested ThemeMode.
+func ThemeOf(cx *core.Scope, mode ThemeMode) Palette {
+	return ThemeFor(cx, PresetStudio, mode)
+}
+
+// ThemeFor resolves the active Palette for the requested ThemePreset & ThemeMode.
+func ThemeFor(cx *core.Scope, preset ThemePreset, mode ThemeMode) Palette {
+	switch mode {
+	case ThemeDark:
+		return PaletteFor(preset, true)
+	case ThemeLight:
+		return PaletteFor(preset, false)
+	default:
+		if cx != nil && cx.Dark() {
+			return PaletteFor(preset, true)
+		}
+		return PaletteFor(preset, false)
 	}
-	return LightVTPalette()
+}
+
+// VTPaletteOf resolves the default Graphite VT canvas palette given app Palette and VTThemeMode.
+func VTPaletteOf(pal Palette, vtMode VTThemeMode) VTPalette {
+	return VTPaletteFor(pal, vtMode, VTSchemeGraphite)
+}
+
+// VTPaletteFor resolves the active VT canvas palette for the requested scheme and mode.
+func VTPaletteFor(pal Palette, vtMode VTThemeMode, scheme VTColorScheme) VTPalette {
+	switch scheme {
+	case VTSchemeTokyo:
+		return VTPalette{
+			Bg:     core.RGB(0x1a1b26),
+			Fg:     core.RGB(0xc0caf5),
+			Muted:  core.RGB(0x8b94b8),
+			Accent: core.RGB(0x9ece6a),
+			Blue:   core.RGB(0x7aa2f7),
+			Amber:  core.RGB(0xe0af68),
+			Red:    core.RGB(0xf7768e),
+			Cursor: core.RGB(0x7aa2f7),
+			ANSI: [16]core.Color{
+				core.RGB(0x15161e), core.RGB(0xf7768e), core.RGB(0x9ece6a), core.RGB(0xe0af68),
+				core.RGB(0x7aa2f7), core.RGB(0xbb9af7), core.RGB(0x7dcfff), core.RGB(0xa9b1d6),
+				core.RGB(0x565f89), core.RGB(0xf7768e), core.RGB(0x9ece6a), core.RGB(0xe0af68),
+				core.RGB(0x7aa2f7), core.RGB(0xbb9af7), core.RGB(0x7dcfff), core.RGB(0xc0caf5),
+			},
+		}
+	case VTSchemeCatppuccin:
+		return VTPalette{
+			Bg:     core.RGB(0x1e1e2e),
+			Fg:     core.RGB(0xcdd6f4),
+			Muted:  core.RGB(0x9399b2),
+			Accent: core.RGB(0xa6e3a1),
+			Blue:   core.RGB(0x89b4fa),
+			Amber:  core.RGB(0xf9e2af),
+			Red:    core.RGB(0xf38ba8),
+			Cursor: core.RGB(0xcba6f7),
+			ANSI: [16]core.Color{
+				core.RGB(0x45475a), core.RGB(0xf38ba8), core.RGB(0xa6e3a1), core.RGB(0xf9e2af),
+				core.RGB(0x89b4fa), core.RGB(0xf5c2e7), core.RGB(0x94e2d5), core.RGB(0xbac2de),
+				core.RGB(0x585b70), core.RGB(0xf38ba8), core.RGB(0xa6e3a1), core.RGB(0xf9e2af),
+				core.RGB(0x89b4fa), core.RGB(0xcba6f7), core.RGB(0x94e2d5), core.RGB(0xcdd6f4),
+			},
+		}
+	case VTSchemeGruvbox:
+		return VTPalette{
+			Bg:     core.RGB(0x282828),
+			Fg:     core.RGB(0xebdbb2),
+			Muted:  core.RGB(0xa89984),
+			Accent: core.RGB(0xb8bb26),
+			Blue:   core.RGB(0x83a598),
+			Amber:  core.RGB(0xfabd2f),
+			Red:    core.RGB(0xff6b57),
+			Cursor: core.RGB(0xfabd2f),
+			ANSI: [16]core.Color{
+				core.RGB(0x282828), core.RGB(0xcc241d), core.RGB(0x98971a), core.RGB(0xd79921),
+				core.RGB(0x458588), core.RGB(0xb16286), core.RGB(0x689d6a), core.RGB(0xa89984),
+				core.RGB(0x928374), core.RGB(0xfb4934), core.RGB(0xb8bb26), core.RGB(0xfabd2f),
+				core.RGB(0x83a598), core.RGB(0xd3869b), core.RGB(0x8ec07c), core.RGB(0xebdbb2),
+			},
+		}
+	default:
+		if vtMode == VTAlwaysDark || pal.Dark {
+			return DarkVTPalette()
+		}
+		return LightVTPalette()
+	}
 }
 
 // ApplyAppearance pushes ThemeMode into NSGo's window appearance.

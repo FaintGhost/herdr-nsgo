@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nsgo-dev/nsgo/base"
 	"github.com/nsgo-dev/nsgo/base/textview"
-	"github.com/nsgo-dev/nsgo/base/textview/highlight"
 	"github.com/nsgo-dev/nsgo/core"
 	"github.com/nsgo-dev/nsgo/ui"
 	"github.com/nsgo-dev/nsgo/ui/chat"
@@ -59,7 +59,7 @@ func RenderChatSessionWithCallbacks(
 	}
 
 	convState := chat.NewConversationState(cx)
-	highlighter := highlight.New(cx)
+	highlighter := newAppHighlighter(cx)
 	visibleLimit := core.NewSignal(cx, chatInitialVisibleItems)
 	diffSheet := core.NewSignalFunc(cx, (*activeDiffModal)(nil), func(x, y *activeDiffModal) bool { return x == y })
 
@@ -270,14 +270,122 @@ func RenderChatSessionWithCallbacks(
 											}
 										},
 									},
-									chat.Chip{TestID: "chat-source-pill", Icon: lucide.RefreshCw, Text: "刷新记录", TextFunc: func() string {
-										if chatCtrl.IsCachedSnapshot() {
-											return "同步中"
-										}
-										return chatCtrl.Source().Label()
-									}, OnPress: func() {
-										chatCtrl.RefreshAsync()
-									}},
+									core.View{
+										Style: core.Style{
+											Direction:  core.Row,
+											AlignItems: core.AlignCenter,
+											Gap:        Tokens.Space1,
+											FlexShrink: 0,
+										},
+										Children: []core.Node{
+											core.Show{
+												When: func() bool { return chatCtrl.ContextUsage().Valid() },
+												Then: func(cx *core.Scope) core.Node {
+													return core.View{
+														TestID: "chat-context-pill",
+														StyleFunc: func() core.Style {
+															pal := a.paletteOf(cx)
+															bg := pal.SurfaceRaised
+															ratio := chatCtrl.ContextUsage().Ratio()
+															if ratio >= 0.90 {
+																bg = pal.DangerSoft
+															} else if ratio >= 0.75 {
+																bg = pal.WarnSoft
+															}
+															return core.Style{
+																Direction:    core.Row,
+																AlignItems:   core.AlignCenter,
+																Padding:      core.Symmetric(core.Points(3), core.Points(7)),
+																CornerRadius: Tokens.RadiusPill,
+																Background:   bg,
+															}
+														},
+														Children: []core.Node{
+															core.Text{
+																MaxLines:    1,
+																ContentFunc: func() string { return chatCtrl.ContextUsage().Label() },
+																StyleFunc: func() core.Style {
+																	pal := a.paletteOf(cx)
+																	col := pal.TextMuted
+																	ratio := chatCtrl.ContextUsage().Ratio()
+																	if ratio >= 0.90 {
+																		col = pal.Danger
+																	} else if ratio >= 0.75 {
+																		col = pal.Warn
+																	}
+																	return core.Style{
+																		Color:      col,
+																		FontSize:   Tokens.FontMonoMeta,
+																		FontFamily: core.FontMonospace,
+																		FontWeight: core.FontWeightMedium,
+																	}
+																},
+															},
+														},
+													}
+												},
+											},
+											base.Button{
+												TestID: "chat-source-pill",
+												Label:  "刷新记录",
+												OnPress: func(core.PressEvent) {
+													playSelectionHaptic(cx)
+													chatCtrl.ManualRefreshAsync()
+												},
+												Style: core.Style{
+													Direction:    core.Row,
+													AlignItems:   core.AlignCenter,
+													Gap:          core.Points(5),
+													Padding:      core.Symmetric(core.Points(3), core.Points(8)),
+													CornerRadius: Tokens.RadiusPill,
+													MinHeight:    core.Pt(24),
+												},
+												StyleFunc: func() core.Style {
+													pal := a.paletteOf(cx)
+													if chatCtrl.IsActivelySyncing() {
+														return core.Style{Background: pal.AccentSoft}
+													}
+													return core.Style{Background: pal.SurfaceRaised}
+												},
+												Children: []core.Node{
+													core.Show{
+														When: chatCtrl.IsActivelySyncing,
+														Then: func(cx *core.Scope) core.Node {
+															return ui.Spinner{
+																TestID: "chat-source-spinner",
+																Size:   11,
+																Label:  "同步中",
+															}
+														},
+														Else: func(cx *core.Scope) core.Node {
+															return ui.Icon(lucide.RefreshCw, 11, func() core.Color { return a.paletteOf(cx).TextMuted })
+														},
+													},
+													core.Text{
+														MaxLines: 1,
+														ContentFunc: func() string {
+															if chatCtrl.IsActivelySyncing() {
+																return "同步中"
+															}
+															return chatCtrl.Source().Label()
+														},
+														StyleFunc: func() core.Style {
+															pal := a.paletteOf(cx)
+															col := pal.TextMuted
+															if chatCtrl.IsActivelySyncing() {
+																col = pal.Accent
+															}
+															return core.Style{
+																Color:      col,
+																FontSize:   Tokens.FontMonoMeta,
+																FontWeight: core.FontWeightMedium,
+															}
+														},
+													},
+												},
+											},
+										},
+									},
 								},
 							},
 							// Pagination loader: reveals buffered in-memory items in 0ms first, then fetches older remote JSONL lines
@@ -333,7 +441,7 @@ func RenderChatSessionWithCallbacks(
 									isLive := func() bool { return it0.ID == liveItemID() }
 									switch it0.Role {
 									case RoleUser:
-										return renderChatUserBubble(cx, a, itemFn)
+										return renderChatUserBubble(cx, a, chatCtrl, itemFn)
 									case RoleThinking:
 										return chat.Reasoning{
 											TestID: "chat-thinking-" + it0.ID, Conversation: convState,
@@ -347,7 +455,7 @@ func RenderChatSessionWithCallbacks(
 											},
 										}
 									case RoleToolGroup:
-										return renderChatToolGroup(cx, a, chatCtrl, itemFn, isLive, func(title string, tc ChatToolCall) {
+										return renderChatToolGroup(cx, a, chatCtrl, highlighter, itemFn, isLive, func(title string, tc ChatToolCall) {
 											diffSheet.Set(&activeDiffModal{Title: title, Tool: tc})
 										})
 									default:
@@ -584,16 +692,17 @@ func chatItemMatchesQuery(it ChatTurnItem, q string) bool {
 	return false
 }
 
-func renderChatUserBubble(cx *core.Scope, a *App, itemFn func() ChatTurnItem) core.Node {
+func renderChatUserBubble(cx *core.Scope, a *App, chatCtrl *ChatSessionController, itemFn func() ChatTurnItem) core.Node {
 	it0 := itemFn()
 	return chat.Message{
 		Outgoing: true,
 		Children: []core.Node{
 			core.View{
 				TestID: "chat-user-" + it0.ID,
-				Style:  core.Style{Padding: core.Edges{Left: 32}, AlignItems: core.AlignEnd},
+				Style:  core.Style{Padding: core.Edges{Left: 32}, AlignItems: core.AlignEnd, Gap: core.Points(4)},
 				Children: []core.Node{
 					core.View{
+						Selectable: true,
 						StyleFunc: func() core.Style {
 							pal := a.paletteOf(cx)
 							return core.Style{
@@ -610,17 +719,12 @@ func renderChatUserBubble(cx *core.Scope, a *App, itemFn func() ChatTurnItem) co
 						},
 						Children: []core.Node{
 							core.Show{
-								When: func() bool { it := itemFn(); return it.FromAgent != "" || it.DeliveryMode != "" },
+								When: func() bool { return itemFn().FromAgent != "" },
 								Then: func(cx *core.Scope) core.Node {
 									return core.Text{
-										MaxLines: 1,
-										ContentFunc: func() string {
-											it := itemFn()
-											if it.FromAgent != "" {
-												return "子会话汇报 · " + it.FromAgent
-											}
-											return "忙时" + it.DeliveryMode
-										},
+										MaxLines:    1,
+										Selectable:  core.SelectableOff,
+										ContentFunc: func() string { return "子会话汇报 · " + itemFn().FromAgent },
 										StyleFunc: func() core.Style {
 											pal := a.paletteOf(cx)
 											return core.Style{
@@ -638,14 +742,113 @@ func renderChatUserBubble(cx *core.Scope, a *App, itemFn func() ChatTurnItem) co
 								ContentFunc: func() string { return itemFn().Text },
 								StyleFunc: func() core.Style {
 									pal := a.paletteOf(cx)
+									fs := a.BodyFontSize()
 									return core.Style{
-										Color:      pal.Text,
-										FontSize:   Tokens.FontBody,
-										LineHeight: core.Points(22),
+										Color:          pal.Text,
+										SelectionColor: pal.AccentSoft,
+										FontSize:       fs,
+										LineHeight:     fs + 7,
+										FontFamily:     a.BodyFontFamily(),
+									}
+								},
+							},
+							core.Show{
+								When: func() bool {
+									it := itemFn()
+									if it.FromAgent != "" || it.DeliveryMode == "" {
+										return false
+									}
+									if it.DeliveryMode == string(chatQueue) {
+										return chatCtrl != nil && chatCtrl.CanSteerItem(it.ID)
+									}
+									return true
+								},
+								Then: func(cx *core.Scope) core.Node {
+									return core.View{
+										Style: core.Style{
+											Direction:      core.Row,
+											AlignItems:     core.AlignCenter,
+											JustifyContent: core.JustifyEnd,
+											Gap:            core.Points(6),
+											Padding:        core.Edges{Top: core.Points(2)},
+										},
+										Children: []core.Node{
+											core.Text{
+												MaxLines:   1,
+												Selectable: core.SelectableOff,
+												ContentFunc: func() string {
+													it := itemFn()
+													if it.DeliveryMode == string(chatQueue) {
+														return "等待中"
+													}
+													if it.DeliveryMode == string(chatSteer) {
+														return "已插队"
+													}
+													return it.DeliveryMode
+												},
+												StyleFunc: func() core.Style {
+													pal := a.paletteOf(cx)
+													return core.Style{
+														Color:      pal.TextMuted,
+														FontSize:   Tokens.FontMonoMeta,
+														FontWeight: core.FontWeightMedium,
+													}
+												},
+											},
+											core.Show{
+												When: func() bool {
+													it := itemFn()
+													return chatCtrl != nil && chatCtrl.CanSteerItem(it.ID)
+												},
+												Then: func(cx *core.Scope) core.Node {
+													return base.Button{
+														TestID: "chat-steer-" + it0.ID,
+														Label:  "插队",
+														OnPress: func(core.PressEvent) {
+															it := itemFn()
+															playSelectionHaptic(cx)
+															if chatCtrl != nil {
+																chatCtrl.MarkSteered(it.ID)
+																a.SteerQueuedChat(chatCtrl.key, func(err error) {
+																	if err == nil {
+																		chatCtrl.RefreshAsync()
+																	}
+																})
+															}
+														},
+														Style: core.Style{
+															Padding:      core.Symmetric(core.Points(2), core.Points(8)),
+															CornerRadius: Tokens.RadiusPill,
+														},
+														StyleFunc: func() core.Style {
+															return core.Style{Background: a.paletteOf(cx).AccentSoft}
+														},
+														Children: []core.Node{
+															core.Text{
+																Content:    "插队",
+																Selectable: core.SelectableOff,
+																StyleFunc: func() core.Style {
+																	return core.Style{
+																		Color:      a.paletteOf(cx).Accent,
+																		FontSize:   Tokens.FontMonoMeta,
+																		FontWeight: core.FontWeightSemibold,
+																	}
+																},
+															},
+														},
+													}
+												},
+											},
+										},
 									}
 								},
 							},
 						},
+					},
+					// Quiet 1-tap copy action below outgoing user message
+					chat.Actions{
+						TestID: "chat-user-actions-" + it0.ID,
+						Text:   func() string { return itemFn().Text },
 					},
 				},
 			},
@@ -710,6 +913,7 @@ func renderChatToolGroup(
 	cx *core.Scope,
 	a *App,
 	chatCtrl *ChatSessionController,
+	highlighter textview.Highlighter,
 	itemFn func() ChatTurnItem,
 	isLive func() bool,
 	onOpenDiff func(title string, tc ChatToolCall),
@@ -945,31 +1149,73 @@ func renderChatToolGroup(
 											core.Show{
 												When: func() bool { return !getTC().HasDiff() || getTC().Output != "" },
 												Then: func(cx *core.Scope) core.Node {
-													return core.Text{
-														Selectable: core.SelectableOn,
-														ContentFunc: func() string {
-															out := getTC().Output
-															if out == "" {
-																if getTC().HasResult {
-																	return "无输出"
+													return core.Dynamic(func(cx *core.Scope) core.Node {
+														tc := getTC()
+														out := tc.Output
+														if !tc.IsError && out != "" && len(out) <= 16*1024 {
+															if lang := toolOutputLanguage(tc); lang != "" {
+																return core.Scroll{
+																	Style: core.Style{MaxHeight: core.Pt(240), FlexShrink: 1},
+																	Children: []core.Node{
+																		ui.TextView{
+																			MarkdownFunc: func() string { return fencedCodeMarkdown(lang, getTC().Output) },
+																			Highlighter:  highlighter,
+																			Selectable:   true,
+																			Options:      textview.Options{NoMath: true, NoHTML: true},
+																			StyleOf: func(part textview.Part) core.Style {
+																				pal := a.paletteOf(cx)
+																				switch part {
+																				case textview.PartRoot:
+																					return core.Style{Gap: 0}
+																				case textview.PartCodeBlock:
+																					return core.Style{Background: pal.Bg, BorderColor: pal.Separator, CornerRadius: Tokens.RadiusKey}
+																				case textview.PartCodeBlockScroll:
+																					return core.Style{Padding: core.Symmetric(8, 10)}
+																				case textview.PartCodeBlockCode:
+																					return core.Style{FontSize: Tokens.FontMonoMeta, LineHeight: 18}
+																				}
+																				return core.Style{}
+																			},
+																			CodeBlockActions: []textview.CodeAction{
+																				{ID: textview.CopyAction, Label: "复制"},
+																			},
+																		},
+																	},
 																}
-																return "尚无输出"
 															}
-															return out
-														},
-														StyleFunc: func() core.Style {
-															pal := a.paletteOf(cx)
-															fg := pal.TextSecondary
-															if getTC().IsError {
-																fg = pal.Danger
-															}
-															return core.Style{
-																Color:      fg,
-																FontSize:   Tokens.FontMonoMeta,
-																FontFamily: core.FontMonospace,
-															}
-														},
-													}
+														}
+														return core.View{
+															Selectable: true,
+															Children: []core.Node{
+																core.Text{
+																	Selectable: core.SelectableOn,
+																	ContentFunc: func() string {
+																		curOut := getTC().Output
+																		if curOut == "" {
+																			if getTC().HasResult {
+																				return "无输出"
+																			}
+																			return "尚无输出"
+																		}
+																		return curOut
+																	},
+																	StyleFunc: func() core.Style {
+																		pal := a.paletteOf(cx)
+																		fg := pal.TextSecondary
+																		if getTC().IsError {
+																			fg = pal.Danger
+																		}
+																		return core.Style{
+																			Color:          fg,
+																			SelectionColor: pal.AccentSoft,
+																			FontSize:       Tokens.FontMonoMeta,
+																			FontFamily:     core.FontMonospace,
+																		}
+																	},
+																},
+															},
+														}
+													})
 												},
 											},
 										},
@@ -1006,8 +1252,18 @@ func renderChatAssistantCard(
 					Selectable:   true,
 					Options:      textview.Options{Streaming: isStreaming},
 					StyleOf: func(part textview.Part) core.Style {
-						if part == textview.PartRoot {
-							return core.Style{FontSize: Tokens.FontBody, LineHeight: 23, Color: a.paletteOf(cx).Text}
+						pal := a.paletteOf(cx)
+						fs := a.BodyFontSize()
+						monoFS := core.Points(a.vtFontSize.Get())
+						switch part {
+						case textview.PartRoot:
+							return core.Style{FontSize: fs, LineHeight: fs + 8, Color: pal.Text, SelectionColor: pal.AccentSoft, FontFamily: a.BodyFontFamily()}
+						case textview.PartCodeBlock:
+							return core.Style{Background: pal.Surface, BorderWidth: 1, BorderColor: pal.Border, CornerRadius: Tokens.RadiusCtrl}
+						case textview.PartCodeBlockCode:
+							return core.Style{FontSize: monoFS, LineHeight: monoFS + 7, SelectionColor: pal.AccentSoft, FontFamily: a.MonoFontFamily()}
+						case textview.PartCode:
+							return core.Style{FontFamily: a.MonoFontFamily()}
 						}
 						return core.Style{}
 					},

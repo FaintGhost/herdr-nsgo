@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/nsgo-dev/nsgo/core"
 	"github.com/nsgo-dev/nsgo/ui"
@@ -12,6 +14,7 @@ import (
 var (
 	MoshiPressSpring = core.SpringConfig{Damping: 14, Stiffness: 320, Mass: 0.6}
 	MoshiSheetSpring = core.SpringConfig{Damping: 22, Stiffness: 240, Mass: 0.8}
+	MoshiToastSpring = core.SpringConfig{Damping: 20, Stiffness: 340, Mass: 0.7}
 )
 
 func playSelectionHaptic(cx *core.Scope) {
@@ -84,6 +87,56 @@ func HarnessIconBadge(cx *core.Scope, a *App, _ func() string) core.Node {
 	}
 }
 
+// harnessBrandSVG returns the official brand vector icon for recognized AI agent harnesses.
+func harnessBrandSVG(kind string) *core.SVG {
+	switch kind {
+	case "claude":
+		return iconClaudeBrand
+	case "codex":
+		return iconCodexBrand
+	case "antigravity":
+		return iconGeminiBrand
+	case "pi", "omp":
+		return iconPiBrand
+	default:
+		return nil
+	}
+}
+
+// HarnessBrandIcon renders the crisp official brand icon for Claude, Codex, Gemini, and Pi sessions.
+func HarnessBrandIcon(cx *core.Scope, a *App, termFn func() Terminal, keyStr string, size core.Points) core.Node {
+	return core.Show{
+		When: func() bool {
+			return harnessBrandSVG(DetectHarnessKind(termFn())) != nil
+		},
+		Then: func(cx *core.Scope) core.Node {
+			k := DetectHarnessKind(termFn())
+			testID := ""
+			if keyStr != "" {
+				if k == "pi" || k == "omp" {
+					testID = "pi-brand-icon-" + keyStr
+				} else {
+					testID = "harness-brand-icon-" + k + "-" + keyStr
+				}
+			}
+			return core.SVGView{
+				TestID: testID,
+				SVGFunc: func() *core.SVG {
+					return harnessBrandSVG(DetectHarnessKind(termFn()))
+				},
+				StyleFunc: func() core.Style {
+					return core.Style{
+						Width:      core.Pt(size),
+						Height:     core.Pt(size),
+						FlexShrink: 0,
+						Color:      a.paletteOf(cx).Text,
+					}
+				},
+			}
+		},
+	}
+}
+
 // shortHarnessLabel formats a concise right-aligned harness label (Claude, Codex, Gemini, Pi, Shell).
 func shortHarnessLabel(app string) string {
 	norm := strings.ToLower(strings.TrimSpace(app))
@@ -105,10 +158,13 @@ func shortHarnessLabel(app string) string {
 	}
 }
 
-// attentionWhy explains concisely why a terminal needs user attention.
+// attentionWhy explains concisely why a terminal needs user attention or reported completion.
 func attentionWhy(t Terminal) string {
-	if t.StateWord() == "error" {
+	switch t.StateWord() {
+	case "error":
 		return "出错"
+	case "done", "idle":
+		return "已完成"
 	}
 	if t.Status != nil {
 		switch t.Status.Kind {
@@ -123,13 +179,22 @@ func attentionWhy(t Terminal) string {
 	return "等你处理"
 }
 
-// firstLine extracts a clean single-line status summary for cards and notifications.
+// firstLine extracts a clean single-line status summary (incorporating OSC 7501 Title + Msg) for cards and notifications.
 func firstLine(st *Status, t Terminal) string {
-	if st != nil && st.Msg != "" {
-		if line, _, ok := strings.Cut(strings.TrimSpace(st.Msg), "\n"); ok {
-			return strings.TrimSpace(line)
+	if st != nil {
+		title := strings.TrimSpace(st.Title)
+		msg := strings.TrimSpace(st.Msg)
+		if line, _, ok := strings.Cut(msg, "\n"); ok {
+			msg = strings.TrimSpace(line)
 		}
-		return strings.TrimSpace(st.Msg)
+		switch {
+		case title != "" && msg != "" && title != msg:
+			return title + " · " + msg
+		case msg != "":
+			return msg
+		case title != "":
+			return title
+		}
 	}
 	if t.CurrentDir() != "" {
 		return t.CurrentDir()
@@ -137,14 +202,14 @@ func firstLine(st *Status, t Terminal) string {
 	return t.Address
 }
 
-// paletteOf resolves the active semantic Palette from App's themeMode signal.
+// paletteOf resolves the active semantic Palette from App's themePreset and themeMode signals.
 func (a *App) paletteOf(cx *core.Scope) Palette {
-	return ThemeOf(cx, a.themeMode.Get())
+	return ThemeFor(cx, a.themePreset.Get(), a.themeMode.Get())
 }
 
-// vtPaletteOf resolves the active VT canvas palette from App's themeMode & vtThemeMode signals.
+// vtPaletteOf resolves the active VT canvas palette from App's theme, vtThemeMode, and vtColorScheme signals.
 func (a *App) vtPaletteOf(cx *core.Scope) VTPalette {
-	return VTPaletteOf(a.paletteOf(cx), a.vtThemeMode.Get())
+	return VTPaletteFor(a.paletteOf(cx), a.vtThemeMode.Get(), a.vtColorScheme.Get())
 }
 
 // stateColor maps a terminal state word to Quiet Studio semantic tokens.
@@ -606,18 +671,31 @@ func SessionRowWithDivider(cx *core.Scope, a *App, itemFn func() AggregatedTermi
 							Gap:            Tokens.Space2,
 						},
 						Children: []core.Node{
-							core.Text{
-								MaxLines:    1,
-								ContentFunc: func() string { return itemFn().Terminal.Label() },
-								StyleFunc: func() core.Style {
-									return core.Style{
-										FlexGrow:   1,
-										FlexShrink: 1,
-										MinWidth:   core.Pt(0),
-										Color:      a.paletteOf(cx).Text,
-										FontSize:   Tokens.FontRowTitle,
-										FontWeight: core.FontWeightMedium,
-									}
+							core.View{
+								Style: core.Style{
+									FlexGrow:   1,
+									FlexShrink: 1,
+									MinWidth:   core.Pt(0),
+									Direction:  core.Row,
+									AlignItems: core.AlignCenter,
+									Gap:        core.Points(6),
+								},
+								Children: []core.Node{
+									HarnessBrandIcon(cx, a, func() Terminal { return itemFn().Terminal }, itemFn().Key.String(), 15),
+									core.Text{
+										MaxLines:    1,
+										ContentFunc: func() string { return itemFn().Terminal.Label() },
+										StyleFunc: func() core.Style {
+											return core.Style{
+												FlexGrow:   1,
+												FlexShrink: 1,
+												MinWidth:   core.Pt(0),
+												Color:      a.paletteOf(cx).Text,
+												FontSize:   Tokens.FontRowTitle,
+												FontWeight: core.FontWeightMedium,
+											}
+										},
+									},
 								},
 							},
 							core.Text{
@@ -644,11 +722,11 @@ func SessionRowWithDivider(cx *core.Scope, a *App, itemFn func() AggregatedTermi
 							},
 						},
 					},
-					// Line 2 (only when semantic status message exists): single-line summary
+					// Line 2 (only when semantic status title/message exists): single-line summary
 					core.Show{
 						When: func() bool {
 							it := itemFn()
-							return it.Terminal.Status != nil && strings.TrimSpace(it.Terminal.Status.Msg) != ""
+							return it.Terminal.Status != nil && (strings.TrimSpace(it.Terminal.Status.Msg) != "" || strings.TrimSpace(it.Terminal.Status.Title) != "")
 						},
 						Then: func(cx *core.Scope) core.Node {
 							return core.Text{
@@ -659,9 +737,71 @@ func SessionRowWithDivider(cx *core.Scope, a *App, itemFn func() AggregatedTermi
 								},
 								StyleFunc: func() core.Style {
 									return core.Style{
-										Color:    a.paletteOf(cx).TextSecondary,
-										FontSize: Tokens.FontCaption,
+										Color:      a.paletteOf(cx).TextSecondary,
+										FontSize:   Tokens.FontCaption,
+										FontFamily: a.BodyFontFamily(),
 									}
+								},
+							}
+						},
+					},
+					// OSC 7501 progress bar when program reports 0..100 progress
+					core.Show{
+						When: func() bool {
+							st := itemFn().Terminal.Status
+							return st != nil && st.Progress != nil && *st.Progress >= 0 && *st.Progress <= 100
+						},
+						Then: func(cx *core.Scope) core.Node {
+							return core.View{
+								TestID: "session-progress-" + itemFn().Key.String(),
+								Style: core.Style{
+									Direction:  core.Row,
+									AlignItems: core.AlignCenter,
+									Gap:        Tokens.Space2,
+									Padding:    core.Edges{Top: core.Points(2)},
+								},
+								Children: []core.Node{
+									core.View{
+										StyleFunc: func() core.Style {
+											return core.Style{
+												FlexGrow:     1,
+												Height:       core.Pt(3),
+												CornerRadius: 2,
+												Background:   a.paletteOf(cx).Fill,
+												Overflow:     core.Hidden,
+											}
+										},
+										Children: []core.Node{
+											core.View{
+												StyleFunc: func() core.Style {
+													pct := 0
+													if st := itemFn().Terminal.Status; st != nil && st.Progress != nil {
+														pct = max(0, min(100, *st.Progress))
+													}
+													return core.Style{
+														Width:      core.Pct(float32(pct)),
+														Height:     core.Pt(3),
+														Background: a.paletteOf(cx).Running,
+													}
+												},
+											},
+										},
+									},
+									core.Text{
+										ContentFunc: func() string {
+											if st := itemFn().Terminal.Status; st != nil && st.Progress != nil {
+												return fmt.Sprintf("%d%%", max(0, min(100, *st.Progress)))
+											}
+											return ""
+										},
+										StyleFunc: func() core.Style {
+											return core.Style{
+												Color:      a.paletteOf(cx).TextMuted,
+												FontSize:   core.Points(11),
+												FontFamily: a.MonoFontFamily(),
+											}
+										},
+									},
 								},
 							}
 						},
@@ -762,6 +902,7 @@ func InlineApprovalCard(cx *core.Scope, a *App, itemFn func() AggregatedTerminal
 									}
 								},
 							},
+							HarnessBrandIcon(cx, a, func() Terminal { return itemFn().Terminal }, "", 15),
 							core.Text{
 								MaxLines: 1,
 								ContentFunc: func() string {
@@ -1425,52 +1566,350 @@ func SheetModal(cx *core.Scope, a *App, testID, title, closeTestID string, onClo
 	}
 }
 
-// ToastBanner shows transient user feedback cleanly.
-func ToastBanner(cx *core.Scope, a *App) core.Node {
+// SyncStatusBanner renders a quiet, animated connecting/syncing indicator pill during cold start
+// or foreground resume so the app never looks frozen or silently blank while SSH/RPC catches up.
+func SyncStatusBanner(cx *core.Scope, a *App) core.Node {
 	return core.Show{
-		When: func() bool { return strings.TrimSpace(a.toastMsg.Get()) != "" },
+		When: func() bool {
+			active, _ := a.SyncStatus()
+			return active
+		},
 		Then: func(cx *core.Scope) core.Node {
 			return core.View{
-				TestID: "toast-banner",
+				TestID: "sync-status-banner",
+				Role:   core.RoleStatus,
 				StyleFunc: func() core.Style {
 					pal := a.paletteOf(cx)
 					return core.Style{
-						Direction:      core.Row,
-						AlignItems:     core.AlignCenter,
-						JustifyContent: core.JustifySpaceBetween,
-						Background:     pal.Surface,
-						BorderColor:    pal.Border,
-						BorderWidth:    1,
-						CornerRadius:   Tokens.RadiusCtrl,
-						Padding:        core.Symmetric(Tokens.Space2, Tokens.Space3),
-						Margin:         core.Symmetric(Tokens.Space1, Tokens.PagePadX),
+						Direction:    core.Row,
+						AlignItems:   core.AlignCenter,
+						Gap:          Tokens.Space2,
+						Background:   pal.Surface,
+						BorderWidth:  1,
+						BorderColor:  pal.Border,
+						CornerRadius: Tokens.RadiusPill,
+						AlignSelf:    core.AlignStart,
+						Padding:      core.Symmetric(core.Points(5), Tokens.Space3),
+						Margin:       core.Edges{Top: Tokens.Space1, Bottom: Tokens.Space1, Left: Tokens.PagePadX, Right: Tokens.PagePadX},
 					}
 				},
 				Children: []core.Node{
+					ui.Spinner{
+						Size:    13,
+						Variant: ui.SpinnerSpokes,
+						Label:   "正在同步",
+						Tint:    func() core.Color { return a.paletteOf(cx).Running },
+					},
 					core.Text{
-						ContentFunc: func() string { return a.toastMsg.Get() },
+						MaxLines: 1,
+						ContentFunc: func() string {
+							_, label := a.SyncStatus()
+							return label
+						},
 						StyleFunc: func() core.Style {
 							return core.Style{
-								Color:      a.paletteOf(cx).Text,
-								FontSize:   Tokens.FontCaption,
-								FlexShrink: 1,
+								Color:      a.paletteOf(cx).TextSecondary,
+								FontSize:   Tokens.FontMonoMeta,
+								FontWeight: core.FontWeightMedium,
 							}
 						},
 					},
+				},
+			}
+		},
+	}
+}
+
+// HomeSkeletonFeed renders Quiet Studio grouped skeleton cards while cold-start instances are still dialing.
+func HomeSkeletonFeed(cx *core.Scope, a *App, testID string) core.Node {
+	row := func(lines int) core.Node {
+		return core.View{
+			Style: core.Style{Padding: core.Symmetric(Tokens.Space3, core.Points(14))},
+			Children: []core.Node{
+				ui.Skeleton{Lines: lines, Label: "正在加载会话列表"},
+			},
+		}
+	}
+	return core.View{
+		TestID: testID,
+		Style:  core.Style{Gap: Tokens.SectionGap},
+		Children: []core.Node{
+			core.View{
+				Style: core.Style{Gap: Tokens.Space2},
+				Children: []core.Node{
+					SectionHeader(cx, a, func() string { return "正在同步会话" }, nil),
+					GroupCard(cx, a, "", []core.Node{
+						row(2),
+						InsetDivider(cx, a, 14),
+						row(2),
+						InsetDivider(cx, a, 14),
+						row(2),
+					}),
+				},
+			},
+		},
+	}
+}
+
+// FloatingToastOverlay renders a single root-level floating pill toast with zero layout shift,
+// spring slide-in, subtle frosted glass elevation, auto-dismiss, and tap/swipe-up dismissal.
+func FloatingToastOverlay(cx *core.Scope, a *App) core.Node {
+	visible := core.NewSignal(cx, false)
+	shown := core.NewSignal(cx, toastNotice{})
+
+	reduceMotion := cx == nil || ui.ReduceMotion(cx) || cx.Env().Simulated()
+	var opacity, translateY, scale *core.AnimatedValue
+	if !reduceMotion {
+		opacity = core.NewAnimatedValue(cx, 0)
+		translateY = core.NewAnimatedValue(cx, -20)
+		scale = core.NewAnimatedValue(cx, 0.94)
+	}
+
+	var exitGen atomic.Uint64
+	var lastSeq uint64
+
+	if cx != nil {
+		cx.Effect(func() {
+			n := a.toast.Get()
+			if strings.TrimSpace(n.Msg) != "" {
+				exitGen.Add(1)
+				wasVisible := visible.GetUntracked()
+				shown.Set(n)
+				visible.Set(true)
+				if !reduceMotion {
+					if !wasVisible {
+						opacity.Set(0)
+						translateY.Set(-20)
+						scale.Set(0.94)
+						ui.Timing(cx, opacity, 1, core.TimingConfig{Duration: 150 * time.Millisecond})
+						ui.Spring(cx, translateY, 0, MoshiToastSpring)
+						ui.Spring(cx, scale, 1, MoshiToastSpring)
+					} else if n.Seq != lastSeq {
+						scale.Set(0.96)
+						ui.Spring(cx, scale, 1, MoshiToastSpring)
+						ui.Timing(cx, opacity, 1, core.TimingConfig{Duration: 120 * time.Millisecond})
+						ui.Spring(cx, translateY, 0, MoshiToastSpring)
+					}
+				}
+				lastSeq = n.Seq
+				return
+			}
+			if !visible.GetUntracked() {
+				return
+			}
+			if reduceMotion {
+				visible.Set(false)
+				shown.Set(toastNotice{})
+				return
+			}
+			gen := exitGen.Add(1)
+			ui.Timing(cx, opacity, 0, core.TimingConfig{Duration: 170 * time.Millisecond})
+			ui.Timing(cx, translateY, -14, core.TimingConfig{Duration: 170 * time.Millisecond})
+			ui.Timing(cx, scale, 0.96, core.TimingConfig{Duration: 170 * time.Millisecond})
+			time.AfterFunc(185*time.Millisecond, func() {
+				if exitGen.Load() != gen {
+					return
+				}
+				a.post(func() {
+					if exitGen.Load() != gen {
+						return
+					}
+					visible.Set(false)
+					shown.Set(toastNotice{})
+				})
+			})
+		})
+	}
+
+	var animStyle *core.AnimatedStyle
+	if !reduceMotion {
+		animStyle = &core.AnimatedStyle{
+			Opacity:    opacity,
+			TranslateY: translateY,
+			Scale:      scale,
+		}
+	}
+
+	currentToast := func() toastNotice {
+		if reduceMotion {
+			return a.toast.Get()
+		}
+		return shown.Get()
+	}
+
+	return core.Show{
+		When: func() bool {
+			if reduceMotion {
+				return strings.TrimSpace(a.toast.Get().Msg) != ""
+			}
+			return visible.Get()
+		},
+		Then: func(cx *core.Scope) core.Node {
+			return core.View{
+				PointerEvents: core.PointerEventsBoxNone,
+				Style: core.Style{
+					Position:   core.Absolute,
+					Top:        core.Pt(0),
+					Left:       core.Pt(0),
+					Right:      core.Pt(0),
+					ZIndex:     120,
+					AlignItems: core.AlignCenter,
+					PaddingEnv: core.EnvEdges{Top: core.EnvSafeArea},
+					Padding: core.Edges{
+						Top:   Tokens.Space2,
+						Left:  Tokens.PagePadX,
+						Right: Tokens.PagePadX,
+					},
+				},
+				Children: []core.Node{
 					core.View{
-						Role: core.RoleButton,
-						OnPress: func(core.PressEvent) {
-							a.toastMsg.Set("")
+						TestID:        "toast-banner",
+						Role:          core.RoleButton,
+						Label:         "关闭提示",
+						PointerEvents: core.PointerEventsAuto,
+						PanActivation: core.PanActivation{ActiveOffsetY: 10},
+						OnPan: func(ev core.PanEvent) {
+							if ev.Phase == core.GestureEnded && ev.Translation.Y < -10 {
+								a.dismissToastSync()
+							}
 						},
-						Style: core.Style{FlexShrink: 0, Padding: core.Symmetric(core.Points(2), Tokens.Space2)},
+						OnPressDown: func(core.PressEvent) {
+							if !reduceMotion {
+								pressSpringTo(cx, scale, 0.96)
+							}
+						},
+						OnPressUp: func(core.PressEvent) {
+							if !reduceMotion {
+								pressSpringTo(cx, scale, 1.0)
+							}
+						},
+						OnPress: func(core.PressEvent) {
+							a.dismissToastSync()
+						},
+						StyleFunc: func() core.Style {
+							pal := a.paletteOf(cx)
+							return core.Style{
+								Animated:        animStyle,
+								Direction:       core.Row,
+								AlignItems:      core.AlignCenter,
+								Gap:             Tokens.Space2,
+								MaxWidth:        core.Pt(348),
+								Background:      pal.GlassSurface,
+								BackdropFilters: []core.Filter{core.Blur(20)},
+								BorderColor:     pal.GlassBorder,
+								BorderWidth:     1,
+								CornerRadius:    22,
+								Padding: core.Edges{
+									Top:    9,
+									Bottom: 9,
+									Left:   11,
+									Right:  14,
+								},
+								ShadowColor:  pal.Overlay,
+								ShadowOffset: core.Point{Y: 6},
+								ShadowRadius: 16,
+							}
+						},
 						Children: []core.Node{
+							// Leading semantic icon badge
+							core.View{
+								StyleFunc: func() core.Style {
+									pal := a.paletteOf(cx)
+									bg := pal.AccentSoft
+									switch currentToast().Kind {
+									case toastSuccess:
+										bg = pal.RunningSoft
+									case toastWarn:
+										bg = pal.WarnSoft
+									case toastError:
+										bg = pal.DangerSoft
+									}
+									return core.Style{
+										Width:          core.Pt(22),
+										Height:         core.Pt(22),
+										CornerRadius:   Tokens.RadiusPill,
+										Background:     bg,
+										AlignItems:     core.AlignCenter,
+										JustifyContent: core.JustifyCenter,
+										FlexShrink:     0,
+									}
+								},
+								Children: []core.Node{
+									core.Show{
+										When: func() bool { return currentToast().Kind == toastSuccess },
+										Then: func(cx *core.Scope) core.Node {
+											return core.Icon{
+												SVG: iconCheck,
+												StyleFunc: func() core.Style {
+													return core.Style{Width: core.Pt(13), Height: core.Pt(13), Color: a.paletteOf(cx).Running}
+												},
+											}
+										},
+										Else: func(cx *core.Scope) core.Node {
+											return core.Show{
+												When: func() bool { return currentToast().Kind == toastError },
+												Then: func(cx *core.Scope) core.Node {
+													return core.Icon{
+														SVG: iconCircleAlert,
+														StyleFunc: func() core.Style {
+															return core.Style{Width: core.Pt(13), Height: core.Pt(13), Color: a.paletteOf(cx).Danger}
+														},
+													}
+												},
+												Else: func(cx *core.Scope) core.Node {
+													return core.Show{
+														When: func() bool { return currentToast().Kind == toastWarn },
+														Then: func(cx *core.Scope) core.Node {
+															return core.Icon{
+																SVG: iconTriangleAlert,
+																StyleFunc: func() core.Style {
+																	return core.Style{Width: core.Pt(13), Height: core.Pt(13), Color: a.paletteOf(cx).Warn}
+																},
+															}
+														},
+														Else: func(cx *core.Scope) core.Node {
+															return core.Icon{
+																SVG: iconInfo,
+																StyleFunc: func() core.Style {
+																	return core.Style{Width: core.Pt(13), Height: core.Pt(13), Color: a.paletteOf(cx).TextSecondary}
+																},
+															}
+														},
+													}
+												},
+											}
+										},
+									},
+								},
+							},
+							// Crisp concise message
 							core.Text{
-								Content: "知道了",
+								ContentFunc: func() string { return currentToast().Msg },
+								MaxLines:    2,
 								StyleFunc: func() core.Style {
 									return core.Style{
 										Color:      a.paletteOf(cx).Text,
 										FontSize:   Tokens.FontCaption,
-										FontWeight: core.FontWeightSemibold,
+										FontWeight: core.FontWeightMedium,
+										LineHeight: 18,
+										FlexShrink: 1,
+									}
+								},
+							},
+							// Subtle dismiss glyph only on longer error toasts (all toasts dismiss on tap / swipe up)
+							core.Show{
+								When: func() bool { return currentToast().Kind == toastError },
+								Then: func(cx *core.Scope) core.Node {
+									return core.Icon{
+										SVG: iconClose,
+										StyleFunc: func() core.Style {
+											return core.Style{
+												Width:      core.Pt(13),
+												Height:     core.Pt(13),
+												Color:      a.paletteOf(cx).TextMuted,
+												FlexShrink: 0,
+											}
+										},
 									}
 								},
 							},
@@ -1483,13 +1922,216 @@ func ToastBanner(cx *core.Scope, a *App) core.Node {
 }
 
 func attentionCount(a *App) int {
-	n := 0
-	for _, t := range a.aggTerms.Get() {
-		if t.Terminal.NeedsYou() {
-			n++
+	urgent, done := a.InboxBadgeCount()
+	return urgent + done
+}
+
+func attentionBadgeColor(pal Palette, a *App) core.Color {
+	urgent, _ := a.InboxBadgeCount()
+	if urgent > 0 {
+		return pal.Warn
+	}
+	return pal.Running
+}
+
+// CompletionReportCard renders a Quiet Studio card in Inbox when an Agent completes and reports back.
+func CompletionReportCard(
+	cx *core.Scope,
+	a *App,
+	itemFn func() AggregatedTerminal,
+	onOpen func(TermKey),
+	onDismiss func(TermKey),
+) core.Node {
+	it0 := itemFn()
+	keyStr := it0.Key.String()
+
+	compactBtn := func(testID, label string, variant ActionVariant, onPress func()) core.Node {
+		scale := newPressScale(cx)
+		return core.View{
+			TestID:      testID,
+			Role:        core.RoleButton,
+			OnPressDown: func(core.PressEvent) { pressSpringTo(cx, scale, 0.97) },
+			OnPressUp:   func(core.PressEvent) { pressSpringTo(cx, scale, 1.0) },
+			OnPress: func(core.PressEvent) {
+				pressSpringTo(cx, scale, 1.0)
+				playSelectionHaptic(cx)
+				if onPress != nil {
+					onPress()
+				}
+			},
+			Style: core.Style{Animated: pressAnimStyle(scale)},
+			StyleFunc: func() core.Style {
+				pal := a.paletteOf(cx)
+				bg, border := pal.SurfaceRaised, pal.Border
+				bw := core.Points(1)
+				if variant == ActionPrimary {
+					bg = pal.Accent
+					border = core.Transparent
+					bw = 0
+				}
+				return core.Style{
+					MinHeight:      core.Pt(36),
+					Padding:        core.Symmetric(Tokens.Space1, core.Points(12)),
+					CornerRadius:   Tokens.RadiusCtrl,
+					Background:     bg,
+					BorderWidth:    bw,
+					BorderColor:    border,
+					AlignItems:     core.AlignCenter,
+					JustifyContent: core.JustifyCenter,
+				}
+			},
+			Children: []core.Node{
+				core.Text{
+					Content: label,
+					StyleFunc: func() core.Style {
+						pal := a.paletteOf(cx)
+						fg := pal.Text
+						if variant == ActionPrimary {
+							fg = pal.AccentFg
+						}
+						return core.Style{Color: fg, FontSize: Tokens.FontCaption, FontWeight: core.FontWeightMedium}
+					},
+				},
+			},
 		}
 	}
-	return n
+
+	return core.View{
+		TestID: "complete-card-" + keyStr,
+		StyleFunc: func() core.Style {
+			pal := a.paletteOf(cx)
+			return core.Style{
+				Background:   pal.Surface,
+				BorderWidth:  1,
+				BorderColor:  pal.Border,
+				CornerRadius: Tokens.RadiusCard,
+				Padding:      core.All(core.Points(14)),
+				Gap:          core.Points(10),
+			}
+		},
+		Children: []core.Node{
+			core.View{
+				Style: core.Style{
+					Direction:      core.Row,
+					AlignItems:     core.AlignCenter,
+					JustifyContent: core.JustifySpaceBetween,
+					Gap:            Tokens.Space2,
+				},
+				Children: []core.Node{
+					core.View{
+						Style: core.Style{
+							Direction:  core.Row,
+							AlignItems: core.AlignCenter,
+							Gap:        Tokens.Space2,
+							FlexGrow:   1,
+							FlexShrink: 1,
+							MinWidth:   core.Pt(0),
+						},
+						Children: []core.Node{
+							core.View{
+								StyleFunc: func() core.Style {
+									return core.Style{
+										Width:        core.Pt(8),
+										Height:       core.Pt(8),
+										CornerRadius: 4,
+										FlexShrink:   0,
+										Background:   a.paletteOf(cx).Running,
+									}
+								},
+							},
+							HarnessBrandIcon(cx, a, func() Terminal { return itemFn().Terminal }, "", 15),
+							core.Text{
+								MaxLines:    1,
+								ContentFunc: func() string { return itemFn().Terminal.Label() },
+								StyleFunc: func() core.Style {
+									return core.Style{
+										FlexShrink: 1,
+										MinWidth:   core.Pt(0),
+										Color:      a.paletteOf(cx).Text,
+										FontSize:   Tokens.FontRowTitle,
+										FontWeight: core.FontWeightMedium,
+									}
+								},
+							},
+							core.Text{
+								MaxLines:    1,
+								ContentFunc: func() string { return itemFn().InstanceName },
+								StyleFunc: func() core.Style {
+									return core.Style{
+										FlexShrink: 1,
+										MinWidth:   core.Pt(0),
+										Color:      a.paletteOf(cx).TextMuted,
+										FontSize:   Tokens.FontMonoMeta,
+										FontFamily: core.FontMonospace,
+									}
+								},
+							},
+						},
+					},
+					core.Text{
+						Content: "已完成",
+						StyleFunc: func() core.Style {
+							return core.Style{
+								FlexShrink: 0,
+								Color:      a.paletteOf(cx).Running,
+								FontSize:   Tokens.FontMonoMeta,
+								FontWeight: core.FontWeightMedium,
+							}
+						},
+					},
+				},
+			},
+			core.View{
+				StyleFunc: func() core.Style {
+					pal := a.paletteOf(cx)
+					return core.Style{
+						Background:   pal.Bg,
+						CornerRadius: core.Points(8),
+						Padding:      core.Symmetric(Tokens.Space2, core.Points(10)),
+					}
+				},
+				Children: []core.Node{
+					core.Text{
+						MaxLines: 2,
+						ContentFunc: func() string {
+							it := itemFn()
+							if it.Terminal.Status != nil && strings.TrimSpace(it.Terminal.Status.Msg) != "" {
+								return firstLine(it.Terminal.Status, it.Terminal)
+							}
+							return "任务已完成，点击查看详情"
+						},
+						StyleFunc: func() core.Style {
+							return core.Style{
+								Color:      a.paletteOf(cx).TextSecondary,
+								FontSize:   Tokens.FontMonoMeta,
+								FontFamily: core.FontMonospace,
+							}
+						},
+					},
+				},
+			},
+			core.View{
+				Style: core.Style{Direction: core.Row, Gap: Tokens.Space2},
+				Children: []core.Node{
+					core.View{
+						Style: core.Style{FlexGrow: 1},
+						Children: []core.Node{
+							compactBtn("complete-open-"+keyStr, "查看结果", ActionPrimary, func() {
+								if onOpen != nil {
+									onOpen(itemFn().Key)
+								}
+							}),
+						},
+					},
+					compactBtn("complete-dismiss-"+keyStr, "已读", ActionSecondary, func() {
+						if onDismiss != nil {
+							onDismiss(itemFn().Key)
+						}
+					}),
+				},
+			},
+		},
+	}
 }
 
 // FloatingTabBar renders the Quiet Studio 56px floating glass capsule 3-Tab bar (lay-home-float).
@@ -1553,7 +2195,7 @@ func FloatingTabBar(cx *core.Scope, a *App, activeTab *core.Signal[string]) core
 											Position:       core.Absolute,
 											Top:            core.Pt(-4),
 											Right:          core.Pt(-10),
-											Background:     pal.Warn,
+											Background:     attentionBadgeColor(pal, a),
 											CornerRadius:   Tokens.RadiusPill,
 											MinWidth:       core.Pt(16),
 											Height:         core.Pt(16),
@@ -1695,7 +2337,7 @@ func WideNavRail(cx *core.Scope, a *App, activeTab *core.Signal[string], onOpenS
 									Width:        core.Pt(7),
 									Height:       core.Pt(7),
 									CornerRadius: 4,
-									Background:   a.paletteOf(cx).Warn,
+									Background:   attentionBadgeColor(a.paletteOf(cx), a),
 								}
 							},
 						}

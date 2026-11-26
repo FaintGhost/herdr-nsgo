@@ -80,7 +80,10 @@ func TestSnapshotStoreInstantOpenAndLRU(t *testing.T) {
 
 	// Seed a brand-new ChatSessionController BEFORE any RefreshSync runs -> 0ms Frame-0 items!
 	ctrl := NewChatSessionController(nil, targetKey, nil, nil, nil)
-	if !ctrl.SeedFromSnapshot(store) {
+	if online := NewChatSessionController(nil, targetKey, nil, nil, nil); online.SeedFromSnapshot(store, &Terminal{Status: &Status{State: "working"}}) || len(online.Items()) > 0 {
+		t.Fatal("working session opened on old cached messages")
+	}
+	if !ctrl.SeedFromSnapshot(store, nil) {
 		t.Fatal("expected SeedFromSnapshot to hit cached snapshot")
 	}
 	if !ctrl.IsCachedSnapshot() {
@@ -187,8 +190,8 @@ func TestUIMoshiGlassComposerDiffSheetQuickSwitcherAndSubagents(t *testing.T) {
 		t.Fatalf("expected back at parent %v, got %v", parentKey, uiRef.activeSession.Get())
 	}
 
-	// 5. Tap Moshi thumb-level `>_ 终端` pill in floating composer -> switches to VT mode!
-	h.Press("id:chat-composer-vt-btn")
+	// The mode switch in the session header opens the terminal.
+	h.Press("id:session-mode-vt")
 	h.Find("id:vt-surface")
 	h.Find("id:keycap-rightclick")
 

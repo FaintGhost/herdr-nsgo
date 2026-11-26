@@ -8,7 +8,7 @@ import (
 )
 
 // inboxScreen renders the Quiet Studio Inbox ("待办") tab with reactive live search
-// and 3-bucket urgency grouping (权限审批 / 等待回答与认证 / 异常与限流), hiding empty buckets.
+// and 4-bucket urgency grouping (权限审批 / 等待回答与认证 / 异常与限流 / 汇报完成), hiding empty buckets.
 func (u *uiController) inboxScreen(cx *core.Scope, wide bool) core.Node {
 	a := u.app
 
@@ -24,6 +24,10 @@ func (u *uiController) inboxScreen(cx *core.Scope, wide bool) core.Node {
 			}
 		}
 		return perm, wait, errs
+	}
+
+	totalInbox := func() int {
+		return len(a.AggregatedAttention()) + len(a.AggregatedCompleted())
 	}
 
 	renderBucket := func(label string, itemsFn func() []AggregatedTerminal, tintFn func(Palette) core.Color) core.Node {
@@ -69,17 +73,26 @@ func (u *uiController) inboxScreen(cx *core.Scope, wide bool) core.Node {
 		},
 		Children: []core.Node{
 			TopHeader(cx, a, func() string {
-				n := len(a.AggregatedAttention())
+				n := totalInbox()
 				if n == 0 {
 					return "待办"
 				}
 				return fmt.Sprintf("待办 · %d", n)
 			}, nil, []core.Node{
+				core.Show{
+					When: func() bool { return len(a.AggregatedCompleted()) > 0 },
+					Then: func(cx *core.Scope) core.Node {
+						return FilterPill(cx, a, "inbox-mark-all-read", func() string { return "全部已读" }, func() bool { return false }, nil, func() {
+							animateSpringLayout(cx)
+							a.AcknowledgeAllCompleted()
+						})
+					},
+				},
 				IconTap(cx, a, "inbox-refresh-btn", "刷新", iconRefresh, func() {
-					a.Reconnect()
+					a.BeginResumeSync()
 				}),
 			}),
-			ToastBanner(cx, a),
+			SyncStatusBanner(cx, a),
 			// Rounded surface search field directly on canvas Bg
 			core.View{
 				Style: core.Style{
@@ -122,11 +135,26 @@ func (u *uiController) inboxScreen(cx *core.Scope, wide bool) core.Node {
 						},
 						Children: []core.Node{
 							core.Show{
-								When: func() bool { return len(a.AggregatedAttention()) == 0 },
+								When: func() bool {
+									syncing, _ := a.SyncStatus()
+									return totalInbox() == 0 && syncing && len(a.aggTerms.Get()) == 0
+								},
+								Then: func(cx *core.Scope) core.Node {
+									return HomeSkeletonFeed(cx, a, "inbox-connecting-skeleton")
+								},
+							},
+							core.Show{
+								When: func() bool {
+									syncing, _ := a.SyncStatus()
+									if syncing && len(a.aggTerms.Get()) == 0 {
+										return false
+									}
+									return totalInbox() == 0
+								},
 								Then: func(cx *core.Scope) core.Node {
 									return EmptyStateCard(cx, a,
-										"一切顺利，没有等待你确认的终端",
-										"当任何实例上的 Agent 请求权限、提问或报错时，会立刻置顶到这里并触发通知。",
+										"一切顺利，暂无待办或未读汇报",
+										"当任何实例上的 Agent 请求权限、提问、报错或汇报完成时，都会立刻显示在这里并通知你。",
 										"", "", nil,
 									)
 								},
@@ -143,6 +171,33 @@ func (u *uiController) inboxScreen(cx *core.Scope, wide bool) core.Node {
 								_, _, e := buckets()
 								return e
 							}, func(p Palette) core.Color { return p.Danger }),
+							core.Show{
+								When: func() bool { return len(a.AggregatedCompleted()) > 0 },
+								Then: func(cx *core.Scope) core.Node {
+									return core.View{
+										TestID: "inbox-completed-bucket",
+										Style:  core.Style{Gap: Tokens.Space2},
+										Children: []core.Node{
+											SectionHeaderTinted(cx, a, func() string {
+												return fmt.Sprintf("汇报完成 · %d", len(a.AggregatedCompleted()))
+											}, func(p Palette) core.Color { return p.Running }, nil),
+											core.Each(
+												a.AggregatedCompleted,
+												func(it AggregatedTerminal) string { return it.Key.String() },
+												func(cx *core.Scope, item func() AggregatedTerminal, _ func() int) core.Node {
+													return CompletionReportCard(cx, a, item, func(k TermKey) {
+														a.AcknowledgeCompleted(k)
+														u.openSession(cx, k)
+													}, func(k TermKey) {
+														animateSpringLayout(cx)
+														a.AcknowledgeCompleted(k)
+													})
+												},
+											),
+										},
+									}
+								},
+							},
 						},
 					},
 				},

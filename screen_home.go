@@ -235,7 +235,7 @@ func (u *uiController) homeScreen(cx *core.Scope, wide bool) core.Node {
 		},
 		Children: []core.Node{
 			TopHeader(cx, a, func() string { return "herdr" }, nil, headerRight),
-			ToastBanner(cx, a),
+			SyncStatusBanner(cx, a),
 			// Borderless horizontal instance filter pills directly on canvas Bg
 			core.Scroll{
 				Horizontal:    true,
@@ -423,10 +423,25 @@ func (u *uiController) homeScreen(cx *core.Scope, wide bool) core.Node {
 									}
 								},
 							},
-							// Empty state when neither working nor idle sessions match current filter
+							// Cold-start connecting skeleton (shown while dialing with no cached sessions yet)
 							core.Show{
 								When: func() bool {
 									w, r, _ := filteredBuckets()
+									syncing, _ := a.SyncStatus()
+									return len(w) == 0 && len(r) == 0 && syncing && a.searchQuery.Get() == ""
+								},
+								Then: func(cx *core.Scope) core.Node {
+									return HomeSkeletonFeed(cx, a, "home-connecting-skeleton")
+								},
+							},
+							// Empty state when neither working nor idle sessions match current filter (and not initial dialing)
+							core.Show{
+								When: func() bool {
+									w, r, _ := filteredBuckets()
+									syncing, _ := a.SyncStatus()
+									if syncing && a.searchQuery.Get() == "" {
+										return false
+									}
 									return len(w) == 0 && len(r) == 0
 								},
 								Then: func(cx *core.Scope) core.Node {
