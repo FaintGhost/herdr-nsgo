@@ -10,10 +10,30 @@ import (
 	"github.com/nsgo-dev/nsgo/ui"
 )
 
-// instancesScreen renders the multi-instance CorePool management tab:
-// online/offline cards, latency, CoreID, TOFU fingerprint badge, QR pairing & manual add.
-func (u *uiController) instancesScreen(cx *core.Scope) core.Node {
+// instancesScreen renders the Quiet Studio multi-instance CorePool management tab:
+// clean grouped cards, online emerald latency/count, TOFU shield line, quiet footer actions, and unified SheetModals.
+func (u *uiController) instancesScreen(cx *core.Scope, wide bool) core.Node {
 	a := u.app
+
+	headerRight := []core.Node{
+		IconTap(cx, a, "instances-qr-btn", "扫码配对", iconQR, func() {
+			u.openQRPairing(cx)
+		}),
+		IconTap(cx, a, "instances-add-btn", "手动添加实例", iconPlus, func() {
+			u.editingHost.Set(Host{UseLocalKey: true})
+			u.showAddInstance.Set(true)
+		}),
+	}
+	if !wide {
+		headerRight = append(headerRight, IconTap(cx, a, "instances-settings-btn", "设置", iconSettings, func() {
+			u.subPage.Set("settings")
+		}))
+	}
+
+	bottomPad := core.Points(96)
+	if wide {
+		bottomPad = Tokens.Space6
+	}
 
 	return core.View{
 		TestID: "screen-instances",
@@ -27,23 +47,21 @@ func (u *uiController) instancesScreen(cx *core.Scope) core.Node {
 			}
 		},
 		Children: []core.Node{
-			TopHeader(cx, a, func() string { return "实例" }, nil, []core.Node{
-				IconButton(cx, a, "instances-qr-btn", "扫码配对", iconQR, true, func() {
-					u.openQRPairing(cx)
-				}),
-				IconButton(cx, a, "instances-add-btn", "手动添加实例", iconPlus, false, func() {
-					u.editingHost.Set(Host{UseLocalKey: true})
-					u.showAddInstance.Set(true)
-				}),
-			}),
+			TopHeader(cx, a, func() string { return "实例" }, nil, headerRight),
 			ToastBanner(cx, a),
 			core.Scroll{
-				Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0)},
+				EdgeEffects: core.EdgeEffects{Top: core.EdgeEffectSoft, Bottom: core.EdgeEffectSoft},
+				Style:       core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0)},
 				Children: []core.Node{
 					core.View{
 						Style: core.Style{
-							Padding: core.All(Tokens.PagePadX),
-							Gap:     Tokens.Space3,
+							Padding: core.Edges{
+								Top:    Tokens.Space2,
+								Left:   Tokens.PagePadX,
+								Right:  Tokens.PagePadX,
+								Bottom: bottomPad,
+							},
+							Gap: Tokens.Space3,
 						},
 						Children: []core.Node{
 							core.Show{
@@ -88,196 +106,279 @@ func (u *uiController) instanceCard(cx *core.Scope, itemFn func() InstanceSnapsh
 		return ""
 	}
 
-	return core.View{
-		TestID: "instance-card-" + id,
-		StyleFunc: func() core.Style {
-			pal := a.paletteOf(cx)
-			return core.Style{
-				Background:   pal.Surface,
-				CornerRadius: Tokens.RadiusCard,
-				BorderWidth:  1,
-				BorderColor:  pal.Border,
-				Padding:      core.All(Tokens.Space3),
-				Gap:          Tokens.Space2,
-			}
+	quietAction := func(testID, label string, svg *core.SVG, danger bool, onPress func()) core.Node {
+		return core.View{
+			TestID: testID,
+			Role:   core.RoleButton,
+			OnPress: func(core.PressEvent) {
+				playSelectionHaptic(cx)
+				if onPress != nil {
+					onPress()
+				}
+			},
+			Style: core.Style{
+				Direction:  core.Row,
+				AlignItems: core.AlignCenter,
+				Gap:        core.Points(5),
+				MinHeight:  core.Pt(32),
+				Padding:    core.Symmetric(core.Points(4), core.Points(4)),
+			},
+			Children: []core.Node{
+				core.Icon{
+					SVG: svg,
+					StyleFunc: func() core.Style {
+						pal := a.paletteOf(cx)
+						fg := pal.TextSecondary
+						if danger {
+							fg = pal.Danger
+						}
+						return core.Style{Width: core.Pt(14), Height: core.Pt(14), Color: fg}
+					},
+				},
+				core.Text{
+					Content: label,
+					StyleFunc: func() core.Style {
+						pal := a.paletteOf(cx)
+						fg := pal.TextSecondary
+						if danger {
+							fg = pal.Danger
+						}
+						return core.Style{
+							Color:      fg,
+							FontSize:   Tokens.FontCaption,
+							FontWeight: core.FontWeightMedium,
+						}
+					},
+				},
+			},
+		}
+	}
+
+	return GroupCard(cx, a, "instance-card-"+id, []core.Node{
+		core.View{
+			Style: core.Style{
+				Padding: core.All(core.Points(14)),
+				Gap:     Tokens.Space2,
+			},
+			Children: []core.Node{
+				// Top line: 8px semantic dot + Instance name + right mono latency/count
+				core.View{
+					Style: core.Style{
+						Direction:      core.Row,
+						AlignItems:     core.AlignCenter,
+						JustifyContent: core.JustifySpaceBetween,
+						Gap:            Tokens.Space2,
+					},
+					Children: []core.Node{
+						core.View{
+							Style: core.Style{
+								Direction:  core.Row,
+								AlignItems: core.AlignCenter,
+								Gap:        Tokens.Space2,
+								FlexShrink: 1,
+								MinWidth:   core.Pt(0),
+							},
+							Children: []core.Node{
+								core.View{
+									StyleFunc: func() core.Style {
+										pal := a.paletteOf(cx)
+										s := itemFn()
+										c := pal.Fill
+										if s.Online {
+											c = pal.Running
+										} else if s.State == stateFailed {
+											c = pal.Danger
+										} else if s.State == stateDialing {
+											c = pal.Warn
+										}
+										return core.Style{
+											FlexShrink:   0,
+											Width:        core.Pt(8),
+											Height:       core.Pt(8),
+											CornerRadius: 4,
+											Background:   c,
+										}
+									},
+								},
+								core.Text{
+									MaxLines:    1,
+									ContentFunc: func() string { return itemFn().InstanceName },
+									StyleFunc: func() core.Style {
+										pal := a.paletteOf(cx)
+										return core.Style{
+											FlexShrink: 1,
+											MinWidth:   core.Pt(0),
+											Color:      pal.Text,
+											FontSize:   Tokens.FontRowTitle,
+											FontWeight: core.FontWeightMedium,
+										}
+									},
+								},
+							},
+						},
+						core.Text{
+							ContentFunc: func() string {
+								s := itemFn()
+								if s.Online {
+									if s.LatencyMS > 0 {
+										return fmt.Sprintf("%dms · %d 会话", s.LatencyMS, len(s.Terminals))
+									}
+									return fmt.Sprintf("在线 · %d 会话", len(s.Terminals))
+								}
+								if s.State == stateDialing {
+									return "连接中…"
+								}
+								return "离线"
+							},
+							StyleFunc: func() core.Style {
+								pal := a.paletteOf(cx)
+								s := itemFn()
+								fg := pal.TextMuted
+								if s.Online {
+									fg = pal.Running
+								} else if s.State == stateFailed {
+									fg = pal.Danger
+								} else if s.State == stateDialing {
+									fg = pal.Warn
+								}
+								return core.Style{
+									FlexShrink: 0,
+									Color:      fg,
+									FontSize:   Tokens.FontMonoMeta,
+									FontFamily: core.FontMonospace,
+									FontWeight: core.FontWeightMedium,
+								}
+							},
+						},
+					},
+				},
+				// Target + CoreID metadata
+				core.Text{
+					MaxLines: 1,
+					ContentFunc: func() string {
+						s := itemFn()
+						parts := []string{}
+						if s.User != "" && s.Target != "" {
+							parts = append(parts, s.User+"@"+s.Target)
+						} else if s.Target != "" {
+							parts = append(parts, s.Target)
+						}
+						if s.CoreID != "" {
+							parts = append(parts, "core:"+s.CoreID)
+						}
+						if len(s.Machines) > 0 {
+							parts = append(parts, fmt.Sprintf("联邦 +%d", len(s.Machines)))
+						}
+						return strings.Join(parts, " · ")
+					},
+					StyleFunc: func() core.Style {
+						pal := a.paletteOf(cx)
+						return core.Style{
+							Color:      pal.TextSecondary,
+							FontSize:   Tokens.FontMonoMeta,
+							FontFamily: core.FontMonospace,
+						}
+					},
+				},
+				// TOFU Fingerprint shield line
+				core.Show{
+					When: func() bool { return findTOFU(itemFn().InstanceID) != "" },
+					Then: func(cx *core.Scope) core.Node {
+						return core.View{
+							Style: core.Style{
+								Direction:  core.Row,
+								AlignItems: core.AlignCenter,
+								Gap:        core.Points(5),
+							},
+							Children: []core.Node{
+								core.Icon{
+									SVG: iconShield,
+									StyleFunc: func() core.Style {
+										return core.Style{Width: core.Pt(13), Height: core.Pt(13), FlexShrink: 0, Color: a.paletteOf(cx).TextMuted}
+									},
+								},
+								core.Text{
+									MaxLines: 1,
+									ContentFunc: func() string {
+										fp := findTOFU(itemFn().InstanceID)
+										if len(fp) > 28 {
+											fp = fp[:28] + "…"
+										}
+										return "TOFU " + fp
+									},
+									StyleFunc: func() core.Style {
+										pal := a.paletteOf(cx)
+										return core.Style{
+											FlexShrink: 1,
+											MinWidth:   core.Pt(0),
+											Color:      pal.TextMuted,
+											FontSize:   Tokens.FontMonoMeta,
+											FontFamily: core.FontMonospace,
+										}
+									},
+								},
+							},
+						}
+					},
+				},
+				// Error problem banner if present
+				core.Show{
+					When: func() bool { return itemFn().Problem != "" },
+					Then: func(cx *core.Scope) core.Node {
+						return core.Text{
+							ContentFunc: func() string { return itemFn().Problem },
+							StyleFunc: func() core.Style {
+								pal := a.paletteOf(cx)
+								return core.Style{
+									Color:    pal.Danger,
+									FontSize: Tokens.FontCaption,
+								}
+							},
+						}
+					},
+				},
+			},
 		},
-		Children: []core.Node{
-			// Top line: Instance name + online status pill
-			core.View{
-				Style: core.Style{
+		// Quiet bottom hairline footer with text+icon actions
+		core.View{
+			StyleFunc: func() core.Style {
+				pal := a.paletteOf(cx)
+				return core.Style{
 					Direction:      core.Row,
 					AlignItems:     core.AlignCenter,
 					JustifyContent: core.JustifySpaceBetween,
-					Gap:            Tokens.Space2,
-				},
-				Children: []core.Node{
-					core.View{
-						Style: core.Style{
-							Direction:  core.Row,
-							AlignItems: core.AlignCenter,
-							Gap:        Tokens.Space2,
-						},
-						Children: []core.Node{
-							core.View{
-								StyleFunc: func() core.Style {
-									pal := a.paletteOf(cx)
-									s := itemFn()
-									c := pal.TextMuted
-									if s.Online {
-										c = pal.Accent
-									} else if s.State == stateFailed {
-										c = pal.Danger
-									} else if s.State == stateDialing {
-										c = pal.Warn
-									}
-									return core.Style{
-										Width:        core.Pt(9),
-										Height:       core.Pt(9),
-										CornerRadius: 5,
-										Background:   c,
-									}
-								},
-							},
-							core.Text{
-								ContentFunc: func() string { return itemFn().InstanceName },
-								StyleFunc: func() core.Style {
-									pal := a.paletteOf(cx)
-									return core.Style{
-										Color:      pal.Text,
-										FontSize:   Tokens.FontRowTitle,
-										FontWeight: core.FontWeightSemibold,
-									}
-								},
-							},
-						},
-					},
-					core.Text{
-						ContentFunc: func() string {
-							s := itemFn()
-							if s.Online {
-								if s.LatencyMS > 0 {
-									return fmt.Sprintf("在线 · %dms · %d 会话", s.LatencyMS, len(s.Terminals))
+					Borders:        core.Edges{Top: 1},
+					BorderColor:    pal.Separator,
+					Padding:        core.Symmetric(Tokens.Space1, core.Points(12)),
+				}
+			},
+			Children: []core.Node{
+				core.View{
+					Style: core.Style{Direction: core.Row, AlignItems: core.AlignCenter, Gap: Tokens.Space3},
+					Children: []core.Node{
+						quietAction("inst-reconnect-"+id, "重连", iconRefresh, false, func() {
+							a.ReconnectInstance(itemFn().InstanceID)
+						}),
+						quietAction("inst-edit-"+id, "编辑", iconPencil, false, func() {
+							cur := itemFn()
+							h := Host{ID: cur.InstanceID, Label: cur.InstanceName, Target: cur.Target, User: cur.User, UseLocalKey: true}
+							for _, saved := range a.Hosts() {
+								if saved.EffectiveID() == cur.InstanceID {
+									h = saved
+									break
 								}
-								return fmt.Sprintf("在线 · %d 会话", len(s.Terminals))
 							}
-							if s.State == stateDialing {
-								return "连接中…"
-							}
-							return "离线"
-						},
-						StyleFunc: func() core.Style {
-							pal := a.paletteOf(cx)
-							s := itemFn()
-							fg := pal.TextMuted
-							if s.Online {
-								fg = pal.Accent
-							} else if s.State == stateFailed {
-								fg = pal.Danger
-							}
-							return core.Style{
-								Color:      fg,
-								FontSize:   Tokens.FontMonoMeta,
-								FontWeight: core.FontWeightSemibold,
-							}
-						},
+							u.editingHost.Set(h)
+							u.showAddInstance.Set(true)
+						}),
 					},
 				},
-			},
-			// Target + CoreID metadata
-			core.Text{
-				ContentFunc: func() string {
-					s := itemFn()
-					parts := []string{}
-					if s.User != "" && s.Target != "" {
-						parts = append(parts, s.User+"@"+s.Target)
-					} else if s.Target != "" {
-						parts = append(parts, s.Target)
-					}
-					if s.CoreID != "" {
-						parts = append(parts, "core:"+s.CoreID)
-					}
-					if len(s.Machines) > 0 {
-						parts = append(parts, fmt.Sprintf("联邦 +%d", len(s.Machines)))
-					}
-					return strings.Join(parts, " · ")
-				},
-				StyleFunc: func() core.Style {
-					pal := a.paletteOf(cx)
-					return core.Style{
-						Color:      pal.TextSecondary,
-						FontSize:   Tokens.FontMonoMeta,
-						FontFamily: core.FontMonospace,
-					}
-				},
-			},
-			// TOFU Fingerprint badge
-			core.Show{
-				When: func() bool { return findTOFU(itemFn().InstanceID) != "" },
-				Then: func(cx *core.Scope) core.Node {
-					return core.Text{
-						ContentFunc: func() string {
-							fp := findTOFU(itemFn().InstanceID)
-							if len(fp) > 28 {
-								fp = fp[:28] + "…"
-							}
-							return "TOFU 指纹: " + fp
-						},
-						StyleFunc: func() core.Style {
-							pal := a.paletteOf(cx)
-							return core.Style{
-								Color:      pal.TextMuted,
-								FontSize:   Tokens.FontMonoMeta,
-								FontFamily: core.FontMonospace,
-							}
-						},
-					}
-				},
-			},
-			// Error problem banner if present
-			core.Show{
-				When: func() bool { return itemFn().Problem != "" },
-				Then: func(cx *core.Scope) core.Node {
-					return core.Text{
-						ContentFunc: func() string { return itemFn().Problem },
-						StyleFunc: func() core.Style {
-							pal := a.paletteOf(cx)
-							return core.Style{
-								Color:    pal.Danger,
-								FontSize: Tokens.FontCaption,
-							}
-						},
-					}
-				},
-			},
-			// Action buttons
-			core.View{
-				Style: core.Style{
-					Direction: core.Row,
-					Gap:       Tokens.Space2,
-				},
-				Children: []core.Node{
-					ActionButton(cx, a, "inst-reconnect-"+id, "重连", ActionSecondary, func() {
-						a.ReconnectInstance(itemFn().InstanceID)
-					}),
-					ActionButton(cx, a, "inst-edit-"+id, "编辑", ActionGhost, func() {
-						cur := itemFn()
-						h := Host{ID: cur.InstanceID, Label: cur.InstanceName, Target: cur.Target, User: cur.User, UseLocalKey: true}
-						for _, saved := range a.Hosts() {
-							if saved.EffectiveID() == cur.InstanceID {
-								h = saved
-								break
-							}
-						}
-						u.editingHost.Set(h)
-						u.showAddInstance.Set(true)
-					}),
-					ActionButton(cx, a, "inst-delete-"+id, "删除", ActionDanger, func() {
-						a.RemoveHost(itemFn().InstanceID)
-					}),
-				},
+				quietAction("inst-delete-"+id, "删除", iconTrash, true, func() {
+					a.RemoveHost(itemFn().InstanceID)
+				}),
 			},
 		},
-	}
+	})
 }
 
 // addInstanceModal renders the manual SSH instance creation / edit form with live connection test.
@@ -389,7 +490,7 @@ func (u *uiController) addInstanceModal(cx *core.Scope) core.Node {
 						pal := a.paletteOf(cx)
 						fg := pal.TextSecondary
 						if strings.HasPrefix(testStatus.Get(), "成功") {
-							fg = pal.Accent
+							fg = pal.Running
 						} else if strings.HasPrefix(testStatus.Get(), "失败") {
 							fg = pal.Danger
 						}

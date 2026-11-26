@@ -1,10 +1,11 @@
 // Command herdr-nsgo is a cross-platform mobile and desktop client for herdr-core:
 // concurrent multi-instance SSH + framed binary VT multiplexing, Agent semantic approval
-// cards, TOFU security pinning, and Crisp Slate Light/Dark design system.
+// cards, TOFU security pinning, and Quiet Studio Light/Dark design system.
 package main
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -126,25 +127,37 @@ func rootWithController(cx *core.Scope, app *App) (core.Node, *uiController) {
 		})
 	}
 
-	// Render the primary 3-Tab navigation column (used full-screen on phone, or as left sidebar on >=680px).
-	tabShell := func(cx *core.Scope) core.Node {
+	// Render active primary tab content (shared by phone floating shell and wide 280px sidebar).
+	tabContent := func(cx *core.Scope, wide bool) core.Node {
+		return core.Show{
+			When: func() bool { return u.activeTab.Get() == "inbox" },
+			Then: func(cx *core.Scope) core.Node { return u.inboxScreen(cx, wide) },
+			Else: func(cx *core.Scope) core.Node {
+				return core.Show{
+					When: func() bool { return u.activeTab.Get() == "instances" },
+					Then: func(cx *core.Scope) core.Node { return u.instancesScreen(cx, wide) },
+					Else: func(cx *core.Scope) core.Node { return u.homeScreen(cx, wide) },
+				}
+			},
+		}
+	}
+
+	// Compact phone shell: primary tab feed with floating glass capsule TabBar overlaid at bottom.
+	phoneTabShell := func(cx *core.Scope) core.Node {
 		return core.View{
-			Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0), Width: core.Pct(100), Height: core.Pct(100)},
+			Style: core.Style{
+				Position:   core.Relative,
+				FlexGrow:   1,
+				FlexShrink: 1,
+				MinHeight:  core.Pt(0),
+				Width:      core.Pct(100),
+				Height:     core.Pct(100),
+			},
 			Children: []core.Node{
 				core.View{
 					Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0), Overflow: core.Hidden},
 					Children: []core.Node{
-						core.Show{
-							When: func() bool { return u.activeTab.Get() == "inbox" },
-							Then: func(cx *core.Scope) core.Node { return u.inboxScreen(cx) },
-							Else: func(cx *core.Scope) core.Node {
-								return core.Show{
-									When: func() bool { return u.activeTab.Get() == "instances" },
-									Then: func(cx *core.Scope) core.Node { return u.instancesScreen(cx) },
-									Else: func(cx *core.Scope) core.Node { return u.homeScreen(cx) },
-								}
-							},
-						},
+						tabContent(cx, false),
 					},
 				},
 				TabBar(cx, app, u.activeTab),
@@ -190,11 +203,14 @@ func rootWithController(cx *core.Scope, app *App) (core.Node, *uiController) {
 									return core.Show{
 										When: isWide,
 										Then: func(cx *core.Scope) core.Node {
-											// Wide >=680px Split Pane layout (Sidebar 280px + Right Session VT)
+											// Wide >=680px 3-pane layout (56px WideNavRail + 280px Sidebar + Right Live Session Pane)
 											return core.View{
 												TestID: "split-pane-layout",
 												Style:  core.Style{Direction: core.Row, FlexGrow: 1, Width: core.Pct(100), Height: core.Pct(100)},
 												Children: []core.Node{
+													WideNavRail(cx, app, u.activeTab, func() {
+														u.subPage.Set("settings")
+													}),
 													core.View{
 														StyleFunc: func() core.Style {
 															pal := app.paletteOf(cx)
@@ -203,12 +219,13 @@ func rootWithController(cx *core.Scope, app *App) (core.Node, *uiController) {
 																Height:      core.Pct(100),
 																Borders:     core.Edges{Right: 1},
 																BorderColor: pal.Separator,
+																Overflow:    core.Hidden,
 															}
 														},
-														Children: []core.Node{tabShell(cx)},
+														Children: []core.Node{tabContent(cx, true)},
 													},
 													core.View{
-														Style: core.Style{FlexGrow: 1, Height: core.Pct(100)},
+														Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinWidth: core.Pt(0), Height: core.Pct(100)},
 														Children: []core.Node{
 															core.Show{
 																When: func() bool { return u.activeSession.Get() != (TermKey{}) },
@@ -217,7 +234,7 @@ func rootWithController(cx *core.Scope, app *App) (core.Node, *uiController) {
 																	return core.View{
 																		Style: core.Style{FlexGrow: 1, AlignItems: core.AlignCenter, JustifyContent: core.JustifyCenter, Padding: core.All(Tokens.Space6)},
 																		Children: []core.Node{
-																			EmptyStateCard(cx, app, "选择一个会话开始查看", "点击左侧任意终端即可在此实时呈现完整 VT 终端与快捷键栏。", "", "", nil),
+																			EmptyStateCard(cx, app, "选择一个会话开始查看", "点击左侧任意会话即可在此实时查看对话流与完整 VT 终端。", "", "", nil),
 																		},
 																	}
 																},
@@ -228,11 +245,11 @@ func rootWithController(cx *core.Scope, app *App) (core.Node, *uiController) {
 											}
 										},
 										Else: func(cx *core.Scope) core.Node {
-											// Compact phone layout: Session pushes full-screen over 3-Tab shell
+											// Compact phone layout: Session pushes full-screen over floating 3-Tab shell
 											return core.Show{
 												When: func() bool { return u.activeSession.Get() != (TermKey{}) },
 												Then: func(cx *core.Scope) core.Node { return u.sessionScreen(cx, true) },
-												Else: tabShell,
+												Else: phoneTabShell,
 											}
 										},
 									}
@@ -335,7 +352,13 @@ func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 		func() string { return st.Screen().PlainText() },
 	)
 	if u.app.frameCacheOn.Get() && u.app.snapshots != nil {
-		chatCtrl.SeedFromSnapshot(u.app.snapshots)
+		var live *Terminal
+		if u.app.pool.ClientFor(key.InstanceID) != nil {
+			if at, ok := u.app.FindTerminal(key); ok {
+				live = &at.Terminal
+			}
+		}
+		chatCtrl.SeedFromSnapshot(u.app.snapshots, live)
 	}
 
 	attachWithMode := func(obs bool, cols, rows int) {
@@ -368,14 +391,27 @@ func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 				Rows:                rows,
 			})
 			if err != nil {
+				if u.attachGen.Load() != gen {
+					return
+				}
+				if rpc, ok := errors.AsType[*RPCError](err); ok && rpc.Kind() == "not_found" {
+					u.app.pool.RefreshInstance(key.InstanceID)
+					u.app.post(func() {
+						if u.attachGen.Load() == gen && st.diag != nil {
+							st.diag.Set("远端找不到终端 " + key.Addr + "。")
+						}
+					})
+					return
+				}
 				st.SetDiag("attach 失败，尝试读取快照：" + err.Error())
 				if r, rerr := client.Read(ctx, key.Addr, 200); rerr == nil && r.Text != "" {
 					st.Feed([]byte(strings.ReplaceAll(r.Text, "\n", "\r\n")))
 					u.app.post(func() { st.ScrollToBottom() })
 					return
 				}
-				st.SetDiag("无法接入终端流：" + explain(err))
-				u.app.notifyToast("无法接入终端流：" + explain(err))
+				if u.attachGen.Load() == gen {
+					st.SetDiag("无法接入终端流：" + explain(err))
+				}
 				return
 			}
 			// Atomic token check (safe off UI thread): drop stream if user switched away.

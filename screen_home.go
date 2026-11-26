@@ -7,10 +7,10 @@ import (
 	"github.com/nsgo-dev/nsgo/ui"
 )
 
-// homeScreen renders the Moshi Home V2 attention-priority Home tab:
-// crisp top bar, live search box, deduplicated multi-instance filter pills,
-// and status-priority sections ("需要你" inline approvals -> "运行中" -> collapsible "就绪与空闲" -> "已结束").
-func (u *uiController) homeScreen(cx *core.Scope) core.Node {
+// homeScreen renders the Quiet Studio attention-priority Home tab:
+// borderless top header, pill host filters directly on Bg, and grouped inset cards
+// ("需要你" inline approvals -> "运行中" -> collapsible "就绪与空闲" -> subtle "已结束").
+func (u *uiController) homeScreen(cx *core.Scope, wide bool) core.Node {
 	a := u.app
 	showSearch := core.NewSignal(cx, false)
 	showIdle := core.NewSignal(cx, true)
@@ -58,7 +58,7 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 		return working, rest, fin
 	}
 
-	renderSessionGroupItem := func(cx *core.Scope, item func() SessionGroup, _ func() int) core.Node {
+	renderSessionGroupItem := func(cx *core.Scope, item func() SessionGroup, idx func() int) core.Node {
 		g0 := item()
 		rootKey := g0.Primary.Key.String()
 		isExpanded := func() bool {
@@ -69,21 +69,24 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 			return g.AttentionChildren > 0
 		}
 		return core.View{
-			Style: core.Style{Gap: core.Points(4)},
 			Children: []core.Node{
+				core.Show{
+					When: func() bool { return idx() > 0 },
+					Then: func(cx *core.Scope) core.Node { return InsetDivider(cx, a, 34) },
+				},
 				SessionRow(cx, a, func() AggregatedTerminal { return item().Primary }, func() bool {
 					return u.activeSession.Get() == item().Primary.Key
 				}, func(k TermKey) {
 					u.openSession(cx, k)
 				}),
-				// Sub-sessions toggle chip when parent spawned child terminals
+				// Sub-sessions disclosure row when parent spawned child terminals
 				core.Show{
 					When: func() bool { return len(item().Children) > 0 },
 					Then: func(cx *core.Scope) core.Node {
 						return core.View{
 							Style: core.Style{
-								Padding: core.Edges{Left: Tokens.Space3},
-								Gap:     core.Points(5),
+								Padding: core.Edges{Left: 34, Right: 14, Bottom: Tokens.Space2},
+								Gap:     Tokens.Space1,
 							},
 							Children: []core.Node{
 								core.View{
@@ -93,42 +96,63 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 										toggleGroup(rootKey)
 									},
 									StyleFunc: func() core.Style {
-										pal := a.paletteOf(cx)
 										return core.Style{
-											Direction:    core.Row,
-											AlignItems:   core.AlignCenter,
-											AlignSelf:    core.AlignStart,
-											Gap:          core.Points(6),
-											Background:   pal.SurfaceRaised,
-											BorderWidth:  1,
-											BorderColor:  pal.Border,
-											CornerRadius: Tokens.RadiusKey,
-											Padding:      core.Symmetric(core.Points(4), core.Points(10)),
+											Direction:  core.Row,
+											AlignItems: core.AlignCenter,
+											AlignSelf:  core.AlignStart,
+											Gap:        core.Points(4),
+											Padding:    core.Symmetric(core.Points(4), core.Points(2)),
 										}
 									},
 									Children: []core.Node{
+										core.Icon{
+											SVG: iconSubagent,
+											StyleFunc: func() core.Style {
+												pal := a.paletteOf(cx)
+												fg := pal.TextMuted
+												if item().AttentionChildren > 0 {
+													fg = pal.Warn
+												}
+												return core.Style{Width: core.Pt(13), Height: core.Pt(13), Color: fg}
+											},
+										},
 										core.Text{
 											ContentFunc: func() string {
 												g := item()
-												arrow := "▸"
-												if isExpanded() {
-													arrow = "▾"
-												}
 												if g.ActiveChildren > 0 {
-													return fmt.Sprintf("%s %d 个子会话（%d 活跃）", arrow, len(g.Children), g.ActiveChildren)
+													return fmt.Sprintf("%d 个子会话 · %d 活跃", len(g.Children), g.ActiveChildren)
 												}
-												return fmt.Sprintf("%s %d 个子会话", arrow, len(g.Children))
+												return fmt.Sprintf("%d 个子会话", len(g.Children))
 											},
 											StyleFunc: func() core.Style {
 												pal := a.paletteOf(cx)
-												fg := pal.TextSecondary
+												fg := pal.TextMuted
 												if item().AttentionChildren > 0 {
 													fg = pal.Warn
 												}
 												return core.Style{
 													Color:      fg,
 													FontSize:   Tokens.FontMonoMeta,
-													FontWeight: core.FontWeightSemibold,
+													FontWeight: core.FontWeightMedium,
+												}
+											},
+										},
+										core.Show{
+											When: isExpanded,
+											Then: func(cx *core.Scope) core.Node {
+												return core.Icon{
+													SVG: iconChevronU,
+													StyleFunc: func() core.Style {
+														return core.Style{Width: core.Pt(13), Height: core.Pt(13), Color: a.paletteOf(cx).TextMuted}
+													},
+												}
+											},
+											Else: func(cx *core.Scope) core.Node {
+												return core.Icon{
+													SVG: iconChevronD,
+													StyleFunc: func() core.Style {
+														return core.Style{Width: core.Pt(13), Height: core.Pt(13), Color: a.paletteOf(cx).TextMuted}
+													},
 												}
 											},
 										},
@@ -144,19 +168,26 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 													Borders:     core.Edges{Left: 2},
 													BorderColor: pal.Separator,
 													Padding:     core.Edges{Left: Tokens.Space2},
-													Gap:         core.Points(6),
 												}
 											},
 											Children: []core.Node{
 												core.Each(
 													func() []AggregatedTerminal { return item().Children },
 													func(ch AggregatedTerminal) string { return ch.Key.String() },
-													func(cx *core.Scope, chItem func() AggregatedTerminal, _ func() int) core.Node {
-														return SessionRow(cx, a, chItem, func() bool {
-															return u.activeSession.Get() == chItem().Key
-														}, func(k TermKey) {
-															u.openSession(cx, k)
-														})
+													func(cx *core.Scope, chItem func() AggregatedTerminal, chIdx func() int) core.Node {
+														return core.View{
+															Children: []core.Node{
+																core.Show{
+																	When: func() bool { return chIdx() > 0 },
+																	Then: func(cx *core.Scope) core.Node { return InsetDivider(cx, a, 34) },
+																},
+																SessionRow(cx, a, chItem, func() bool {
+																	return u.activeSession.Get() == chItem().Key
+																}, func(k TermKey) {
+																	u.openSession(cx, k)
+																}),
+															},
+														}
 													},
 												),
 											},
@@ -171,6 +202,26 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 		}
 	}
 
+	headerRight := []core.Node{
+		IconTap(cx, a, "home-search-btn", "搜索会话", iconSearch, func() {
+			animateSpringLayout(cx)
+			showSearch.Set(!showSearch.Get())
+		}),
+		IconTap(cx, a, "fab-new-session", "新建会话", iconPlus, func() {
+			u.showNewSession.Set(true)
+		}),
+	}
+	if !wide {
+		headerRight = append(headerRight, IconTap(cx, a, "home-settings-btn", "设置", iconSettings, func() {
+			u.subPage.Set("settings")
+		}))
+	}
+
+	bottomPad := core.Points(96)
+	if wide {
+		bottomPad = Tokens.Space6
+	}
+
 	return core.View{
 		TestID: "screen-home",
 		StyleFunc: func() core.Style {
@@ -183,38 +234,19 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 			}
 		},
 		Children: []core.Node{
-			TopHeader(cx, a, func() string { return "herdr" }, nil, []core.Node{
-				IconButton(cx, a, "home-search-btn", "搜索会话", iconSearch, false, func() {
-					animateSpringLayout(cx)
-					showSearch.Set(!showSearch.Get())
-				}),
-				IconButton(cx, a, "fab-new-session", "新建会话", iconPlus, true, func() {
-					u.showNewSession.Set(true)
-				}),
-				IconButton(cx, a, "home-settings-btn", "设置", iconSettings, false, func() {
-					u.subPage.Set("settings")
-				}),
-			}),
+			TopHeader(cx, a, func() string { return "herdr" }, nil, headerRight),
 			ToastBanner(cx, a),
-			// Top horizontal instance filter pills (NoShrink prevents vertical clipping!)
+			// Borderless horizontal instance filter pills directly on canvas Bg
 			core.Scroll{
 				Horizontal:    true,
 				NoShrink:      true,
 				HideIndicator: true,
-				StyleFunc: func() core.Style {
-					pal := a.paletteOf(cx)
-					return core.Style{
-						Background:  pal.Surface,
-						Borders:     core.Edges{Bottom: 1},
-						BorderColor: pal.Separator,
-					}
-				},
 				Children: []core.Node{
 					core.View{
 						Style: core.Style{
 							Direction: core.Row,
 							Gap:       Tokens.Space2,
-							Padding:   core.Symmetric(Tokens.Space2, Tokens.PagePadX),
+							Padding:   core.Edges{Top: Tokens.Space1, Bottom: Tokens.Space2, Left: Tokens.PagePadX, Right: Tokens.PagePadX},
 						},
 						Children: []core.Node{
 							FilterPill(cx, a, "pill-all", func() string {
@@ -252,19 +284,13 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 					},
 				},
 			},
-			// Collapsible live search box
+			// Collapsible live search box on canvas Bg
 			core.Show{
 				When: showSearch.Get,
 				Then: func(cx *core.Scope) core.Node {
 					return core.View{
-						StyleFunc: func() core.Style {
-							pal := a.paletteOf(cx)
-							return core.Style{
-								Background:  pal.Surface,
-								Padding:     core.Symmetric(Tokens.Space2, Tokens.PagePadX),
-								Borders:     core.Edges{Bottom: 1},
-								BorderColor: pal.Separator,
-							}
+						Style: core.Style{
+							Padding: core.Edges{Top: Tokens.Space1, Bottom: Tokens.Space2, Left: Tokens.PagePadX, Right: Tokens.PagePadX},
 						},
 						Children: []core.Node{
 							ui.Input{
@@ -276,8 +302,8 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 									pal := a.paletteOf(cx)
 									return core.Style{
 										Width:        core.Pct(100),
-										MinHeight:    core.Pt(36),
-										Background:   pal.SurfaceRaised,
+										MinHeight:    core.Pt(Tokens.SizeTouch),
+										Background:   pal.Surface,
 										Color:        pal.Text,
 										CornerRadius: Tokens.RadiusCtrl,
 										BorderColor:  pal.Border,
@@ -289,18 +315,23 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 					}
 				},
 			},
-			// Main scrollable list
+			// Main scrollable feed
 			core.Scroll{
 				EdgeEffects: core.EdgeEffects{Top: core.EdgeEffectSoft, Bottom: core.EdgeEffectSoft},
 				Style:       core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0)},
 				Children: []core.Node{
 					core.View{
 						Style: core.Style{
-							Padding: core.All(Tokens.PagePadX),
-							Gap:     Tokens.Space4,
+							Padding: core.Edges{
+								Top:    Tokens.Space2,
+								Left:   Tokens.PagePadX,
+								Right:  Tokens.PagePadX,
+								Bottom: bottomPad,
+							},
+							Gap: Tokens.SectionGap,
 						},
 						Children: []core.Node{
-							// Any offline/error instance quick banner
+							// Offline/error instance alert banner
 							core.Show{
 								When: func() bool {
 									for _, inst := range a.instances.Get() {
@@ -315,11 +346,11 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 										StyleFunc: func() core.Style {
 											pal := a.paletteOf(cx)
 											return core.Style{
-												Background:   pal.DangerSoft,
-												BorderColor:  pal.Danger,
+												Background:   pal.Surface,
+												BorderColor:  pal.DangerSoft,
 												BorderWidth:  1,
 												CornerRadius: Tokens.RadiusCard,
-												Padding:      core.All(Tokens.Space3),
+												Padding:      core.All(core.Points(14)),
 												Gap:          Tokens.Space2,
 											}
 										},
@@ -348,7 +379,7 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 									}
 								},
 							},
-							// Section 1: "需要你" (Moshi Home V2 top-priority waiting / approval cards)
+							// Section 1: "需要你" (top-priority waiting / approval cards)
 							core.Show{
 								When: func() bool {
 									for _, it := range a.FilteredTerminals() {
@@ -362,7 +393,7 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 									return core.View{
 										Style: core.Style{Gap: Tokens.Space2},
 										Children: []core.Node{
-											SectionHeader(cx, a, func() string {
+											SectionHeaderTinted(cx, a, func() string {
 												n := 0
 												for _, it := range a.FilteredTerminals() {
 													if it.Terminal.NeedsYou() {
@@ -370,7 +401,7 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 													}
 												}
 												return fmt.Sprintf("需要你 · %d", n)
-											}, nil),
+											}, func(p Palette) core.Color { return p.Warn }, nil),
 											core.Each(
 												func() []AggregatedTerminal {
 													var out []AggregatedTerminal
@@ -408,7 +439,7 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 									)
 								},
 							},
-							// Section 2: "运行中" (Active working agents)
+							// Section 2: "运行中" (Grouped inset card)
 							core.Show{
 								When: func() bool {
 									w, _, _ := filteredBuckets()
@@ -416,25 +447,27 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 								},
 								Then: func(cx *core.Scope) core.Node {
 									return core.View{
-										Style: core.Style{Gap: Tokens.RowGap},
+										Style: core.Style{Gap: Tokens.Space2},
 										Children: []core.Node{
 											SectionHeader(cx, a, func() string {
 												w, _, _ := filteredBuckets()
 												return fmt.Sprintf("运行中 · %d", len(w))
 											}, nil),
-											core.Each(
-												func() []SessionGroup {
-													w, _, _ := filteredBuckets()
-													return w
-												},
-												func(g SessionGroup) string { return g.Primary.Key.String() },
-												renderSessionGroupItem,
-											),
+											GroupCard(cx, a, "home-group-working", []core.Node{
+												core.Each(
+													func() []SessionGroup {
+														w, _, _ := filteredBuckets()
+														return w
+													},
+													func(g SessionGroup) string { return g.Primary.Key.String() },
+													renderSessionGroupItem,
+												),
+											}),
 										},
 									}
 								},
 							},
-							// Section 3: "就绪与空闲" (Open by default, 1-tap collapsible like Moshi Home V2 Idle section!)
+							// Section 3: "就绪与空闲" (Grouped inset card with subtle right collapse text+chevron)
 							core.Show{
 								When: func() bool {
 									_, r, _ := filteredBuckets()
@@ -442,43 +475,82 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 								},
 								Then: func(cx *core.Scope) core.Node {
 									return core.View{
-										Style: core.Style{Gap: Tokens.RowGap},
+										Style: core.Style{Gap: Tokens.Space2},
 										Children: []core.Node{
 											SectionHeader(cx, a, func() string {
 												_, r, _ := filteredBuckets()
 												return fmt.Sprintf("就绪与空闲 · %d", len(r))
-											}, FilterPill(cx, a, "home-idle-toggle", func() string {
-												if showIdle.Get() {
-													return "收起 ▴"
-												}
-												return "展开 ▾"
-											}, showIdle.Get, nil, func() {
-												animateSpringLayout(cx)
-												showIdle.Set(!showIdle.Get())
-											})),
+											}, core.View{
+												TestID: "home-idle-toggle",
+												Role:   core.RoleButton,
+												OnPress: func(core.PressEvent) {
+													animateSpringLayout(cx)
+													playSelectionHaptic(cx)
+													showIdle.Set(!showIdle.Get())
+												},
+												Style: core.Style{
+													Direction:  core.Row,
+													AlignItems: core.AlignCenter,
+													Gap:        core.Points(3),
+													Padding:    core.Symmetric(core.Points(4), core.Points(4)),
+												},
+												Children: []core.Node{
+													core.Text{
+														ContentFunc: func() string {
+															if showIdle.Get() {
+																return "收起"
+															}
+															return "展开"
+														},
+														StyleFunc: func() core.Style {
+															return core.Style{
+																Color:      a.paletteOf(cx).TextMuted,
+																FontSize:   Tokens.FontSection,
+																FontWeight: core.FontWeightMedium,
+															}
+														},
+													},
+													core.Show{
+														When: showIdle.Get,
+														Then: func(cx *core.Scope) core.Node {
+															return core.Icon{
+																SVG: iconChevronU,
+																StyleFunc: func() core.Style {
+																	return core.Style{Width: core.Pt(13), Height: core.Pt(13), Color: a.paletteOf(cx).TextMuted}
+																},
+															}
+														},
+														Else: func(cx *core.Scope) core.Node {
+															return core.Icon{
+																SVG: iconChevronD,
+																StyleFunc: func() core.Style {
+																	return core.Style{Width: core.Pt(13), Height: core.Pt(13), Color: a.paletteOf(cx).TextMuted}
+																},
+															}
+														},
+													},
+												},
+											}),
 											core.Show{
 												When: showIdle.Get,
 												Then: func(cx *core.Scope) core.Node {
-													return core.View{
-														Style: core.Style{Gap: Tokens.RowGap},
-														Children: []core.Node{
-															core.Each(
-																func() []SessionGroup {
-																	_, r, _ := filteredBuckets()
-																	return r
-																},
-																func(g SessionGroup) string { return g.Primary.Key.String() },
-																renderSessionGroupItem,
-															),
-														},
-													}
+													return GroupCard(cx, a, "home-group-idle", []core.Node{
+														core.Each(
+															func() []SessionGroup {
+																_, r, _ := filteredBuckets()
+																return r
+															},
+															func(g SessionGroup) string { return g.Primary.Key.String() },
+															renderSessionGroupItem,
+														),
+													})
 												},
 											},
 										},
 									}
 								},
 							},
-							// Section 4: Collapsible finished sessions (hidden by default so Home stays focused)
+							// Section 4: Subtle collapsible finished sessions disclosure
 							core.Show{
 								When: func() bool {
 									_, _, fin := filteredBuckets()
@@ -488,38 +560,86 @@ func (u *uiController) homeScreen(cx *core.Scope) core.Node {
 									return core.View{
 										Style: core.Style{Gap: Tokens.Space2},
 										Children: []core.Node{
-											ActionButtonFunc(cx, a, "home-finished-toggle", func() string {
-												_, _, fin := filteredBuckets()
-												if showFinished.Get() {
-													return fmt.Sprintf("收起已结束会话 · %d ▴", len(fin))
-												}
-												return fmt.Sprintf("查看已结束会话 · %d ▾", len(fin))
-											}, ActionGhost, func() {
-												animateSpringLayout(cx)
-												showFinished.Set(!showFinished.Get())
-											}),
+											core.View{
+												TestID: "home-finished-toggle",
+												Role:   core.RoleButton,
+												OnPress: func(core.PressEvent) {
+													animateSpringLayout(cx)
+													playSelectionHaptic(cx)
+													showFinished.Set(!showFinished.Get())
+												},
+												Style: core.Style{
+													Direction:  core.Row,
+													AlignItems: core.AlignCenter,
+													AlignSelf:  core.AlignStart,
+													Gap:        core.Points(4),
+													Padding:    core.Symmetric(core.Points(4), Tokens.Space1),
+												},
+												Children: []core.Node{
+													core.Text{
+														ContentFunc: func() string {
+															_, _, fin := filteredBuckets()
+															if showFinished.Get() {
+																return fmt.Sprintf("收起已结束会话 · %d", len(fin))
+															}
+															return fmt.Sprintf("已结束会话 · %d", len(fin))
+														},
+														StyleFunc: func() core.Style {
+															return core.Style{
+																Color:      a.paletteOf(cx).TextMuted,
+																FontSize:   Tokens.FontSection,
+																FontWeight: core.FontWeightMedium,
+															}
+														},
+													},
+													core.Show{
+														When: showFinished.Get,
+														Then: func(cx *core.Scope) core.Node {
+															return core.Icon{
+																SVG: iconChevronU,
+																StyleFunc: func() core.Style {
+																	return core.Style{Width: core.Pt(13), Height: core.Pt(13), Color: a.paletteOf(cx).TextMuted}
+																},
+															}
+														},
+														Else: func(cx *core.Scope) core.Node {
+															return core.Icon{
+																SVG: iconChevronD,
+																StyleFunc: func() core.Style {
+																	return core.Style{Width: core.Pt(13), Height: core.Pt(13), Color: a.paletteOf(cx).TextMuted}
+																},
+															}
+														},
+													},
+												},
+											},
 											core.Show{
 												When: showFinished.Get,
 												Then: func(cx *core.Scope) core.Node {
-													return core.View{
-														Style: core.Style{Gap: Tokens.RowGap},
-														Children: []core.Node{
-															core.Each(
-																func() []AggregatedTerminal {
-																	_, _, fin := filteredBuckets()
-																	return fin
-																},
-																func(it AggregatedTerminal) string { return it.Key.String() },
-																func(cx *core.Scope, item func() AggregatedTerminal, _ func() int) core.Node {
-																	return SessionRow(cx, a, item, func() bool {
-																		return u.activeSession.Get() == item().Key
-																	}, func(k TermKey) {
-																		u.openSession(cx, k)
-																	})
-																},
-															),
-														},
-													}
+													return GroupCard(cx, a, "home-group-finished", []core.Node{
+														core.Each(
+															func() []AggregatedTerminal {
+																_, _, fin := filteredBuckets()
+																return fin
+															},
+															func(it AggregatedTerminal) string { return it.Key.String() },
+															func(cx *core.Scope, item func() AggregatedTerminal, idx func() int) core.Node {
+																return core.View{
+																	Children: []core.Node{
+																		core.Show{
+																			When: func() bool { return idx() > 0 },
+																			Then: func(cx *core.Scope) core.Node { return InsetDivider(cx, a, 34) },
+																		},
+																		SessionRow(cx, a, item, func() bool {
+																			return u.activeSession.Get() == item().Key
+																		}, func(k TermKey) {
+																			u.openSession(cx, k)
+																		}),
+																	},
+																}
+															},
+														),
+													})
 												},
 											},
 										},

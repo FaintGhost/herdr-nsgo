@@ -274,3 +274,43 @@ func TestQuietStudioComponents(t *testing.T) {
 		t.Fatal("WideNavRail settings callback did not fire")
 	}
 }
+
+func TestQuietStudioShellAndInboxGrouping(t *testing.T) {
+	// Wide >=680px: 56px WideNavRail + 280px sidebar + right pane; NO mobile bottom-tab-bar, NO duplicate topbar settings button.
+	wide := nsgotest.Start(t, func(cx *core.Scope) core.Node {
+		_, node := testSeededApp(cx)
+		return node
+	}, nsgotest.Size(960, 720))
+
+	wide.Find("id:split-pane-layout")
+	wide.Find("id:wide-nav-rail")
+	if len(wide.Query("id:bottom-tab-bar")) != 0 {
+		t.Fatal("wide split-pane layout must replace mobile bottom-tab-bar with WideNavRail")
+	}
+	if len(wide.Query("id:home-settings-btn")) != 0 {
+		t.Fatal("wide layout must hide duplicate home-settings-btn since rail-settings-btn is in WideNavRail")
+	}
+
+	// Switch to Inbox from Rail and verify 3-bucket urgency grouping (permission / question / error).
+	phone := nsgotest.Start(t, func(cx *core.Scope) core.Node {
+		a, node := testSeededApp(cx)
+		snaps := a.instances.Get()
+		snaps[0].Terminals = append(snaps[0].Terminals, Terminal{
+			Address: "t9",
+			Name:    "rate-limited-job",
+			Cwd:     "/srv/jobs",
+			State:   "error",
+			Status:  &Status{State: "error", App: "claude", Msg: "You've hit your 5-hour limit"},
+		})
+		a.instances.Set(snaps)
+		a.SeedSnapshots(snaps)
+		return node
+	}, nsgotest.Size(390, 844))
+
+	phone.Find("id:bottom-tab-bar")
+	phone.Press("id:tab-inbox")
+	phone.Find("id:screen-inbox")
+	phone.Find("text:权限审批 · 1")
+	phone.Find("text:等待回答与认证 · 1")
+	phone.Find("text:异常与限流 · 1")
+}
