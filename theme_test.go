@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -9,6 +10,11 @@ import (
 
 	"github.com/nsgo-dev/nsgo/core"
 )
+
+func colorHex(c core.Color) string {
+	u := uint32(c)
+	return fmt.Sprintf("#%06x", (u>>8)&0xffffff)
+}
 
 func TestPaletteWCAGContrast(t *testing.T) {
 	palettes := []struct {
@@ -34,6 +40,7 @@ func TestPaletteWCAGContrast(t *testing.T) {
 				{"text-muted on bg", tc.p.TextMuted, tc.p.Bg, 4.5},
 				{"accent on surface", tc.p.Accent, tc.p.Surface, 4.5},
 				{"accent-fg on accent", tc.p.AccentFg, tc.p.Accent, 4.5},
+				{"running on surface", tc.p.Running, tc.p.Surface, 4.5},
 				{"warn on surface", tc.p.Warn, tc.p.Surface, 4.5},
 				{"danger on surface", tc.p.Danger, tc.p.Surface, 4.5},
 				{"vt fg on vt bg", tc.vt.Fg, tc.vt.Bg, 7.0},
@@ -55,36 +62,114 @@ func TestPaletteWCAGContrast(t *testing.T) {
 
 func TestThemePaletteColorsMatchSpec(t *testing.T) {
 	lp := LightPalette()
-	if lp.Bg != core.RGB(0xf7f8fa) || lp.Accent != core.RGB(0x0f766e) {
-		t.Errorf("light palette mismatch: bg=%#08x accent=%#08x", uint32(lp.Bg), uint32(lp.Accent))
+	if lp.Bg != core.RGB(0xf5f5f7) || lp.Surface != core.RGB(0xffffff) || lp.Accent != core.RGB(0x18181b) || lp.Running != core.RGB(0x0d7a5f) {
+		t.Errorf("light Quiet Studio palette mismatch: bg=%s surface=%s accent=%s running=%s",
+			colorHex(lp.Bg), colorHex(lp.Surface), colorHex(lp.Accent), colorHex(lp.Running))
 	}
 	dp := DarkPalette()
-	if dp.Bg != core.RGB(0x0c0f12) || dp.Accent != core.RGB(0x2dd4bf) {
-		t.Errorf("dark palette mismatch: bg=%#08x accent=%#08x", uint32(dp.Bg), uint32(dp.Accent))
+	if dp.Bg != core.RGB(0x0d0d0f) || dp.Surface != core.RGB(0x161619) || dp.Accent != core.RGB(0xf4f4f5) || dp.Running != core.RGB(0x34d399) {
+		t.Errorf("dark Quiet Studio palette mismatch: bg=%s surface=%s accent=%s running=%s",
+			colorHex(dp.Bg), colorHex(dp.Surface), colorHex(dp.Accent), colorHex(dp.Running))
 	}
 	lvt := LightVTPalette()
-	if lvt.Bg != core.RGB(0xfafbfc) || len(lvt.ANSI) != 16 {
-		t.Errorf("light VT palette invalid: bg=%#08x ansi=%d", uint32(lvt.Bg), len(lvt.ANSI))
+	if lvt.Bg != core.RGB(0xfafafa) || lvt.Accent != core.RGB(0x0d7a5f) || len(lvt.ANSI) != 16 {
+		t.Errorf("light VT palette mismatch: bg=%s accent=%s ansi=%d", colorHex(lvt.Bg), colorHex(lvt.Accent), len(lvt.ANSI))
 	}
 	dvt := DarkVTPalette()
-	if dvt.Bg != core.RGB(0x070a0d) || len(dvt.ANSI) != 16 {
-		t.Errorf("dark VT palette invalid: bg=%#08x ansi=%d", uint32(dvt.Bg), len(dvt.ANSI))
+	if dvt.Bg != core.RGB(0x09090b) || dvt.Accent != core.RGB(0x34d399) || len(dvt.ANSI) != 16 {
+		t.Errorf("dark VT palette mismatch: bg=%s accent=%s ansi=%d", colorHex(dvt.Bg), colorHex(dvt.Accent), len(dvt.ANSI))
 	}
-	// Verify every token is listed for the runtime tokens gallery.
+
+	// Verify strict 4px scale & Quiet Studio sizing tokens.
+	if Tokens.PagePadX != 16 || Tokens.SectionGap != 18 || Tokens.RadiusCtrl != 10 || Tokens.RadiusCard != 14 || Tokens.RadiusSheet != 20 {
+		t.Errorf("Quiet Studio layout tokens mismatch: %+v", Tokens)
+	}
+	if Tokens.FontNav != 22 || Tokens.FontSession != 16 || Tokens.FontRowTitle != 15 || Tokens.FontBody != 15 || Tokens.FontCaption != 13 || Tokens.FontMonoMeta != 12 {
+		t.Errorf("Quiet Studio font scale mismatch: %+v", Tokens)
+	}
+	if Tokens.SizeTopbar != 48 || Tokens.SizeTabBar != 56 || Tokens.RailWidth != 56 || Tokens.ChatMaxWidth != 720 {
+		t.Errorf("Quiet Studio responsive size tokens mismatch: %+v", Tokens)
+	}
+
+	// Verify AppTheme differentiates Accent / AccentHover / AccentPressed / Success.
+	at := AppTheme()
+	if at.Light.Success != lp.Running || at.Dark.Success != dp.Running {
+		t.Errorf("AppTheme Success must map to Running semantic emerald")
+	}
+	if at.Light.AccentHover == at.Light.Accent || at.Light.AccentPressed == at.Light.Accent {
+		t.Errorf("AppTheme Light AccentHover/AccentPressed must differentiate from Accent")
+	}
+	if at.Dark.AccentHover == at.Dark.Accent || at.Dark.AccentPressed == at.Dark.Accent {
+		t.Errorf("AppTheme Dark AccentHover/AccentPressed must differentiate from Accent")
+	}
+}
+
+func TestTokenCatalogComplete(t *testing.T) {
+	lp, dp := LightPalette(), DarkPalette()
+	lvt, dvt := LightVTPalette(), DarkVTPalette()
 	entries := TokenCatalog()
-	if len(entries) < 20 {
-		t.Errorf("TokenCatalog() has %d entries, want >= 20", len(entries))
-	}
+	byName := make(map[string]TokenEntry, len(entries))
 	for _, e := range entries {
 		if e.Name == "" || e.Use == "" || e.Light == "" || e.Dark == "" {
 			t.Errorf("incomplete token catalog entry: %+v", e)
+		}
+		byName[e.Name] = e
+	}
+
+	// Guard against catalog drift: every solid Palette & VT token must exist and match exact hexes.
+	solidChecks := []struct {
+		name  string
+		light core.Color
+		dark  core.Color
+	}{
+		{"--color-bg", lp.Bg, dp.Bg},
+		{"--color-surface", lp.Surface, dp.Surface},
+		{"--color-surface-raised", lp.SurfaceRaised, dp.SurfaceRaised},
+		{"--color-fill", lp.Fill, dp.Fill},
+		{"--color-text", lp.Text, dp.Text},
+		{"--color-text-secondary", lp.TextSecondary, dp.TextSecondary},
+		{"--color-text-muted", lp.TextMuted, dp.TextMuted},
+		{"--color-accent", lp.Accent, dp.Accent},
+		{"--color-accent-fg", lp.AccentFg, dp.AccentFg},
+		{"--color-running", lp.Running, dp.Running},
+		{"--color-warn", lp.Warn, dp.Warn},
+		{"--color-danger", lp.Danger, dp.Danger},
+		{"--color-vt-bg", lvt.Bg, dvt.Bg},
+		{"--color-vt-fg", lvt.Fg, dvt.Fg},
+		{"--color-vt-accent", lvt.Accent, dvt.Accent},
+	}
+	for _, chk := range solidChecks {
+		e, ok := byName[chk.name]
+		if !ok {
+			t.Errorf("TokenCatalog missing required token %q", chk.name)
+			continue
+		}
+		if strings.ToLower(e.Light) != colorHex(chk.light) {
+			t.Errorf("TokenCatalog %s light drift: catalog=%s palette=%s", chk.name, e.Light, colorHex(chk.light))
+		}
+		if strings.ToLower(e.Dark) != colorHex(chk.dark) {
+			t.Errorf("TokenCatalog %s dark drift: catalog=%s palette=%s", chk.name, e.Dark, colorHex(chk.dark))
+		}
+	}
+
+	// Ensure glass, separator, border, type, space, radius, size, motion tokens are documented too.
+	for _, req := range []string{
+		"--color-separator", "--color-border", "--color-glass", "--color-glass-border", "--color-overlay",
+		"--type-scale", "--space-grid", "--radius-scale", "--size-scale", "--motion-curve",
+	} {
+		if _, ok := byName[req]; !ok {
+			t.Errorf("TokenCatalog missing required entry %q", req)
 		}
 	}
 }
 
 func TestNoRawColorsInScreens(t *testing.T) {
 	re := regexp.MustCompile(`\bcore\.RGB(A)?\s*\(`)
-	patterns := []string{"screen_*.go", "components.go"}
+	patterns := []string{
+		"screen_*.go", "components.go", "main.go",
+		"mobile_picker.go", "project_browser.go", "browser_preview.go",
+		"slash_commands.go", "dictation.go",
+	}
 	for _, pat := range patterns {
 		matches, err := filepath.Glob(pat)
 		if err != nil {

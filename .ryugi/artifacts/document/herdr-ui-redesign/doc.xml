@@ -1,0 +1,776 @@
+<doc>
+  <h1 id="Q_tjypdM">herdr-nsgo UI 与设计系统重塑规格（Quiet Studio）</h1>
+  <p id="84tI7GJ2">将 <code>herdr-nsgo</code> 的视觉语言、Token 体系、响应布局与全部 9 类页面和底部抽屉统一升级为 <b>Quiet Studio（静谧工作台）</b>：去框降噪、黑白高对比操作锚点 + 翡翠绿/琥珀/绯红专职语义态、全仓统一 Lucide 图标、分组白卡与 0.5px 内缩线、悬浮通透底栏与输入器，以及平板/桌面端 56px 左侧图标 Rail。</p>
+  <h2 id="mGTPl4w-">1. 动机与目标</h2>
+  <p id="Q3_TSo6N">现有 <code>Crisp Slate v1</code> 视觉系统建立于 Chat 视图、Diff 查看器、模型选择器、项目文件浏览与 tmux/Zellij 接入之前。随功能叠加，当前界面出现四类结构性退化：</p>
+  <ul id="yXylh2gD">
+    <li><b>Token 漂移与未生效声明</b>：<code>theme.go</code> 中 <code>Warn</code>（<code>#9A4106</code>）、暗色 <code>Danger</code>（<code>#F87171</code>）和 <code>TextMuted</code>（<code>#91A0B4</code>）与 <code>TokenCatalog()</code> / <code>DESIGN.md</code> 脱节；<code>GlassSurface</code> 与 <code>Overlay</code> 全仓零引用；<code>AppTheme()</code> 中 5 个交互角色碰撞为同一青绿色。</li>
+    <li><b>框线过载与信息层级失衡</b>：每条 <code>SessionRow</code> 同时堆叠 1px 外框、3px 彩条、26px 彩底方块、状态胶囊、灰底主机芯片与等宽路径；用户气泡（14px）反比 AI 回复正文（16px）小；运行中发送键从 36px 圆形跳变成宽矩形红框 <code>中断</code> 按钮导致输入栏横向抖动。</li>
+    <li><b>图标体系与顶栏割裂</b>：<code>icons.go</code> 手写 SVG + 带框 36px <code>IconButton</code> 与 <code>screen_session.go</code> / <code>screen_chat.go</code> 的 <code>icons/lucide</code> + 无框 40px <code>sessionIcon</code> 混用；不同二级页返回按钮形态各异。</li>
+    <li><b>抽屉与宽屏退化</b>：<code>project_browser.go</code>、<code>screen_multiplexer.go</code>、<code>screen_session.go</code> 工具抽屉用居中粗体 <code>ActionButton</code> 堆叠文件列表与菜单项，且 <code>mobile_picker.go</code> / <code>project_browser.go</code> / <code>browser_preview.go</code> 绕开 <code>SheetModal</code> 直接拼裸 <code>ui.Sheet</code>；宽屏左侧 280px 侧栏底部仍塞着手机 3-Tab 栏，右侧 Chat 正文无最大宽限制。</li>
+  </ul>
+  <h3 id="pePge3TA">目标（Goals）</h3>
+  <ul id="tm4Pwz1_">
+    <li>以 <code>theme.go</code> 为唯一代码 Token 源，彻底消除漂移、死变量与离网魔数（7/10/14/38/10.5/9.5px），全部收敛到 4px 网格与 6 级字阶。</li>
+    <li>全站 UI 统一为 <b>Quiet Studio</b> 分组白卡 + 0.5px 内缩线 + 无框 Lucide 图标 + 8px 语义圆点 + 悬浮通透功能层（底栏与 Chat 输入器）。</li>
+    <li>补齐宽屏（<code>&gt;= 680px</code>）桌面级骨架：56px 左侧图标 Rail + 280px 列表侧栏 + 右侧 Chat 居中限宽 <code>720px</code>（切至 VT 自动放开 100% 全宽）。</li>
+    <li>所有抽屉统一经由 <code>SheetModal</code> + <code>SheetListRow</code>（左对齐 + 前置 Lucide 图标 + 尾部值/箭头 + 独立危险分区）渲染，彻底废除居中按钮列表。</li>
+    <li>保留全部已有 <code>herdr-core</code> 协议能力、0ms Chat/VT 显隐切换、白名单二次校验审批与当前工作区已开发的全部功能代码（模型选择、文件/Git 浏览、tmux/Zellij、斜杠命令、语音听写、主机网页预览、图片附件）。</li>
+  </ul>
+  <h3 id="vrDumT1B">非目标与反目标（Non-goals / Anti-goals）</h3>
+  <ul id="MYlFccPe">
+    <li><b>Non-goals</b>：不修改 SSH 传输、<code>CorePool</code> 多路复用、JSONL 解析器、VT100 仿真器、审批安全白名单逻辑或新增远端 RPC 协议字段。</li>
+    <li><b>Anti-goals</b>：不引入 NSGo 之外的原生平台桥接（保持纯 Go <code>go tool nsgo build</code> 打包 Android/iOS）；不对正文内容卡片使用重投影、彩色光晕或毛玻璃；不为了换皮而删减任何既有功能入口。</li>
+  </ul>
+  <h2 id="KOQH14bo">2. 约束与实现边界</h2>
+  <ul id="zQePVtpt">
+    <li><b>UI 框架约束</b>：严格基于 <code>github.com/nsgo-dev/nsgo v0.3.0</code>（<code>core</code>、<code>base</code>、<code>ui</code>、<code>ui/chat</code>、<code>ui/diff</code>、<code>icons/lucide</code>）。NSGo 不支持复杂 CSS <code>backdrop-filter</code> 时，悬浮底栏与输入器使用 <code>pal.GlassSurface</code> + <code>pal.GlassBorder</code>（高质感半透明浮层与柔和阴影/细描边，或复用 <code>ui/chat</code> 官方浮层原语），确保在 Android / iOS / macOS 均清晰可辨。</li>
+    <li><b>代码规范与守卫</b>：所有 UI 文件（含 <code>components.go</code>、<code>screen_*.go</code>、<code>mobile_picker.go</code>、<code>project_browser.go</code>、<code>browser_preview.go</code>、<code>slash_commands.go</code>、<code>dictation.go</code>）严禁出现 <code>core.RGB</code> / <code>core.RGBA</code> 字面量；全部颜色对满足 WCAG AA（正文 <code>&gt;= 4.5:1</code>，VT 主文本 <code>&gt;= 7.0:1</code>）。</li>
+    <li><b>工作区基线（我们的默认决策）</b>：直接基于当前工作区现有代码（包含未提交的 <code>mobile_picker.go</code>、<code>project_browser.go</code>、<code>screen_multiplexer.go</code>、<code>slash_commands.go</code> 等新功能）原地重塑，不回滚或丢弃已有功能；实现前先跑一次 <code>go test -race ./...</code> 确认基线状态。</li>
+    <li><b>TestID 兼容</b>：保持现有 <code>ui_test.go</code>、<code>chat_ui_test.go</code>、<code>moshi_ux_test.go</code>、<code>mobile_workflow_test.go</code> 的核心 <code>TestID</code>（如 <code>screen-home</code>、<code>screen-session</code>、<code>split-pane-layout</code>、<code>bottom-tab-bar</code>、<code>chat-glass-composer</code>、<code>session-interrupt-btn</code>、<code>session-send-btn</code> 等）。仅按新规范同步两处测试断言：<code>theme_test.go</code> 更新为 Quiet Studio 色值；<code>ui_test.go</code> 中会话搜索路径改为点开 <code>session-tools-btn</code> 后触发 <code>session-search-btn</code>。</li>
+  </ul>
+  <h2 id="fjoSP-rV">3. 选定视觉方向与画板决策记录</h2>
+  <p id="EMQ51GDr">本规格由完整 5 页设计画板 <ref artboard="herdr-ui-redesign" to="24hBfv73dXzJY99KKo16i">herdr-nsgo UI 与设计系统重塑</ref>（路径 <code>.ryugi/artifacts/artboard/herdr-ui-redesign/canvas.json</code>）逐轮确认产出，核心决策全部写入本文，脱离画板亦可独立实现：</p>
+  <ul id="YLetRswf">
+    <li><b>Product</b>：开发者在手机与平板/桌面端高效巡检多台远端开发机的 AI Agent（Claude / Codex / Pi / Antigravity）与真实 VT 终端，快速审批阻塞并无缝切换对话与终端。</li>
+    <li><b>Character</b>：克制（Restrained）、利落（Crisp）、原生通透（Native &amp; Calm）——零多余装饰框。</li>
+    <li><b>World</b>：精密工作台 + 原生分组列表：内容区保持纯净不透明，依靠纯石墨表面阶梯与 0.5px 内缩线建立层级；仅悬浮功能层（底栏、Chat 输入器）使用微通透浮层。</li>
+    <li><b>Moments</b>：首页顶部轻量「需要你」审批卡 + 会话内统一 15px 节奏的 AI 对话流与悬浮胶囊输入器。</li>
+    <li><b>Signature</b>：8px 状态圆点（取代 3px 彩色左边框）+ 全站 1.75px Lucide 线性图标 + 固定 34×34 圆形发送/停止双态键。</li>
+  </ul>
+  <table id="9CaE71Ly">
+    <tr>
+      <th>
+        <p>阶段</p>
+      </th>
+      <th>
+        <p>已选定画板</p>
+      </th>
+      <th>
+        <p>锁定结论</p>
+      </th>
+    </tr>
+    <tr>
+      <td>
+        <p>现状审计</p>
+      </td>
+      <td>
+        <p><ref artboard="herdr-ui-redesign" to="24hBfv73dXzJY99KKo16i" board="what-exists">what-exists</ref></p>
+      </td>
+      <td>
+        <p>确认 6 处 Token 漂移/死变量、2 套混用图标与顶栏、14+ 离网尺寸、4 个居中按钮抽屉。</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Step 1 方向</p>
+      </td>
+      <td>
+        <p><ref artboard="herdr-ui-redesign" to="24hBfv73dXzJY99KKo16i" board="dir-studio">dir-studio</ref></p>
+      </td>
+      <td>
+        <p>选定方向 A「静谧工作台 Quiet Studio」，淘汰现状 Crisp Slate v1 与暖纸方案。</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Step 2 Tokens</p>
+      </td>
+      <td>
+        <p><ref artboard="herdr-ui-redesign" to="24hBfv73dXzJY99KKo16i" board="tok-color-mono">tok-color-mono</ref> / <ref artboard="herdr-ui-redesign" to="24hBfv73dXzJY99KKo16i" board="tok-type-studio">tok-type-studio</ref> / <ref artboard="herdr-ui-redesign" to="24hBfv73dXzJY99KKo16i" board="tok-scale-studio">tok-scale-studio</ref> / <ref artboard="herdr-ui-redesign" to="24hBfv73dXzJY99KKo16i" board="token-sheet">token-sheet</ref></p>
+      </td>
+      <td>
+        <p>黑白墨色 CTA + 翡翠绿专职运行态；统一 15px 对话与列表（VT 默认 12px）；14px 分组白卡 + 4px 网格 + 浮层玻璃。</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Step 3 布局</p>
+      </td>
+      <td>
+        <p><ref artboard="herdr-ui-redesign" to="24hBfv73dXzJY99KKo16i" board="lay-home-float">lay-home-float</ref> / <ref artboard="herdr-ui-redesign" to="24hBfv73dXzJY99KKo16i" board="lay-session-clean">lay-session-clean</ref> / <ref artboard="herdr-ui-redesign" to="24hBfv73dXzJY99KKo16i" board="lay-wide-rail">lay-wide-rail</ref> / <ref artboard="herdr-ui-redesign" to="24hBfv73dXzJY99KKo16i" board="layout-sheet">layout-sheet</ref></p>
+      </td>
+      <td>
+        <p>无横线通透页头 + 56px 悬浮胶囊底栏；极简会话顶栏（搜索入「…」）+ 悬浮双态胶囊输入器；宽屏 56px 图标 Rail + 280px 列表 + 右侧 Chat 居中 720px / VT 全宽。</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Step 4 组件与流程</p>
+      </td>
+      <td>
+        <p><ref artboard="herdr-ui-redesign" to="24hBfv73dXzJY99KKo16i" board="comp-kit">comp-kit</ref> + <code>flow-home</code> … <code>flow-onboarding</code>（9 屏）</p>
+      </td>
+      <td>
+        <p>锁定核心 5 组件规范与 9 屏完整落地形态。</p>
+      </td>
+    </tr>
+  </table>
+  <h2 id="PrRAOskT">4. Token 总表（唯一代码源：<code>theme.go</code>）</h2>
+  <p id="S6EBL7ht">数值完全同步自 <code>.ryugi/artifacts/artboard/herdr-ui-redesign/pages/tokens.css</code> 与 <ref artboard="herdr-ui-redesign" to="24hBfv73dXzJY99KKo16i" board="token-sheet">token-sheet</ref>。在 Go 源码中由 <code>theme.go</code>（<code>Palette</code>、<code>VTPalette</code>、<code>Tokens</code>、<code>AppTheme()</code>、<code>TokenCatalog()</code>）唯一声明并导出。新增 <code>Running</code> / <code>RunningSoft</code> 语义字段，使主操作 <code>Accent</code> 与运行状态 <code>Running</code> 彻底解耦。</p>
+  <table id="WRfYyv2x">
+    <tr>
+      <th>
+        <p>分组</p>
+      </th>
+      <th>
+        <p>Token（<code>theme.go</code> 字段）</p>
+      </th>
+      <th>
+        <p>Light</p>
+      </th>
+      <th>
+        <p>Dark</p>
+      </th>
+      <th>
+        <p>用途</p>
+      </th>
+      <th>
+        <p>来源板</p>
+      </th>
+    </tr>
+    <tr>
+      <td>
+        <p>Surface</p>
+      </td>
+      <td>
+        <p><code>--color-bg</code> (<code>Bg</code>)</p>
+      </td>
+      <td>
+        <p><code>#f5f5f7</code></p>
+      </td>
+      <td>
+        <p><code>#0d0d0f</code></p>
+      </td>
+      <td>
+        <p>页面底色（石墨浅灰 / 深石墨）</p>
+      </td>
+      <td>
+        <p><code>tok-color-mono</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Surface</p>
+      </td>
+      <td>
+        <p><code>--color-surface</code> (<code>Surface</code>)</p>
+      </td>
+      <td>
+        <p><code>#ffffff</code></p>
+      </td>
+      <td>
+        <p><code>#161619</code></p>
+      </td>
+      <td>
+        <p>分组卡片、顶栏、抽屉主表面</p>
+      </td>
+      <td>
+        <p><code>tok-color-mono</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Surface</p>
+      </td>
+      <td>
+        <p><code>--color-surface-raised</code> (<code>SurfaceRaised</code>)</p>
+      </td>
+      <td>
+        <p><code>#ebebf0</code></p>
+      </td>
+      <td>
+        <p><code>#222226</code></p>
+      </td>
+      <td>
+        <p>次级按钮、输入框、用户气泡、键帽</p>
+      </td>
+      <td>
+        <p><code>tok-color-mono</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Surface</p>
+      </td>
+      <td>
+        <p><code>--color-fill</code> (<code>Fill</code>)</p>
+      </td>
+      <td>
+        <p><code>#dcdce3</code></p>
+      </td>
+      <td>
+        <p><code>#2e2e34</code></p>
+      </td>
+      <td>
+        <p>空闲圆点、禁用态、拖拽手柄</p>
+      </td>
+      <td>
+        <p><code>tok-color-mono</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Border</p>
+      </td>
+      <td>
+        <p><code>--color-separator</code> (<code>Separator</code>)</p>
+      </td>
+      <td>
+        <p><code>rgba(20,20,22,0.075)</code></p>
+      </td>
+      <td>
+        <p><code>rgba(244,244,245,0.08)</code></p>
+      </td>
+      <td>
+        <p>分组内 0.5px 内缩线与顶栏细线</p>
+      </td>
+      <td>
+        <p><code>tok-color-mono</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Border</p>
+      </td>
+      <td>
+        <p><code>--color-border</code> (<code>Border</code>)</p>
+      </td>
+      <td>
+        <p><code>rgba(20,20,22,0.085)</code></p>
+      </td>
+      <td>
+        <p><code>rgba(244,244,245,0.095)</code></p>
+      </td>
+      <td>
+        <p>输入框与暗色卡片边界线</p>
+      </td>
+      <td>
+        <p><code>tok-color-mono</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Glass</p>
+      </td>
+      <td>
+        <p><code>--color-glass</code> (<code>GlassSurface</code>)</p>
+      </td>
+      <td>
+        <p><code>rgba(255,255,255,0.84)</code></p>
+      </td>
+      <td>
+        <p><code>rgba(26,26,30,0.86)</code></p>
+      </td>
+      <td>
+        <p>悬浮底栏与 Chat 悬浮输入器背景</p>
+      </td>
+      <td>
+        <p><code>tok-scale-studio</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Glass</p>
+      </td>
+      <td>
+        <p><code>--color-glass-border</code> (<code>GlassBorder</code>)</p>
+      </td>
+      <td>
+        <p><code>rgba(20,20,22,0.09)</code></p>
+      </td>
+      <td>
+        <p><code>rgba(244,244,245,0.11)</code></p>
+      </td>
+      <td>
+        <p>悬浮底栏与输入器外描边</p>
+      </td>
+      <td>
+        <p><code>tok-scale-studio</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Glass</p>
+      </td>
+      <td>
+        <p><code>--color-overlay</code> (<code>Overlay</code>)</p>
+      </td>
+      <td>
+        <p><code>rgba(20,20,22,0.34)</code></p>
+      </td>
+      <td>
+        <p><code>rgba(0,0,0,0.56)</code></p>
+      </td>
+      <td>
+        <p>底部抽屉遮罩层</p>
+      </td>
+      <td>
+        <p><code>tok-scale-studio</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Text</p>
+      </td>
+      <td>
+        <p><code>--color-text</code> (<code>Text</code>)</p>
+      </td>
+      <td>
+        <p><code>#141416</code></p>
+      </td>
+      <td>
+        <p><code>#f4f4f5</code></p>
+      </td>
+      <td>
+        <p>主标题、会话名、正文（18.5:1 / 16.4:1）</p>
+      </td>
+      <td>
+        <p><code>tok-color-mono</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Text</p>
+      </td>
+      <td>
+        <p><code>--color-text-secondary</code> (<code>TextSecondary</code>)</p>
+      </td>
+      <td>
+        <p><code>#52525b</code></p>
+      </td>
+      <td>
+        <p><code>#a8a8b3</code></p>
+      </td>
+      <td>
+        <p>状态摘要、次要说明、工具参数（7.6:1 / 7.8:1）</p>
+      </td>
+      <td>
+        <p><code>tok-color-mono</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Text</p>
+      </td>
+      <td>
+        <p><code>--color-text-muted</code> (<code>TextMuted</code>)</p>
+      </td>
+      <td>
+        <p><code>#686873</code></p>
+      </td>
+      <td>
+        <p><code>#8b8b96</code></p>
+      </td>
+      <td>
+        <p>分区标题、主机名、路径与时间（5.5:1 / 5.5:1）</p>
+      </td>
+      <td>
+        <p><code>tok-color-mono</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Accent</p>
+      </td>
+      <td>
+        <p><code>--color-accent</code> (<code>Accent</code>)</p>
+      </td>
+      <td>
+        <p><code>#18181b</code></p>
+      </td>
+      <td>
+        <p><code>#f4f4f5</code></p>
+      </td>
+      <td>
+        <p>主按钮、选中胶囊与发送/停止圆键（17.7:1 / 17.0:1）</p>
+      </td>
+      <td>
+        <p><code>tok-color-mono</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Accent</p>
+      </td>
+      <td>
+        <p><code>--color-accent-fg</code> (<code>AccentFg</code>)</p>
+      </td>
+      <td>
+        <p><code>#ffffff</code></p>
+      </td>
+      <td>
+        <p><code>#111113</code></p>
+      </td>
+      <td>
+        <p>主按钮内文字与图标</p>
+      </td>
+      <td>
+        <p><code>tok-color-mono</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Accent</p>
+      </td>
+      <td>
+        <p><code>--color-accent-soft</code> (<code>AccentSoft</code>)</p>
+      </td>
+      <td>
+        <p><code>rgba(24,24,27,0.08)</code></p>
+      </td>
+      <td>
+        <p><code>rgba(244,244,245,0.11)</code></p>
+      </td>
+      <td>
+        <p>激活 Tab / 列表选中行背景</p>
+      </td>
+      <td>
+        <p><code>tok-color-mono</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Semantic</p>
+      </td>
+      <td>
+        <p><code>--color-running</code> / <code>soft</code> (<code>Running</code>)</p>
+      </td>
+      <td>
+        <p><code>#0d7a5f</code> / 11%</p>
+      </td>
+      <td>
+        <p><code>#34d399</code> / 14%</p>
+      </td>
+      <td>
+        <p>运行中 / 实例在线唯一绿（5.3:1 / 9.7:1）</p>
+      </td>
+      <td>
+        <p><code>tok-color-mono</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Semantic</p>
+      </td>
+      <td>
+        <p><code>--color-warn</code> / <code>soft</code> (<code>Warn</code>)</p>
+      </td>
+      <td>
+        <p><code>#a64b00</code> / 10%</p>
+      </td>
+      <td>
+        <p><code>#fbbf24</code> / 14%</p>
+      </td>
+      <td>
+        <p>需要你 / 权限审批 / 等待回答（5.8:1 / 10.8:1）</p>
+      </td>
+      <td>
+        <p><code>tok-color-mono</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Semantic</p>
+      </td>
+      <td>
+        <p><code>--color-danger</code> / <code>soft</code> (<code>Danger</code>)</p>
+      </td>
+      <td>
+        <p><code>#c81e1e</code> / 10%</p>
+      </td>
+      <td>
+        <p><code>#f87171</code> / 14%</p>
+      </td>
+      <td>
+        <p>报错、断连告警、拒绝与终止（5.7:1 / 6.8:1）</p>
+      </td>
+      <td>
+        <p><code>tok-color-mono</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>VT</p>
+      </td>
+      <td>
+        <p><code>--color-vt-bg</code> / <code>fg</code> / <code>muted</code> / <code>accent</code></p>
+      </td>
+      <td>
+        <p><code>#fafafa</code> / <code>#141416</code> / <code>#686873</code> / <code>#0d7a5f</code></p>
+      </td>
+      <td>
+        <p><code>#09090b</code> / <code>#f4f4f5</code> / <code>#8b8b96</code> / <code>#34d399</code></p>
+      </td>
+      <td>
+        <p>VT 终端画布（跟随主题，支持设置「始终暗色」）</p>
+      </td>
+      <td>
+        <p><code>tok-color-mono</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Type</p>
+      </td>
+      <td>
+        <p><code>FontNav / Session / RowTitle / Body / Caption / MonoMeta / VTDefault</code></p>
+      </td>
+      <td>
+        <p><code>22 / 16 / 15 / 15 / 13 / 12 / 12px</code></p>
+      </td>
+      <td>
+        <p>同左</p>
+      </td>
+      <td>
+        <p>6 级收敛字阶；用户气泡与 AI 回复统一 <code>15px</code>（行高 <code>22-23px</code>）</p>
+      </td>
+      <td>
+        <p><code>tok-type-studio</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Space</p>
+      </td>
+      <td>
+        <p><code>Space1..6</code> / <code>PagePadX</code> / <code>SectionGap</code></p>
+      </td>
+      <td>
+        <p><code>4/8/12/16/20/24</code> · <code>16</code> · <code>18px</code></p>
+      </td>
+      <td>
+        <p>同左</p>
+      </td>
+      <td>
+        <p>严格 4px 网格，消除 7/10/14 离网值</p>
+      </td>
+      <td>
+        <p><code>tok-scale-studio</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Radius</p>
+      </td>
+      <td>
+        <p><code>RadiusKey / Ctrl / Card / Sheet / Pill</code></p>
+      </td>
+      <td>
+        <p><code>6 / 10 / 14 / 20 / 999px</code></p>
+      </td>
+      <td>
+        <p>同左</p>
+      </td>
+      <td>
+        <p>嵌套圆角阶梯（悬浮输入器 <code>22px</code>，悬浮底栏 <code>28px</code>）</p>
+      </td>
+      <td>
+        <p><code>tok-scale-studio</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Size</p>
+      </td>
+      <td>
+        <p><code>SizeTouch / Key / Icon / Topbar / TabBar / RailWidth / SidebarWidth / ChatMaxWidth</code></p>
+      </td>
+      <td>
+        <p><code>40 / 34 / 19 / 48 / 56 / 56 / 280 / 720px</code></p>
+      </td>
+      <td>
+        <p>同左</p>
+      </td>
+      <td>
+        <p>全站统一触控热区、顶栏与响应式尺寸</p>
+      </td>
+      <td>
+        <p><code>tok-scale-studio</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Depth</p>
+      </td>
+      <td>
+        <p><code>--shadow-card</code> / <code>--shadow-float</code></p>
+      </td>
+      <td>
+        <p>极轻浮起 / 浮层柔和投影</p>
+      </td>
+      <td>
+        <p><code>none</code> + 1px 细描边 / 暗色浮层投影</p>
+      </td>
+      <td>
+        <p>普通内容无阴影或极轻浮起，悬浮层明确抬升</p>
+      </td>
+      <td>
+        <p><code>tok-scale-studio</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Motion</p>
+      </td>
+      <td>
+        <p><code>Press / Nav / Sheet</code></p>
+      </td>
+      <td>
+        <p><code>140 / 240 / 300ms</code> · <code>(0.22,1,0.36,1)</code></p>
+      </td>
+      <td>
+        <p>同左</p>
+      </td>
+      <td>
+        <p>按压缩放 <code>0.97</code>，保留 120fps Spring 预设</p>
+      </td>
+      <td>
+        <p><code>tok-scale-studio</code></p>
+      </td>
+    </tr>
+  </table>
+  <h2 id="nY0ollQ6">5. 布局规则（对应 <ref artboard="herdr-ui-redesign" to="24hBfv73dXzJY99KKo16i" board="layout-sheet">layout-sheet</ref>）</h2>
+  <table id="sa8UHy10">
+    <tr>
+      <th>
+        <p>页面类型</p>
+      </th>
+      <th>
+        <p>承载文件 / 组件</p>
+      </th>
+      <th>
+        <p>导航与顶栏</p>
+      </th>
+      <th>
+        <p>内容宽与留白</p>
+      </th>
+      <th>
+        <p>窄屏（&lt; 680px）→ 宽屏（&gt;= 680px）变化</p>
+      </th>
+    </tr>
+    <tr>
+      <td>
+        <p>一级 Tab 页（首页 / 待办 / 实例）</p>
+      </td>
+      <td>
+        <p><code>main.go</code> / <code>screen_home.go</code> / <code>screen_inbox.go</code> / <code>screen_instances.go</code></p>
+      </td>
+      <td>
+        <p>48px 无底线通透 <code>TopHeader</code>（标题 <code>22px Semibold</code> + 无框 40px Lucide <code>IconTap</code>）</p>
+      </td>
+      <td>
+        <p><code>PagePadX: 16px</code>，组间距 <code>18px</code>，底部预留 <code>96px</code> 避免悬浮底栏遮挡；同分区会话收入同一 <code>GroupCard</code>（14px 圆角 + 0.5px 内缩线）</p>
+      </td>
+      <td>
+        <p>手机：底部 56px 悬浮玻璃胶囊 3-Tab（<code>FloatingTabBar</code>，距左右 16px、安全区上方 8px）。宽屏：升格为左侧 56px 垂直图标 Rail（<code>WideNavRail</code>：品牌标 / 会话 / 待办带红点 / 实例 / 底部设置）+ 280px 列表侧栏（会话 / 待办 / 实例均在 280px 侧栏内切换，右侧持续保留实时会话；<code>instanceCard</code> 采用紧凑轻量化文本图标操作行、<code>InlineApprovalCard</code> 采用 36px 紧凑按钮以适配 248px 净宽——<b>我们的默认决策</b>），隐藏手机底栏。</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>会话页（Chat / VT）</p>
+      </td>
+      <td>
+        <p><code>screen_session.go</code> / <code>screen_chat.go</code> / <code>vt_view.go</code></p>
+      </td>
+      <td>
+        <p>48px 带 1px 细底线顶栏，采用单行弹性排布：返回（仅窄屏）+ 8px 状态点 + 会话名下拉切换器（<code>FlexGrow: 1, MaxLines: 1</code> 避免 360px 窄屏截断）+ 紧贴右侧的圆角 <code>聊天|终端</code> 分段胶囊 + <code>…</code> 工具按钮（搜索收进工具抽屉）</p>
+      </td>
+      <td>
+        <p>Chat 画布底色为 <code>pal.Bg</code>（与 <code>chat.FloatingEdgeBar</code> 及宽屏右栏自然融合）；工具调用折叠行卡片化使用 <code>pal.Surface</code> + <code>1px pal.Border</code>（12px 圆角）；<code>chat-subagent-strip</code> 改用不透明 <code>GroupCard</code>（淘汰 <code>chat.GlassPanel</code>）；用户气泡使用 <code>pal.SurfaceRaised</code> + <code>1px pal.Border</code> 与 AI 回复统一 <code>15px</code>；底部为 22px 悬浮胶囊输入器（去灰拖把条，固定 34×34 圆形发送/停止键）。VT 保留精简状态条 + 34px 键帽栏 + 折叠输入栏。</p>
+      </td>
+      <td>
+        <p>手机：全屏推入，支持硬件/手势返回。宽屏：右侧实时呈现，Chat 消息流与悬浮输入器居中限宽 <code>720px</code>；切换至 VT 模式时画布自动放开 <code>100%</code> 全宽。</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>二级推入页（设置 / Tokens / 引导）</p>
+      </td>
+      <td>
+        <p><code>screen_settings.go</code> / <code>screen_onboarding.go</code></p>
+      </td>
+      <td>
+        <p>48px 通透顶栏 + 统一无框 <code>lucide.ChevronLeft</code> 返回按钮（Tokens 与设置页一致）；宽屏从 <code>WideNavRail</code> 底部点按设置时沿用全屏推入（隐藏 Rail 与侧栏，保留返回键与现有路由/测试一致——<b>我们的默认决策</b>）</p>
+      </td>
+      <td>
+        <p>居中列 <code>max-width: 640px</code>（冷启动引导 <code>520px</code>），<code>Inset Grouped</code> 卡片内每行 <code>min-height: 48px</code></p>
+      </td>
+      <td>
+        <p>宽屏自动居中留白，不拉伸过宽表单。</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>统一底部抽屉 Sheet</p>
+      </td>
+      <td>
+        <p><code>components.go</code> (<code>SheetModal</code> / <code>SheetListRow</code>) 及全部 7 个抽屉文件</p>
+      </td>
+      <td>
+        <p>顶部 36×4px 拖拽条 + 18px 标题 + 32px 圆形关闭图标（<code>lucide.X</code>）</p>
+      </td>
+      <td>
+        <p>20px 顶圆角，桌面居中 <code>max-width: 560px</code>；内容用 <code>GroupCard</code> + 46px 左对齐 <code>SheetListRow</code>（前置 Lucide 图标 + 尾部值/箭头），危险操作单独分组置底</p>
+      </td>
+      <td>
+        <p>手机贴底上滑，支持下滑关闭；平板/桌面居中浮出。</p>
+      </td>
+    </tr>
+  </table>
+  <h2 id="0tSfFgtC">6. 核心 5 组件与使用规范（对应 <ref artboard="herdr-ui-redesign" to="24hBfv73dXzJY99KKo16i" board="comp-kit">comp-kit</ref>）</h2>
+  <ol id="NmBV66Jp">
+    <li><b>Buttons &amp; IconTap</b>：<code>ActionButton</code> 统一 <code>40px</code> 高度、<code>10px</code> 圆角、无冗余硬边框（<code>Primary</code> 为黑白高对比 <code>Accent</code>，<code>Secondary</code> 为 <code>SurfaceRaised</code>，<code>Danger</code> 为 <code>DangerSoft</code> + <code>Danger</code> 文字，无红框）；顶栏统一用无框 <code>40×40</code> <code>IconTap</code>（全仓改用 <code>icons/lucide</code>，废弃 <code>icons.go</code> 中与 Lucide 重复的常规图标，仅保留 Agent 专属图形或统一以清晰文字标签呈现）；Chat 发送/中断统一为固定 <code>34×34</code> 圆形按钮（发送为 <code>ArrowUp</code>，工作中无草稿时切换为同尺寸 <code>Square</code> 停止图标，保留 <code>TestID: &quot;session-interrupt-btn&quot;</code>，零跳宽）。</li>
+    <li><b>GroupCard &amp; SessionRow</b>：同分区（运行中 / 空闲 / 已结束）的 <code>SessionRow</code> 放进同一个 <code>GroupCard</code> 容器，行间用 <code>left: 34px</code> 的 <code>0.5px</code>（或 <code>1px</code> 淡色）内缩线分隔；每行由 <code>8px</code> 语义状态圆点 + 标题（<code>15px Medium</code>）+ 右侧精简程序名/状态（<code>Claude / Codex / Pi / Shell</code>）+ 可选摘要行（运行中展示，空闲省去）+ 干净单行等宽元数据（<code>host · cwd</code>，去掉灰底芯片包裹）构成。</li>
+    <li><b>InlineApprovalCard</b>：保持白名单二次校验安全红线不变；外框改用柔和语义淡描边，命令体放在 <code>pal.Bg</code> 等宽代码块中；白名单 <code>permission</code> 展示 <code>允许</code>（Primary）+ <code>拒绝</code>（DangerSoft）+ 终端图标按钮（Secondary）；其余 <code>question / auth / error</code> 展示全宽 Secondary「进入终端处理」。</li>
+    <li><b>FloatingComposer &amp; KeycapBar</b>：Chat 悬浮输入器使用 <code>GlassSurface</code> + <code>GlassBorder</code> + <code>22px</code> 圆角，去掉冗余灰拖把条（长文展开入口仍在 <code>+</code> 输入工具抽屉中保留）；底部操作行合并模型与思考强度入口，或者紧凑展示两个轻量胶囊且保持不拥挤（我们的决策：保留 <code>chat-model-selector</code> 与 <code>chat-effort-selector</code> 两个独立 <code>TestID</code> 触发器，确保现有 <code>mobile_workflow_test.go</code> 零回归，视觉上收敛为紧凑轻胶囊 <code>height: 28px</code>）。</li>
+    <li><b>UnifiedSheet &amp; SheetListRow</b>：所有抽屉（新建会话、会话切换器、会话工具、输入附件、常用短语、模型选择器、项目文件与 Git、tmux/Zellij 选择器、主机网页预览、语音听写、添加/编辑实例、扫码配对）统一复用 <code>SheetModal</code> 外壳与 <code>SheetListRow</code> / <code>GroupCard</code>，严禁再用居中 <code>ActionButton</code> 充当文件项或菜单项。</li>
+  </ol>
+  <h2 id="020G1JG-">7. <code>DESIGN.md</code>、运行时图鉴与守卫测试</h2>
+  <ul id="1MprFcG8">
+    <li><b>更新仓库根 <code>DESIGN.md</code></b>：以「规则而非历史」重写，包含 6 个章节：① 五维方向描述；② <code>theme.go</code> Token 表与职责约束；③ 字阶、4px 间距、圆角与四类页面响应布局规则；④ 核心 5 组件变体与适用场景；⑤ Don&apos;ts 禁忌清单；⑥ 发版前校验清单。</li>
+    <li><b>运行时 Tokens 页面与组件切片图鉴</b>：升级 <code>screen_settings.go</code> 的 <code>tokensGalleryScreen</code>，直接从运行时 <code>ThemeOf(cx)</code> 与 <code>TokenCatalog()</code> 读取色块与数值分组展示，并在顶部增加「核心组件实时切片」（Button / GroupCard / SessionRow / ApprovalCard / SheetListRow，真实文案，随亮暗主题即时切换，免登录直开）。</li>
+    <li>
+      <b>守卫测试（<code>theme_test.go</code>）</b>：
+      <ul>
+        <li>更新 <code>TestPaletteWCAGContrast</code>：覆盖全部新 Light/Dark 表面、<code>Running</code>/<code>Warn</code>/<code>Danger</code> 与 VT 对比度检查（全部 <code>&gt;= 4.5:1</code>，VT 主文本 <code>&gt;= 7.0:1</code>）。</li>
+        <li>扩展 <code>TestNoRawColorsInScreens</code>：扫描模式从 <code>screen_*.go, components.go</code> 扩展到全仓所有 UI 源文件（补充 <code>main.go</code>、<code>mobile_picker.go</code>、<code>project_browser.go</code>、<code>browser_preview.go</code>、<code>slash_commands.go</code>、<code>dictation.go</code>）。</li>
+        <li>新增 <code>TestTokenCatalogComplete</code>：校验 <code>Palette</code> 与 <code>Tokens</code> 的关键 Token 均在 <code>TokenCatalog()</code> 中有对应条目且色值与 <code>LightPalette()</code>/<code>DarkPalette()</code> 严格一致，杜绝文档/图鉴漂移。</li>
+      </ul>
+    </li>
+  </ul>
+  <h2 id="xoPp2cWz">8. 分阶段替换计划（Replacement Plan）</h2>
+  <steps id="-v_mmAfD">
+    <step id="s_gpfo9v5n" title="阶段 1：重写 theme.go Tokens 与守卫测试">
+      <p>在 <code>theme.go</code> 落地 Quiet Studio 亮/暗/VT 色板（新增 <code>Running</code>/<code>RunningSoft</code>，修正 <code>AppTheme()</code> 悬停/按压态分化）、严格 4px <code>Tokens</code> 常量与同步的 <code>TokenCatalog()</code>；同步更新 <code>theme_test.go</code> 并新增 <code>TestTokenCatalogComplete</code> 与全 UI 文件裸色扫描。</p>
+    </step>
+    <step id="s_3igjot3a" title="阶段 2：重构 components.go 公共原语并统一 Lucide 图标">
+      <p>统一 <code>TopHeader</code>（通透模式与带细底线模式）、<code>IconTap</code>（40×40 无框 Lucide）、<code>GroupCard</code>、<code>InsetSeparator</code>、<code>SessionRow</code>（8px 圆点 + 去框去彩条）、<code>InlineApprovalCard</code>、<code>FloatingTabBar</code>（56px 悬浮胶囊）、<code>WideNavRail</code>（56px 左侧桌面 Rail）、<code>SheetModal</code>（20px 顶圆角 + 圆形关闭键）与 <code>SheetListRow</code>；精简 <code>icons.go</code> 移除与 <code>icons/lucide</code> 重复的手写 SVG。</p>
+    </step>
+    <step id="s_4vxlur57" title="阶段 3：升级主壳与三大一级页（main.go / Home / Inbox / Instances）">
+      <p><code>main.go</code> 实现 <code>&lt;680px</code> 悬浮底栏与 <code>&gt;=680px</code>「56px Rail + 280px 侧栏 + 右侧内容」三段骨架；重塑 <code>screen_home.go</code>（无横线顶栏与胶囊筛选、分区 <code>GroupCard</code>、轻量化折叠头与已结束入口）、<code>screen_inbox.go</code>（圆角搜索框 + 按紧急类型分三组展示 <code>AggregatedAttention()</code>：① <code>权限审批</code> <code>CanInlineApprove</code>、② <code>等待回答与认证</code> 其余 blocked、③ <code>异常与限流</code> error，空组隐藏，对应 <code>flow-inbox</code>）、<code>screen_instances.go</code>（干净延迟/TOFU 卡 + 轻量化操作行，以及统一 <code>SheetModal</code> 表单/扫码弹窗）。</p>
+    </step>
+    <step id="s_3vxecx1p" title="阶段 4：升级会话页与 Chat 视图（screen_session.go / screen_chat.go）">
+      <p>重塑会话顶栏（搜索收入工具抽屉，保留 <code>session-search-btn</code> TestID；宽屏 Chat 居中限宽 <code>720px</code>，VT 全宽）；修复 <code>screen_chat.go</code> 字号倒挂（用户气泡与 AI 回复统一 <code>15px</code>）、卡片化工具调用折叠行、重构 <code>chat-glass-composer</code>（去灰把手、<code>GlassSurface</code> + <code>GlassBorder</code>、固定 34×34 圆形发送/停止双态键，保留 <code>session-interrupt-btn</code>）。</p>
+    </step>
+    <step id="s_jos9w7mx" title="阶段 5：统一全部二级页与 7 类底部抽屉">
+      <p>全面改造 <code>screen_settings.go</code>（Inset Grouped 开关与密钥行 + 运行时 Tokens 实时切片图鉴）、<code>screen_onboarding.go</code>（无框分组步骤与紧凑命令盒）、<code>screen_new_session.go</code>、<code>project_browser.go</code>（左对齐带文件夹/代码图标 <code>SheetListRow</code> 替代居中按钮）、<code>screen_multiplexer.go</code>（左对齐会话列表）、<code>mobile_picker.go</code>（走 <code>SheetModal</code> + 勾选行）、<code>browser_preview.go</code>、<code>dictation.go</code> 与 <code>slash_commands.go</code>。</p>
+    </step>
+    <step id="s_vchyhc1j" title="阶段 6：更新 DESIGN.md、回归测试与视觉核验">
+      <p>重写根 <code>DESIGN.md</code>；同步更新受布局/色值变更影响的 <code>ui_test.go</code> 断言；运行 <code>go test -race ./...</code> 全绿及 <code>go tool nsgo build -target android_arm64</code> 打包验证。</p>
+    </step>
+  </steps>
+  <h2 id="Lnjdyq2L">9. 核验对照计划（Verify Plan）</h2>
+  <p id="Ldt3iuuz">实现完成后按 <code>ryugi:verifying</code> 运行完整测试并逐屏核对：</p>
+  <ul id="lYPqgHnR">
+    <li><b>自动化验证</b>：<code>go test -v -race ./...</code>（含 <code>TestPaletteWCAGContrast</code>、<code>TestNoRawColorsInScreens</code>、<code>TestTokenCatalogComplete</code> 及全套 <code>nsgotest</code> 窄屏 <code>390×844</code> + 宽屏 <code>960×720</code> UI 测试）与 <code>go tool nsgo build -target android_arm64</code>。</li>
+    <li><b>视觉对照矩阵</b>：首页 ↔ <code>lay-home-float</code> / <code>flow-home</code>；会话 Chat ↔ <code>lay-session-clean</code> / <code>flow-chat</code>；会话 VT ↔ <code>flow-vt</code>；宽屏分栏 ↔ <code>lay-wide-rail</code>；待办 ↔ <code>flow-inbox</code>；统一抽屉 ↔ <code>flow-sheets</code>；新建会话 ↔ <code>flow-new-session</code>；实例池 ↔ <code>flow-instances</code>；设置与图鉴 ↔ <code>flow-settings</code>；冷启动引导 ↔ <code>flow-onboarding</code>。</li>
+  </ul>
+  <h2 id="KNkggAVc">10. 留给实现者的自主权（Builder Discretion）</h2>
+  <ul id="78gCk6DH">
+    <li>NSGo 具体节点封装细节（例如 <code>GroupCard</code> 是通过外层容器 + 子节点渲染内缩线，还是提供 helper 函数 <code>GroupedList(cx, a, rows)</code>），以代码最简洁、兼容 <code>core.Each</code> 响应式更新为准。</li>
+    <li>宽屏模式下顶部「设置」图标既在左侧 Rail 底部展示，因此在宽屏时首页侧栏顶栏可自动隐藏重复的设置图标（避免同一导航出现两次，遵循 <code>checks.md</code>）。</li>
+    <li><code>SheetModal</code> 遮罩与圆角若受 NSGo <code>ui.Sheet</code> 内部默认样式约束，在不魔改框架的前提下选择与 <code>Quiet Studio</code> 最贴合的样式组合，并在验证报告中说明任何框架级差异。</li>
+  </ul>
+</doc>
+
