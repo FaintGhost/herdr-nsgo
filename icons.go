@@ -46,8 +46,10 @@ var (
 	iconTriangleAlert = lucide.TriangleAlert()
 	iconInfo          = lucide.Info()
 	iconMic           = lucide.Mic()
-	iconPalette  = lucide.Palette()
-	iconType     = lucide.Type()
+	iconPalette       = lucide.Palette()
+	iconType          = lucide.Type()
+	iconSort          = lucide.ArrowUpDown()
+	iconGrip          = lucide.GripVertical()
 
 	// Official Pi Coding Agent (pi.dev) colorful "P" brand mark (Coral #F09082, Blue #4D9ABF, Yellow #F1BE58).
 	iconPiBrand = core.MustParseSVG([]byte(

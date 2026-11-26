@@ -2,20 +2,27 @@ package main
 
 import (
 	"fmt"
+	"time"
 
+	"github.com/nsgo-dev/nsgo/base/dragdrop"
 	"github.com/nsgo-dev/nsgo/core"
 	"github.com/nsgo-dev/nsgo/ui"
 )
 
 // homeScreen renders the Quiet Studio attention-priority Home tab:
 // borderless top header, pill host filters directly on Bg, and grouped inset cards
-// ("需要你" inline approvals -> "运行中" -> collapsible "就绪与空闲" -> subtle "已结束").
+// ("需要你" inline approvals -> "运行中" -> collapsible "就绪与空闲" -> subtle "已结束"),
+// with active-time (newest/oldest) sorting and long-press drag-to-reorder.
 func (u *uiController) homeScreen(cx *core.Scope, wide bool) core.Node {
 	a := u.app
 	showSearch := core.NewSignal(cx, false)
+	showSortSheet := core.NewSignal(cx, false)
 	showIdle := core.NewSignal(cx, true)
 	showFinished := core.NewSignal(cx, false)
 	expandedGroups := core.NewSignalFunc(cx, map[string]bool{}, nil)
+	draggingKey := core.NewSignal(cx, "")
+	dropTargetKey := core.NewSignal(cx, "")
+	dropTargetAfter := core.NewSignal(cx, false)
 
 	toggleGroup := func(key string) {
 		animateSpringLayout(cx)
@@ -47,6 +54,12 @@ func (u *uiController) homeScreen(cx *core.Scope, wide bool) core.Node {
 
 	filteredBuckets := func() (working, rest []SessionGroup, finished []AggregatedTerminal) {
 		active, fin := GroupSessions(a.FilteredTerminals())
+		mode := a.SessionSort()
+		order := a.ManualSessionOrder()
+		live := a.LiveActiveMap()
+		if mode == SortManual {
+			return SortSessionGroups(active, mode, order, live), nil, fin
+		}
 		for _, g := range active {
 			isWorking := g.Primary.Terminal.StateWord() == "working" || g.ActiveChildren > 0
 			if isWorking {
@@ -55,7 +68,21 @@ func (u *uiController) homeScreen(cx *core.Scope, wide bool) core.Node {
 				rest = append(rest, g)
 			}
 		}
+		working = SortSessionGroups(working, mode, order, live)
+		rest = SortSessionGroups(rest, mode, order, live)
 		return working, rest, fin
+	}
+
+	allVisibleGroupKeys := func() []string {
+		w, r, _ := filteredBuckets()
+		keys := make([]string, 0, len(w)+len(r))
+		for _, g := range w {
+			keys = append(keys, g.Primary.Key.String())
+		}
+		for _, g := range r {
+			keys = append(keys, g.Primary.Key.String())
+		}
+		return keys
 	}
 
 	renderSessionGroupItem := func(cx *core.Scope, item func() SessionGroup, idx func() int) core.Node {
@@ -68,17 +95,170 @@ func (u *uiController) homeScreen(cx *core.Scope, wide bool) core.Node {
 			}
 			return g.AttentionChildren > 0
 		}
+
+		dropIndicator := func(show func() bool) core.Node {
+			return core.Show{
+				When: show,
+				Then: func(cx *core.Scope) core.Node {
+					return core.View{
+						StyleFunc: func() core.Style {
+							return core.Style{
+								Height:       core.Pt(2),
+								Margin:       core.Symmetric(0, Tokens.Space3),
+								CornerRadius: Tokens.RadiusPill,
+								Background:   a.paletteOf(cx).Running,
+							}
+						},
+					}
+				},
+			}
+		}
+
+		rowContent := core.View{
+			StyleFunc: func() core.Style {
+				var op core.Opacity
+				if draggingKey.Get() == rootKey {
+					op = core.Alpha(0.42)
+				}
+				return core.Style{
+					Direction:  core.Row,
+					AlignItems: core.AlignCenter,
+					Opacity:    op,
+				}
+			},
+			Children: []core.Node{
+				core.View{
+					Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinWidth: core.Pt(0)},
+					Children: []core.Node{
+						SessionRow(cx, a, func() AggregatedTerminal { return item().Primary }, func() bool {
+							return u.activeSession.Get() == item().Primary.Key
+						}, func(k TermKey) {
+							u.openSession(cx, k)
+						}),
+					},
+				},
+				core.Show{
+					When: func() bool { return a.SessionSort() == SortManual },
+					Then: func(cx *core.Scope) core.Node {
+						return core.View{
+							Style: core.Style{
+								Padding:    core.Edges{Right: 10, Left: 2},
+								FlexShrink: 0,
+							},
+							Children: []core.Node{
+								core.Icon{
+									SVG: iconGrip,
+									StyleFunc: func() core.Style {
+										return core.Style{Width: core.Pt(15), Height: core.Pt(15), Color: a.paletteOf(cx).TextMuted}
+									},
+								},
+							},
+						}
+					},
+				},
+			},
+		}
+
+		draggableRow := dragdrop.Target{
+			Accept: func(data any) bool {
+				k, ok := data.(string)
+				return ok && k != "" && k != rootKey
+			},
+			OnEnter: func(ev dragdrop.Event) {
+				dropTargetKey.Set(rootKey)
+				dropTargetAfter.Set(ev.Position.Y > 30)
+			},
+			OnMove: func(ev dragdrop.Event) {
+				if dropTargetKey.GetUntracked() != rootKey {
+					dropTargetKey.Set(rootKey)
+				}
+				dropTargetAfter.Set(ev.Position.Y > 30)
+			},
+			OnLeave: func(dragdrop.Event) {
+				if dropTargetKey.GetUntracked() == rootKey {
+					dropTargetKey.Set("")
+				}
+			},
+			OnDrop: func(ev dragdrop.Event) {
+				fromKey, _ := ev.Data.(string)
+				after := ev.Position.Y > 30
+				dropTargetKey.Set("")
+				draggingKey.Set("")
+				if fromKey != "" && fromKey != rootKey {
+					animateSpringLayout(cx)
+					playSelectionHaptic(cx)
+					a.ReorderSession(fromKey, rootKey, allVisibleGroupKeys(), after)
+					a.notifyToast("已更新手动排序")
+				}
+			},
+			View: core.View{
+				Children: []core.Node{
+					dropIndicator(func() bool { return dropTargetKey.Get() == rootKey && !dropTargetAfter.Get() }),
+					dragdrop.Source{
+						Activation: dragdrop.AfterLongPress,
+						Threshold:  4,
+						Data:       func() any { return rootKey },
+						OnStart: func(any) {
+							draggingKey.Set(rootKey)
+							if cx != nil && !cx.Env().Simulated() {
+								cx.PlayHaptic(core.HapticMedium)
+							}
+						},
+						OnEnd: func(dragdrop.Result) {
+							draggingKey.Set("")
+							dropTargetKey.Set("")
+						},
+						Preview: func(any) core.Node {
+							return core.View{
+								StyleFunc: func() core.Style {
+									pal := a.paletteOf(cx)
+									return core.Style{
+										Direction:    core.Row,
+										AlignItems:   core.AlignCenter,
+										Gap:          Tokens.Space2,
+										Background:   pal.GlassSurface,
+										BorderWidth:  1,
+										BorderColor:  pal.GlassBorder,
+										CornerRadius: Tokens.RadiusCard,
+										Padding:      core.Symmetric(Tokens.Space2, Tokens.Space3),
+										ShadowColor:  pal.Overlay,
+										ShadowOffset: core.Point{Y: 6},
+										ShadowRadius: 16,
+									}
+								},
+								Children: []core.Node{
+									HarnessBrandIcon(cx, a, func() Terminal { return item().Primary.Terminal }, "", 15),
+									core.Text{
+										MaxLines:    1,
+										ContentFunc: func() string { return item().Primary.Terminal.Label() },
+										StyleFunc: func() core.Style {
+											return core.Style{
+												Color:      a.paletteOf(cx).Text,
+												FontSize:   Tokens.FontRowTitle,
+												FontWeight: core.FontWeightMedium,
+											}
+										},
+									},
+								},
+							}
+						},
+						View: core.View{
+							DelayLongPress: 280 * time.Millisecond,
+							Children:       []core.Node{rowContent},
+						},
+					},
+					dropIndicator(func() bool { return dropTargetKey.Get() == rootKey && dropTargetAfter.Get() }),
+				},
+			},
+		}
+
 		return core.View{
 			Children: []core.Node{
 				core.Show{
 					When: func() bool { return idx() > 0 },
 					Then: func(cx *core.Scope) core.Node { return InsetDivider(cx, a, 34) },
 				},
-				SessionRow(cx, a, func() AggregatedTerminal { return item().Primary }, func() bool {
-					return u.activeSession.Get() == item().Primary.Key
-				}, func(k TermKey) {
-					u.openSession(cx, k)
-				}),
+				draggableRow,
 				// Sub-sessions disclosure row when parent spawned child terminals
 				core.Show{
 					When: func() bool { return len(item().Children) > 0 },
@@ -203,6 +383,10 @@ func (u *uiController) homeScreen(cx *core.Scope, wide bool) core.Node {
 	}
 
 	headerRight := []core.Node{
+		IconTap(cx, a, "home-sort-btn", "排序方式", iconSort, func() {
+			playSelectionHaptic(cx)
+			showSortSheet.Set(true)
+		}),
 		IconTap(cx, a, "home-search-btn", "搜索会话", iconSearch, func() {
 			animateSpringLayout(cx)
 			showSearch.Set(!showSearch.Get())
@@ -280,6 +464,17 @@ func (u *uiController) homeScreen(cx *core.Scope, wide bool) core.Node {
 									})
 								},
 							),
+							core.Show{
+								When: func() bool { return a.SessionSort() != SortActiveNewest },
+								Then: func(cx *core.Scope) core.Node {
+									return FilterPill(cx, a, "home-sort-pill", func() string {
+										return "排序 · " + a.SessionSort().Label()
+									}, func() bool { return true }, nil, func() {
+										playSelectionHaptic(cx)
+										showSortSheet.Set(true)
+									})
+								},
+							},
 						},
 					},
 				},
@@ -315,11 +510,13 @@ func (u *uiController) homeScreen(cx *core.Scope, wide bool) core.Node {
 					}
 				},
 			},
-			// Main scrollable feed
-			core.Scroll{
-				EdgeEffects: core.EdgeEffects{Top: core.EdgeEffectSoft, Bottom: core.EdgeEffectSoft},
-				Style:       core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0)},
+			// Main scrollable feed wrapped in dragdrop.Area for long-press drag-to-reorder
+			dragdrop.Area{
 				Children: []core.Node{
+					core.Scroll{
+						EdgeEffects: core.EdgeEffects{Top: core.EdgeEffectSoft, Bottom: core.EdgeEffectSoft},
+						Style:       core.Style{FlexGrow: 1, FlexShrink: 1, MinHeight: core.Pt(0)},
+						Children: []core.Node{
 					core.View{
 						Style: core.Style{
 							Padding: core.Edges{
@@ -454,7 +651,7 @@ func (u *uiController) homeScreen(cx *core.Scope, wide bool) core.Node {
 									)
 								},
 							},
-							// Section 2: "运行中" (Grouped inset card)
+							// Section 2: "运行中" (or unified "活跃会话" when in manual drag-reorder mode)
 							core.Show{
 								When: func() bool {
 									w, _, _ := filteredBuckets()
@@ -466,6 +663,9 @@ func (u *uiController) homeScreen(cx *core.Scope, wide bool) core.Node {
 										Children: []core.Node{
 											SectionHeader(cx, a, func() string {
 												w, _, _ := filteredBuckets()
+												if a.SessionSort() == SortManual {
+													return fmt.Sprintf("活跃会话 · %d", len(w))
+												}
 												return fmt.Sprintf("运行中 · %d", len(w))
 											}, nil),
 											GroupCard(cx, a, "home-group-working", []core.Node{
@@ -663,6 +863,44 @@ func (u *uiController) homeScreen(cx *core.Scope, wide bool) core.Node {
 							},
 						},
 					},
+				},
+			},
+				},
+			},
+			// Sort Mode Bottom Sheet
+			core.Show{
+				When: showSortSheet.Get,
+				Then: func(cx *core.Scope) core.Node {
+					pickSort := func(mode SessionSortMode, toast string) {
+						animateSpringLayout(cx)
+						playSelectionHaptic(cx)
+						a.SetSessionSort(mode)
+						showSortSheet.Set(false)
+						if toast != "" {
+							a.notifyToast(toast)
+						}
+					}
+					modeBadge := func(m SessionSortMode) string {
+						if a.SessionSort() == m {
+							return "当前"
+						}
+						return ""
+					}
+					return SheetModal(cx, a, "home-sort-sheet", "会话排序", "支持按活跃时间排序或长按拖拽自由排序", func() { showSortSheet.Set(false) }, []core.Node{
+						GroupCard(cx, a, "", []core.Node{
+							SheetListRow(cx, a, "sort-mode-newest", "最近活跃（新 → 旧）", modeBadge(SortActiveNewest), iconSort, false, false, func() {
+								pickSort(SortActiveNewest, "已按最近活跃排序")
+							}),
+							InsetDivider(cx, a, 14),
+							SheetListRow(cx, a, "sort-mode-oldest", "最早活跃（旧 → 新）", modeBadge(SortActiveOldest), iconSort, false, false, func() {
+								pickSort(SortActiveOldest, "已按最早活跃排序")
+							}),
+							InsetDivider(cx, a, 14),
+							SheetListRow(cx, a, "sort-mode-manual", "手动拖拽排序", modeBadge(SortManual), iconGrip, false, false, func() {
+								pickSort(SortManual, "长按任意会话行即可拖拽调整顺序")
+							}),
+						}),
+					})
 				},
 			},
 		},

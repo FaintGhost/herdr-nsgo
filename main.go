@@ -586,6 +586,7 @@ func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 	}
 	u.activeSession.Set(key)
 	u.app.SetActiveSession(key)
+	u.app.TouchSessionActivity(key)
 
 	// Determine initial mode: remembered per-session choice -> Agent="chat" / Shell="vt".
 	mode, remembered := u.sessionModes[key]

@@ -119,6 +119,18 @@ func (t Terminal) NeedsYou() bool {
 	return false
 }
 
+// ActiveMS returns the most recent known activity timestamp (ms) reported by herdr-core for this terminal.
+func (t Terminal) ActiveMS() uint64 {
+	best := t.CreatedMS
+	if t.StatusMS != nil && *t.StatusMS > best {
+		best = *t.StatusMS
+	}
+	if t.FinishedMS != nil && *t.FinishedMS > best {
+		best = *t.FinishedMS
+	}
+	return best
+}
+
 // Finished reports a terminal whose program is gone.
 func (t Terminal) Finished() bool {
 	return t.FinishedMS != nil || t.ExitCode != nil || t.State == "finished"

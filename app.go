@@ -50,10 +50,12 @@ type AppPrefs struct {
 	BodyFont        BodyFontPreset `json:"body_font,omitempty"`
 	MonoFont        MonoFontPreset `json:"mono_font,omitempty"`
 	BodyFontSize    float32        `json:"body_font_size,omitempty"`
-	ObserveDefault  bool           `json:"observe_default"`
-	FrameCacheOn    bool           `json:"frame_cache_on"`
-	NotifyAlerts    bool           `json:"notify_alerts"`
-	DefaultSendMode chatSubmitMode `json:"default_send_mode,omitempty"`
+	ObserveDefault     bool            `json:"observe_default"`
+	FrameCacheOn       bool            `json:"frame_cache_on"`
+	NotifyAlerts       bool            `json:"notify_alerts"`
+	DefaultSendMode    chatSubmitMode  `json:"default_send_mode,omitempty"`
+	SessionSort        SessionSortMode `json:"session_sort,omitempty"`
+	ManualSessionOrder []string        `json:"manual_session_order,omitempty"`
 }
 
 func defaultPrefs() AppPrefs {
@@ -70,6 +72,7 @@ func defaultPrefs() AppPrefs {
 		FrameCacheOn:    true,
 		NotifyAlerts:    true,
 		DefaultSendMode: chatQueue,
+		SessionSort:     SortActiveNewest,
 	}
 }
 
@@ -162,6 +165,8 @@ type App struct {
 	notifyAlerts         *core.Signal[bool]
 	notifPerm            *core.Signal[core.NotificationPermission]
 	defaultSendMode      *core.Signal[chatSubmitMode]
+	sessionSort          *core.Signal[SessionSortMode]
+	manualSessionOrder   *core.Signal[[]string]
 	snippets             *core.Signal[[]Snippet]
 	tofuRecords          *core.Signal[[]TOFURecord]
 	localPubKey          *core.Signal[string]
@@ -199,6 +204,8 @@ type App struct {
 	catalogFetchInFly     map[string]bool
 	catalogFetchedAt   map[string]time.Time
 	prevTermStates     map[TermKey]string
+	prevTermSigs       map[TermKey]string
+	lastActiveMS       map[TermKey]uint64
 	activeSessionKey   TermKey
 	alerts             *alertTracker
 	onNotify           func(TermKey)
@@ -236,6 +243,8 @@ func NewApp(cx *core.Scope) *App {
 		notifyAlerts:         core.NewSignal(cx, prefs.NotifyAlerts),
 		notifPerm:            core.NewSignal(cx, core.NotificationsNotAsked),
 		defaultSendMode:      core.NewSignal(cx, prefs.DefaultSendMode),
+		sessionSort:          core.NewSignal(cx, prefs.SessionSort),
+		manualSessionOrder:   core.NewSignalFunc(cx, append([]string(nil), prefs.ManualSessionOrder...), nil),
 		snippets:             core.NewSignalFunc(cx, loadSnippets(cx), nil),
 		tofuRecords:          core.NewSignalFunc(cx, []TOFURecord(nil), nil),
 		localPubKey:          core.NewSignal(cx, ""),
@@ -1029,6 +1038,13 @@ func (a *App) trackCompletionTransitions(agg []AggregatedTerminal) {
 	if a.prevTermStates == nil {
 		a.prevTermStates = make(map[TermKey]string)
 	}
+	if a.prevTermSigs == nil {
+		a.prevTermSigs = make(map[TermKey]string)
+	}
+	if a.lastActiveMS == nil {
+		a.lastActiveMS = make(map[TermKey]uint64)
+	}
+	nowMS := uint64(time.Now().UnixMilli())
 	var newlyDone []TermKey
 	var resumedWorking []TermKey
 	seen := make(map[TermKey]bool, len(agg))
@@ -1036,6 +1052,16 @@ func (a *App) trackCompletionTransitions(agg []AggregatedTerminal) {
 		seen[item.Key] = true
 		cur := item.Terminal.StateWord()
 		prev := a.prevTermStates[item.Key]
+		if base := item.Terminal.ActiveMS(); base > a.lastActiveMS[item.Key] {
+			a.lastActiveMS[item.Key] = base
+		}
+		sig := fmt.Sprintf("%s|%d|%s|%s", cur, item.Terminal.Turn, item.Terminal.Title, firstLine(item.Terminal.Status, item.Terminal))
+		if oldSig, had := a.prevTermSigs[item.Key]; had && oldSig != sig {
+			if nowMS > a.lastActiveMS[item.Key] {
+				a.lastActiveMS[item.Key] = nowMS
+			}
+		}
+		a.prevTermSigs[item.Key] = sig
 		if cur == "working" {
 			resumedWorking = append(resumedWorking, item.Key)
 		} else if prev == "working" && (cur == "idle" || cur == "done") && item.Key != activeKey {
@@ -1046,6 +1072,7 @@ func (a *App) trackCompletionTransitions(agg []AggregatedTerminal) {
 	for k := range a.prevTermStates {
 		if !seen[k] {
 			delete(a.prevTermStates, k)
+			delete(a.prevTermSigs, k)
 		}
 	}
 	a.mu.Unlock()
@@ -1592,6 +1619,9 @@ func loadPrefs(cx *core.Scope) AppPrefs {
 	if p.DefaultSendMode != chatQueue && p.DefaultSendMode != chatSteer {
 		p.DefaultSendMode = chatQueue
 	}
+	if p.SessionSort != SortActiveNewest && p.SessionSort != SortActiveOldest && p.SessionSort != SortManual {
+		p.SessionSort = SortActiveNewest
+	}
 	return p
 }
 
@@ -1600,18 +1630,20 @@ func (a *App) savePrefs() {
 		return
 	}
 	p := AppPrefs{
-		ThemeMode:       a.themeMode.Get(),
-		ThemePreset:     a.themePreset.Get(),
-		VTThemeMode:     a.vtThemeMode.Get(),
-		VTColorScheme:   a.vtColorScheme.Get(),
-		VTFontSize:      a.vtFontSize.Get(),
-		BodyFont:        a.bodyFont.Get(),
-		MonoFont:        a.monoFont.Get(),
-		BodyFontSize:    a.bodyFontSize.Get(),
-		ObserveDefault:  a.observeDefault.Get(),
-		FrameCacheOn:    a.frameCacheOn.Get(),
-		NotifyAlerts:    a.notifyAlerts.Get(),
-		DefaultSendMode: a.defaultSendMode.Get(),
+		ThemeMode:          a.themeMode.Get(),
+		ThemePreset:        a.themePreset.Get(),
+		VTThemeMode:        a.vtThemeMode.Get(),
+		VTColorScheme:      a.vtColorScheme.Get(),
+		VTFontSize:         a.vtFontSize.Get(),
+		BodyFont:           a.bodyFont.Get(),
+		MonoFont:           a.monoFont.Get(),
+		BodyFontSize:       a.bodyFontSize.Get(),
+		ObserveDefault:     a.observeDefault.Get(),
+		FrameCacheOn:       a.frameCacheOn.Get(),
+		NotifyAlerts:       a.notifyAlerts.Get(),
+		DefaultSendMode:    a.defaultSendMode.Get(),
+		SessionSort:        a.sessionSort.Get(),
+		ManualSessionOrder: append([]string(nil), a.manualSessionOrder.Get()...),
 	}
 	if raw, err := json.Marshal(p); err == nil {
 		a.cx.Storage().SetItem(prefsKey, string(raw))
@@ -1726,6 +1758,93 @@ func (a *App) DefaultSendMode() chatSubmitMode {
 		return chatQueue
 	}
 	return m
+}
+
+// SessionSort returns the active Home session sort mode.
+func (a *App) SessionSort() SessionSortMode {
+	if a.sessionSort == nil {
+		return SortActiveNewest
+	}
+	m := a.sessionSort.Get()
+	if m != SortActiveNewest && m != SortActiveOldest && m != SortManual {
+		return SortActiveNewest
+	}
+	return m
+}
+
+// SetSessionSort updates and persists the Home session sort mode.
+func (a *App) SetSessionSort(m SessionSortMode) {
+	if m != SortActiveNewest && m != SortActiveOldest && m != SortManual {
+		m = SortActiveNewest
+	}
+	a.sessionSort.Set(m)
+	a.savePrefs()
+}
+
+// ManualSessionOrder returns the persisted manual session ordering.
+func (a *App) ManualSessionOrder() []string {
+	if a.manualSessionOrder == nil {
+		return nil
+	}
+	return a.manualSessionOrder.Get()
+}
+
+// ReorderSession moves fromKey relative to toKey (seeding from visibleKeys), switches to SortManual, and persists.
+func (a *App) ReorderSession(fromKey, toKey string, visibleKeys []string, placeAfter bool) {
+	if fromKey == "" || toKey == "" || fromKey == toKey {
+		return
+	}
+	cur := a.manualSessionOrder.GetUntracked()
+	base := make([]string, 0, len(visibleKeys)+len(cur))
+	seen := make(map[string]bool, len(visibleKeys)+len(cur))
+	for _, k := range visibleKeys {
+		if k != "" && !seen[k] {
+			seen[k] = true
+			base = append(base, k)
+		}
+	}
+	for _, k := range cur {
+		if k != "" && !seen[k] {
+			seen[k] = true
+			base = append(base, k)
+		}
+	}
+	next := ReorderKeySlice(base, fromKey, toKey, placeAfter)
+	a.manualSessionOrder.Set(next)
+	if a.sessionSort.GetUntracked() != SortManual {
+		a.sessionSort.Set(SortManual)
+	}
+	a.savePrefs()
+}
+
+// TouchSessionActivity records recent user interaction with a session so SortActiveNewest reflects it immediately.
+func (a *App) TouchSessionActivity(key TermKey) {
+	if key == (TermKey{}) {
+		return
+	}
+	nowMS := uint64(time.Now().UnixMilli())
+	a.mu.Lock()
+	if a.lastActiveMS == nil {
+		a.lastActiveMS = make(map[TermKey]uint64)
+	}
+	if nowMS > a.lastActiveMS[key] {
+		a.lastActiveMS[key] = nowMS
+	}
+	a.mu.Unlock()
+}
+
+// LiveActiveMap returns a snapshot copy of observed activity timestamps for sorting.
+func (a *App) LiveActiveMap() map[TermKey]uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.lastActiveMS) == 0 {
+		return nil
+	}
+	cp := make(map[TermKey]uint64, len(a.lastActiveMS))
+	for k, v := range a.lastActiveMS {
+		cp[k] = v
+	}
+	return cp
 }
 
 // SetDefaultSendMode updates and persists the default message send behavior (等待 / 插队).

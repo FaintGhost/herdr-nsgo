@@ -259,6 +259,156 @@ func (tr *alertTracker) diff(snaps []InstanceSnapshot, agg []AggregatedTerminal)
 	return alerts
 }
 
+// SessionSortMode controls how active sessions are ordered on the Home screen.
+type SessionSortMode string
+
+const (
+	SortActiveNewest SessionSortMode = "active_newest" // 最近活跃（新→旧）
+	SortActiveOldest SessionSortMode = "active_oldest" // 最早活跃（旧→新）
+	SortManual       SessionSortMode = "manual"        // 手动拖拽排序
+)
+
+func (m SessionSortMode) Label() string {
+	switch m {
+	case SortActiveOldest:
+		return "最早活跃"
+	case SortManual:
+		return "手动排序"
+	default:
+		return "最近活跃"
+	}
+}
+
+// GroupActiveMS returns the latest activity timestamp (ms) across a parent session and its sub-sessions.
+func GroupActiveMS(g SessionGroup, live map[TermKey]uint64) uint64 {
+	best := g.Primary.Terminal.ActiveMS()
+	if live != nil {
+		if ts := live[g.Primary.Key]; ts > best {
+			best = ts
+		}
+	}
+	for _, ch := range g.Children {
+		if ts := ch.Terminal.ActiveMS(); ts > best {
+			best = ts
+		}
+		if live != nil {
+			if ts := live[ch.Key]; ts > best {
+				best = ts
+			}
+		}
+	}
+	return best
+}
+
+// SortSessionGroups orders session groups by active time (newest/oldest) or persisted manual drag order.
+func SortSessionGroups(groups []SessionGroup, mode SessionSortMode, manualOrder []string, live map[TermKey]uint64) []SessionGroup {
+	if len(groups) <= 1 {
+		return groups
+	}
+	out := make([]SessionGroup, len(groups))
+	copy(out, groups)
+
+	switch mode {
+	case SortActiveOldest:
+		sort.SliceStable(out, func(i, j int) bool {
+			ai := GroupActiveMS(out[i], live)
+			aj := GroupActiveMS(out[j], live)
+			if ai != aj {
+				return ai < aj
+			}
+			if out[i].Primary.Terminal.CreatedMS != out[j].Primary.Terminal.CreatedMS {
+				return out[i].Primary.Terminal.CreatedMS < out[j].Primary.Terminal.CreatedMS
+			}
+			return out[i].Primary.Key.String() < out[j].Primary.Key.String()
+		})
+	case SortManual:
+		rank := make(map[string]int, len(manualOrder))
+		for idx, k := range manualOrder {
+			if _, exists := rank[k]; !exists {
+				rank[k] = idx
+			}
+		}
+		sort.SliceStable(out, func(i, j int) bool {
+			ki := out[i].Primary.Key.String()
+			kj := out[j].Primary.Key.String()
+			ri, oki := rank[ki]
+			rj, okj := rank[kj]
+			if oki && okj {
+				return ri < rj
+			}
+			// Brand-new sessions not yet placed manually float cleanly to the top by newest activity.
+			if oki != okj {
+				return !oki
+			}
+			ai := GroupActiveMS(out[i], live)
+			aj := GroupActiveMS(out[j], live)
+			if ai != aj {
+				return ai > aj
+			}
+			return ki < kj
+		})
+	default: // SortActiveNewest
+		sort.SliceStable(out, func(i, j int) bool {
+			ai := GroupActiveMS(out[i], live)
+			aj := GroupActiveMS(out[j], live)
+			if ai != aj {
+				return ai > aj
+			}
+			if out[i].Primary.Terminal.CreatedMS != out[j].Primary.Terminal.CreatedMS {
+				return out[i].Primary.Terminal.CreatedMS > out[j].Primary.Terminal.CreatedMS
+			}
+			return out[i].Primary.Key.String() < out[j].Primary.Key.String()
+		})
+	}
+	return out
+}
+
+// ReorderKeySlice moves fromKey to the position of toKey (before or after), seeding from baseOrder.
+func ReorderKeySlice(baseOrder []string, fromKey, toKey string, placeAfter bool) []string {
+	if fromKey == "" || toKey == "" || fromKey == toKey {
+		return append([]string(nil), baseOrder...)
+	}
+	seen := make(map[string]bool, len(baseOrder)+2)
+	clean := make([]string, 0, len(baseOrder)+2)
+	for _, k := range baseOrder {
+		if k != "" && !seen[k] {
+			seen[k] = true
+			clean = append(clean, k)
+		}
+	}
+	if !seen[fromKey] {
+		clean = append(clean, fromKey)
+	}
+	if !seen[toKey] {
+		clean = append(clean, toKey)
+	}
+	without := make([]string, 0, len(clean)-1)
+	for _, k := range clean {
+		if k != fromKey {
+			without = append(without, k)
+		}
+	}
+	targetIdx := -1
+	for i, k := range without {
+		if k == toKey {
+			targetIdx = i
+			break
+		}
+	}
+	if targetIdx < 0 {
+		return append(without, fromKey)
+	}
+	insertAt := targetIdx
+	if placeAfter {
+		insertAt = targetIdx + 1
+	}
+	res := make([]string, 0, len(without)+1)
+	res = append(res, without[:insertAt]...)
+	res = append(res, fromKey)
+	res = append(res, without[insertAt:]...)
+	return res
+}
+
 // SessionGroup pairs a top-level parent terminal with any child sub-sessions spawned from it (via Terminal.Parent).
 type SessionGroup struct {
 	Primary           AggregatedTerminal
