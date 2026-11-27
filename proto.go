@@ -112,6 +112,9 @@ func (t Terminal) StateWord() string {
 // NeedsYou reports a terminal waiting on a person: blocked (permission,
 // question, auth) or error. This is the inbox's whole definition.
 func (t Terminal) NeedsYou() bool {
+	if t.Finished() {
+		return false
+	}
 	switch t.StateWord() {
 	case "blocked", "error":
 		return true

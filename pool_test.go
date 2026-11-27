@@ -81,6 +81,7 @@ func TestGroupSessionsNestsChildrenAndSeparatesFinished(t *testing.T) {
 		{Key: TermKey{InstanceID: "kr", Addr: "kr/t1d"}, InstanceName: "kr", Terminal: Terminal{Address: "kr/t1d", Name: "main-agent", State: "live"}},
 		{Key: TermKey{InstanceID: "kr", Addr: "kr/t1m"}, InstanceName: "kr", Terminal: Terminal{Address: "kr/t1m", Name: "child-1", Parent: &p1, State: "finished"}},
 		{Key: TermKey{InstanceID: "kr", Addr: "kr/t1n"}, InstanceName: "kr", Terminal: Terminal{Address: "kr/t1n", Name: "child-2", Parent: &p1, State: "working"}},
+		{Key: TermKey{InstanceID: "kr", Addr: "kr/t1p"}, InstanceName: "kr", Terminal: Terminal{Address: "kr/t1p", Name: "child-3", Parent: &p1, State: "live", Status: &Status{State: "done"}}},
 		{Key: TermKey{InstanceID: "kr", Addr: "t3"}, InstanceName: "kr", Terminal: Terminal{Address: "t3", Name: "old-zsh", State: "finished"}},
 	}
 
@@ -91,8 +92,159 @@ func TestGroupSessionsNestsChildrenAndSeparatesFinished(t *testing.T) {
 	if active[0].Primary.Key.Addr != "kr/t1d" || len(active[0].Children) != 2 || active[0].ActiveChildren != 1 {
 		t.Errorf("unexpected root group: %+v", active[0])
 	}
-	if len(finished) != 1 || finished[0].Key.Addr != "t3" {
-		t.Errorf("expected 1 standalone finished terminal (t3), got %+v", finished)
+	if len(finished) != 2 {
+		t.Errorf("expected 2 finished terminals (t3 + finished child kr/t1m), got %+v", finished)
+	}
+}
+
+func TestGroupSessionsExcludesFinishedChildrenAndGrandchildren(t *testing.T) {
+	rootAddr := "kr/t11f"
+	exitZero := 0
+	items := []AggregatedTerminal{
+		{
+			Key:          TermKey{InstanceID: "mac", Addr: rootAddr},
+			InstanceName: "mac",
+			Terminal:     Terminal{Address: rootAddr, Name: "main-session", State: "live", Status: &Status{State: "done"}},
+		},
+	}
+
+	// 6 live direct sub-sessions (4 done + 2 working), mirroring real hc ls output.
+	liveChildAddrs := []string{"kr/t139", "kr/t13a", "kr/t13b", "kr/t13c", "kr/t13d", "kr/t13e"}
+	for i, addr := range liveChildAddrs {
+		st := "done"
+		if i < 2 {
+			st = "working"
+		}
+		p := rootAddr
+		items = append(items, AggregatedTerminal{
+			Key:          TermKey{InstanceID: "mac", Addr: addr},
+			InstanceName: "mac",
+			Terminal: Terminal{
+				Address: addr,
+				Name:    fmt.Sprintf("sub-%d", i),
+				Parent:  &p,
+				State:   "live",
+				Status:  &Status{State: st},
+			},
+		})
+	}
+
+	// 2 finished direct children (one with a stale blocked status).
+	for i := range 2 {
+		p := rootAddr
+		var stale *Status
+		if i == 0 {
+			stale = &Status{State: "blocked", Kind: "permission", App: "claude"}
+		}
+		items = append(items, AggregatedTerminal{
+			Key:          TermKey{InstanceID: "mac", Addr: fmt.Sprintf("kr/tdead%d", i)},
+			InstanceName: "mac",
+			Terminal: Terminal{
+				Address:  fmt.Sprintf("kr/tdead%d", i),
+				Name:     fmt.Sprintf("dead-direct-%d", i),
+				Parent:   &p,
+				State:    "finished",
+				ExitCode: &exitZero,
+				Status:   stale,
+			},
+		})
+	}
+
+	// 68 finished grandchildren (short-lived bash/go commands spawned by the 6 live sub-sessions).
+	for i := range 68 {
+		parentAddr := liveChildAddrs[i%len(liveChildAddrs)]
+		items = append(items, AggregatedTerminal{
+			Key:          TermKey{InstanceID: "mac", Addr: fmt.Sprintf("kr/tcmd%d", i)},
+			InstanceName: "mac",
+			Terminal: Terminal{
+				Address:  fmt.Sprintf("kr/tcmd%d", i),
+				Name:     fmt.Sprintf("drain-test-%d", i),
+				Parent:   &parentAddr,
+				State:    "finished",
+				ExitCode: &exitZero,
+			},
+		})
+	}
+
+	// Edge cases:
+	// 1. Live grandchild under a finished intermediate child still attaches to live root.
+	deadMid := "kr/tdead0"
+	items = append(items, AggregatedTerminal{
+		Key:          TermKey{InstanceID: "mac", Addr: "kr/tlive-grand"},
+		InstanceName: "mac",
+		Terminal:     Terminal{Address: "kr/tlive-grand", Name: "live-grandchild", Parent: &deadMid, State: "live", Status: &Status{State: "idle"}},
+	})
+	// 2. Finished root with a live child stays in active so the live child is not hidden.
+	deadRoot := "kr/told-root"
+	items = append(items,
+		AggregatedTerminal{
+			Key:          TermKey{InstanceID: "mac", Addr: deadRoot},
+			InstanceName: "mac",
+			Terminal:     Terminal{Address: deadRoot, Name: "old-root", State: "finished", ExitCode: &exitZero},
+		},
+		AggregatedTerminal{
+			Key:          TermKey{InstanceID: "mac", Addr: "kr/told-root-live-kid"},
+			InstanceName: "mac",
+			Terminal:     Terminal{Address: "kr/told-root-live-kid", Name: "orphan-survivor", Parent: &deadRoot, State: "live", Status: &Status{State: "idle"}},
+		},
+	)
+	// 3. Finished root with only a finished child -> both appear in finished once (no duplicates).
+	deadPairRoot := "kr/tpair-root"
+	items = append(items,
+		AggregatedTerminal{
+			Key:          TermKey{InstanceID: "mac", Addr: deadPairRoot},
+			InstanceName: "mac",
+			Terminal:     Terminal{Address: deadPairRoot, Name: "pair-root", State: "finished", ExitCode: &exitZero},
+		},
+		AggregatedTerminal{
+			Key:          TermKey{InstanceID: "mac", Addr: "kr/tpair-kid"},
+			InstanceName: "mac",
+			Terminal:     Terminal{Address: "kr/tpair-kid", Name: "pair-kid", Parent: &deadPairRoot, State: "finished", ExitCode: &exitZero},
+		},
+	)
+
+	active, finished := GroupSessions(items)
+	if len(active) != 2 {
+		t.Fatalf("expected 2 active groups (kr/t11f + old-root with live child), got %d", len(active))
+	}
+
+	var mainGroup *SessionGroup
+	for i := range active {
+		if active[i].Primary.Key.Addr == rootAddr {
+			mainGroup = &active[i]
+		}
+	}
+	if mainGroup == nil {
+		t.Fatalf("missing root group %s", rootAddr)
+	}
+	// 6 live direct children + 1 live grandchild = 7 (NOT 77!).
+	if len(mainGroup.Children) != 7 {
+		t.Fatalf("expected 7 live descendants (6 direct + 1 live grandchild), got %d", len(mainGroup.Children))
+	}
+	if mainGroup.ActiveChildren != 2 {
+		t.Fatalf("expected ActiveChildren=2 (only working/needs-you children), got %d", mainGroup.ActiveChildren)
+	}
+	if mainGroup.AttentionChildren != 0 {
+		t.Fatalf("expected AttentionChildren=0 (stale blocked status on finished child must not count), got %d", mainGroup.AttentionChildren)
+	}
+
+	// Verify dead-direct-0 with stale blocked status reports NeedsYou()==false.
+	for _, it := range finished {
+		if it.Key.Addr == "kr/tdead0" && it.Terminal.NeedsYou() {
+			t.Fatalf("finished terminal with stale blocked status must not report NeedsYou()==true")
+		}
+	}
+
+	// 2 dead direct + 68 dead grandchildren + 1 pair-root + 1 pair-kid = 72 unique finished terminals.
+	if len(finished) != 72 {
+		t.Fatalf("expected 72 finished terminals, got %d", len(finished))
+	}
+	seen := make(map[TermKey]bool, len(finished))
+	for _, it := range finished {
+		if seen[it.Key] {
+			t.Fatalf("duplicate finished terminal %v", it.Key)
+		}
+		seen[it.Key] = true
 	}
 }
 

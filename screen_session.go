@@ -1354,7 +1354,7 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 					all := a.aggTerms.Get()
 					var waiting, working, idle []AggregatedTerminal
 					for _, it := range all {
-						if it.Terminal.StateWord() == "finished" {
+						if it.Terminal.Finished() {
 							continue
 						}
 						switch {

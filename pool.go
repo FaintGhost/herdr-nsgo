@@ -417,8 +417,9 @@ type SessionGroup struct {
 	AttentionChildren int
 }
 
-// GroupSessions nests child sub-sessions (Terminal.Parent != nil) under their root parent session
-// and separates standalone finished terminals so the active Home list stays clean and scannable.
+// GroupSessions nests live child sub-sessions (Terminal.Parent != nil) under their root parent session
+// and moves all finished terminals (including exited child/grandchild sub-sessions) into the finished slice
+// so active sub-session counts reflect live sub-sessions rather than accumulated historical exited commands.
 func GroupSessions(items []AggregatedTerminal) (active []SessionGroup, finished []AggregatedTerminal) {
 	byKey := make(map[TermKey]int, len(items))
 	for i, it := range items {
@@ -446,10 +447,15 @@ func GroupSessions(items []AggregatedTerminal) (active []SessionGroup, finished 
 
 	childrenByRoot := make(map[TermKey][]AggregatedTerminal)
 	isChild := make(map[TermKey]bool)
+	var finishedChildren []AggregatedTerminal
 	for _, it := range items {
 		if rootKey, ok := rootOf(it); ok {
-			childrenByRoot[rootKey] = append(childrenByRoot[rootKey], it)
 			isChild[it.Key] = true
+			if it.Terminal.Finished() {
+				finishedChildren = append(finishedChildren, it)
+				continue
+			}
+			childrenByRoot[rootKey] = append(childrenByRoot[rootKey], it)
 		}
 	}
 
@@ -458,20 +464,19 @@ func GroupSessions(items []AggregatedTerminal) (active []SessionGroup, finished 
 			continue
 		}
 		kids := childrenByRoot[it.Key]
+		if it.Terminal.Finished() && len(kids) == 0 {
+			finished = append(finished, it)
+			continue
+		}
 		activeKids := 0
 		attnKids := 0
 		for _, ch := range kids {
-			if !ch.Terminal.Finished() {
+			if ch.Terminal.StateWord() == "working" || ch.Terminal.NeedsYou() {
 				activeKids++
 			}
 			if ch.Terminal.NeedsYou() {
 				attnKids++
 			}
-		}
-		if it.Terminal.Finished() && activeKids == 0 && attnKids == 0 {
-			finished = append(finished, it)
-			finished = append(finished, kids...)
-			continue
 		}
 		active = append(active, SessionGroup{
 			Primary:           it,
@@ -480,6 +485,7 @@ func GroupSessions(items []AggregatedTerminal) (active []SessionGroup, finished 
 			AttentionChildren: attnKids,
 		})
 	}
+	finished = append(finished, finishedChildren...)
 	return active, finished
 }
 
