@@ -1201,6 +1201,9 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 												core.View{Style: core.Style{FlexGrow: 1}},
 												core.Show{
 													When: func() bool {
+														if a.catalogRev != nil {
+															_ = a.catalogRev.Get()
+														}
 														ch := curChat()
 														return ch != nil && ch.ContextUsage().Valid()
 													},
@@ -1252,6 +1255,9 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 																	Size:      20,
 																	LineWidth: 2.4,
 																	Value: func() float32 {
+																		if a.catalogRev != nil {
+																			_ = a.catalogRev.Get()
+																		}
 																		ch := curChat()
 																		if ch == nil {
 																			return 0

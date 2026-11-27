@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -609,6 +610,44 @@ func (c *Client) Send(ctx context.Context, addr, text string) (SendResult, error
 	var out SendResult
 	err := c.Call(ctx, "terminal.send", map[string]any{"terminal": addr, "text": text}, &out)
 	return out, err
+}
+
+// SendForced sends text + Enter even when the terminal reports blocked (for answering TUI
+// "Other" / "tell Claude what to do differently" dialogs). Falls back to a short-lived
+// framed Attach bracketed-paste write preserving Cols/Rows if an older core rejects force.
+func (c *Client) SendForced(ctx context.Context, addr, text string) (SendResult, error) {
+	var out SendResult
+	err := c.Call(ctx, "terminal.send", map[string]any{"terminal": addr, "text": text, "force": true}, &out)
+	if err == nil {
+		return out, nil
+	}
+	var rpcErr *RPCError
+	if !errors.As(err, &rpcErr) || (rpcErr.Kind() != "blocked" && rpcErr.Kind() != "invalid_params") {
+		return SendResult{}, err
+	}
+	if !c.framed.Load() || strings.ContainsAny(text, "\x1b\x00") {
+		return SendResult{}, err
+	}
+	term, gerr := c.Get(ctx, addr)
+	if gerr != nil || term.Cols <= 0 || term.Rows <= 0 {
+		return SendResult{}, err
+	}
+	stream, res, aerr := c.Attach(ctx, AttachParams{Terminal: addr, Resumed: true, Cols: term.Cols, Rows: term.Rows})
+	if aerr != nil {
+		return SendResult{}, err
+	}
+	defer stream.Close()
+	payload := []byte("\x1b[200~" + text + "\x1b[201~\r")
+	if res.AutomaticInput {
+		if werr := c.writeFrame(stream.Channel(), FrameAutomaticInput, payload); werr != nil {
+			return SendResult{}, werr
+		}
+		return SendResult{}, nil
+	}
+	if _, werr := stream.Write(payload); werr != nil {
+		return SendResult{}, werr
+	}
+	return SendResult{}, nil
 }
 
 // Keys presses keys by name: enter, esc, up, ctrl+c.

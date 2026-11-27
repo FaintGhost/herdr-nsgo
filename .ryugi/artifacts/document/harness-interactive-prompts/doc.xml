@@ -1,0 +1,262 @@
+<doc ryugi-attribution="eyJjcmVhdGVkQnkiOiJBbnRpZ3Jhdml0eSIsImRpZ2VzdCI6Ijc0MDViNzViY2E5MGFhM2VmYzI5Y2VhYmFkMjZkMDViNTUzNTI5YTI4NDMxY2FiNjg3ZDdiZTNmNjM5Mzg3YWIifQ">
+  <h1 id="3m6dZbz8">Harness 多选项权限审批、交互式提问与 Pi 元数据精准适配设计</h1>
+  <p id="8QmFpi2V">本文档为最终工程设计稿，覆盖多选项权限审批（Agy 4 项、Claude 2–3 项、Codex/Pi）、聊天模式内 <code>AskUserQuestion</code> / <code>ask_question</code> / Pi <code>ask_user_question</code> 直接交互，以及 Pi 思考强度与精确上下文窗口（如 272k）修复。</p>
+  <h2 id="SVlaajPK">1. 背景与目标（Intent &amp; Why）</h2>
+  <p id="xgHXDnM3">当前 <code>herdr-nsgo</code> 的内联审批卡片（<code>approvals.go</code> + <code>InlineApprovalCard</code>）把所有 <code>blocked + permission</code> 状态硬编码为「允许（<code>enter</code>）」与「拒绝（<code>esc</code>）」两个固定按钮，且对 <code>blocked + question</code> 完全不支持聊天模式内点选，只能提示「进入终端处理」。在手机单手操作场景下，这造成三个高频痛点：</p>
+  <ul id="Q0d4zM-c">
+    <li><b>权限审批选项被阉割：</b>Antigravity (Agy) 常见 4 项审批（1 临时允许 / 2 当前会话允许 / 3 持久化到配置文件 / 4 拒绝），Claude Code 常见 2–3 项（允许 / 本会话允许 / 拒绝并补充指示），用户无法直接在聊天中选「当前会话允许」或「持久化到配置文件」，每次都要切终端按方向键。</li>
+    <li><b>Agent 提问在聊天模式无法交互：</b>Claude 的 <code>AskUserQuestion</code>、Agy 的 <code>ask_question</code>、Pi 的 <code>rpiv-ask-user-question</code> 触发阻塞提问（单选 / 多选 / 多题串联 / 「其他」自定义输入）时，聊天页只显示跳终端按钮，甚至 Pi 插件仅发 BEL 而不发 OSC 7501 <code>blocked</code>，割裂了阅读上下文与作答流程。</li>
+    <li><b>Pi 元数据失真：</b>Pi 长会话初始只拉尾部 JSONL 窗口，漏掉了文件第 2–4 行的 <code>thinking_level_change</code>（导致实际 <code>high</code> 被显示为默认 <code>medium</code>）；同时上下文窗口估算未读取宿主机 <code>~/.pi/agent/models.json</code> 中模型声明的 <code>contextWindow</code>（导致实际 272k 模型被误显示为 200k）。</li>
+  </ul>
+  <h2 id="aLDQvUAF">2. 目标、非目标与反目标</h2>
+  <ul id="MSHAcHZh">
+    <li>
+      <b>目标（Goals）：</b>
+      <ul>
+        <li>实时解析并呈现各 harness（Agy / Claude / Codex / Pi / OMP）当前 TUI 阻塞态的真实权限选项（2–4+ 项），支持一键点选驱动远端 TUI。</li>
+        <li>在聊天模式内原生支持 <code>AskUserQuestion</code> / <code>ask_question</code> / <code>ask_user_question</code>（单选、多选勾选、多题切换、最终确认步、「其他」卡片内自由输入），无需切回终端。</li>
+        <li>首页与收件箱卡片保持紧凑且兼容 280px 宽屏侧栏，同时支持卡片内一键展开全部 3–4 个权限选项。</li>
+        <li>发送任何按键或自由文本前强制复核远端当前屏幕与选项指纹，解析不确定时安全降级到「进终端处理」。</li>
+        <li>修复 Pi 思考强度头部读取与宿主机 <code>models.json</code> 精确 <code>contextWindow</code>（如 272k）展示。</li>
+      </ul>
+    </li>
+    <li><b>非目标（Non-Goals）：</b>不改造 <code>herdr-core</code> 服务端 RPC 协议（完全复用既有 <code>terminal.get</code> / <code>terminal.read</code> / <code>terminal.keys</code> / <code>terminal.send</code> 含 <code>force: true</code> / <code>terminal.attach</code> / <code>file.read</code> / <code>machine.exec</code>）；不尝试模拟任意第三方交互式 TUI 应用（如 <code>vim</code> / <code>htop</code>）。</li>
+    <li><b>反目标（Anti-Goals）：</b>绝不在未核对远端当前屏幕的情况下盲发方向键、空格或自定义文本；绝不自动跳过多题末尾的 <code>Submit answers</code> 确认页；绝不因读屏失败阻塞用户使用「进终端」兜底通道；绝不把硬编码颜色引入 UI 层。</li>
+  </ul>
+  <h2 id="ZSVbYFfn">3. 已确认决策汇总（Settled Decisions）</h2>
+  <ul id="3wA6UZjX">
+    <li><b>选项获取与驱动策略（已采纳推荐）：</b>实时读取 TUI 屏幕（<code>terminal.read</code>）解析真实选项列表与光标位置为主，结合 JSONL 补充提问的完整题干、选项描述与多选标记（<code>live-tui-primary</code>）。</li>
+    <li><b>多选项权限卡片形态（画板已采纳）：</b>采用纵向紧凑选项列表，带 1–4 等宽编号徽章与语义着色，见 <ref artboard="harness-interactive-prompts" to="WOlh8QGbMGNBl50kl6h6O" board="perm-stack" />。</li>
+    <li><b>Agy 4 项审批语义（你的明确说明）：</b>① 临时允许（Allow once）、② 当前会话允许（Allow for session）、③ 把允许持久化到配置文件（Always allow / persist to config）、④ 拒绝（Deny）。解析器保留 TUI 实时原文的同时，对语义角色做准确着色（项 1 主按钮、项 2–3 中性次级行、项 4 警示红）。</li>
+    <li><b>Ask User Question 聊天交互形态（画板已采纳）：</b>采用聊天流底部内联交互卡片（位于悬浮输入框上方，不遮挡对话正文），支持单选、多选勾选、多题分页及卡片内「其他」输入，见 <ref artboard="harness-interactive-prompts" to="WOlh8QGbMGNBl50kl6h6O" board="q-inline-card" />。</li>
+    <li><b>首页与收件箱多选项策略（已采纳推荐）：</b>卡片默认保持紧凑布局（兼容 280px 宽屏侧栏），并在解析出 ≥3 个选项时提供卡片内一键「展开全部选项」开关（<code>inbox-compact-expand</code>）。</li>
+    <li><b>「其他 / 自定义说明」输入形态（已采纳推荐）：</b>点选需要输入说明的选项（如 Claude 第 3 项 <code>No, tell Claude what to do differently</code> 或提问中的 <code>Other</code> / <code>Type something.</code>）后，在选项卡片内部直接展开紧凑输入框并提交（<code>inline-input</code>）。</li>
+    <li><b>Pi 元数据修复（你的要求）：</b>一并纳入本次实现——读取 Pi JSONL 头部 <code>thinking_level_change</code> 纠正 <code>high → medium</code> 误报，并从宿主机 <code>~/.pi/agent/models.json</code> 读取模型真实 <code>contextWindow</code> 纠正 <code>272k → 200k</code> 误报。</li>
+    <li>
+      <b>工程决策（我的设计裁决，供你复核）：</b>
+      <ul>
+        <li><b>双触发机制：</b>除 OSC 7501 <code>blocked</code> 外，当活跃聊天会话的 JSONL 尾部存在尚未返回结果的 <code>ask_user_question</code> / <code>AskUserQuestion</code> / <code>ask_question</code> 工具调用时（覆盖仅发 BEL 不发 OSC 7501 的 Pi <code>rpiv-ask-user-question</code>），同样自动触发实时读屏与交互卡片。</li>
+        <li><b>阻塞态自由文本通道：</b><code>NeedsText</code> 文本发送优先调用 <code>herdr-core</code> 既有的 <code>terminal.send</code> + <code>force: true</code>（已通过 <code>hc send --help</code> 验证支持阻塞态直发）；若旧版 core 拒绝 <code>force</code>，自动降级为保留原始 <code>Cols/Rows</code> 的短连接 <code>terminal.attach</code> 括号粘贴写入（同 <code>chat_delivery.go</code>）。</li>
+        <li><b>多题末尾提交确认页：</b>不静默自动提交 Claude / Pi 多题结尾的 <code>Submit answers</code> 复核页，而是在卡片内将其渲染为明确的「确认提交全部回答 / 取消 / 返回修改」终步。</li>
+        <li><b>紧凑卡片与聊天卡片安全契约：</b>聊天页读屏中展示轻量加载态，解析失败统一降级「进终端处理 + 重试」；首页/收件箱紧凑卡保留首帧 36pt 快捷行（兼容 <code>ui_test.go</code> 与 280px 侧栏），点击时优先走实时读屏光标驱动，仅在白名单 <code>blocked + permission</code> 且无读屏数据时回退既有 <code>ApproveKeys</code>。</li>
+      </ul>
+    </li>
+  </ul>
+  <h2 id="AQkIw6ZY">4. 系统架构与核心数据流</h2>
+  <mermaid id="SzTierhn">flowchart TD
+    T1[OSC 7501 blocked&lt;br/&gt;permission or question] --&gt; R[PromptInspector&lt;br/&gt;terminal.read visible screen]
+    T2[Active Chat JSONL&lt;br/&gt;pending ask_user_question tool] --&gt; R
+    T2 --&gt; M[Enrich question title,&lt;br/&gt;descriptions &amp; multiSelect]
+    R --&gt; P[ParseInteractivePrompt&lt;br/&gt;per-harness TUI parser]
+    P --&gt; M
+    M --&gt; OK{Parsed &gt;= 2 options&lt;br/&gt;with valid cursor?}
+    OK --&gt;|Yes| UI[Render Prompt Card&lt;br/&gt;Chat Full / Inbox Compact]
+    OK --&gt;|No| FB[Safe fallback:&lt;br/&gt;进入终端处理]
+    UI --&gt; ACT[User taps option / multi-select /&lt;br/&gt;inline Other text]
+    ACT --&gt; VER[Re-verify c.Get not finished +&lt;br/&gt;live c.Read Fingerprint match]
+    VER --&gt;|Matched| DRV[Send up/down/space/tab +&lt;br/&gt;SendForced force:true / enter]
+    VER --&gt;|Drifted| ABT[Abort + Toast 提示状态已变化]
+</mermaid>
+  <h2 id="VrcSVgsG">5. 模块详细设计</h2>
+  <h3 id="d142fckl">5.1 统一交互提示模型与分 Harness 解析器（<code>prompt_inspector.go</code>）</h3>
+  <p id="FDM2_IgE">新增 <code>InteractivePrompt</code> 模型统一表达权限审批、单选/多选提问与多题最终提交复核页：</p>
+  <codeblock id="vBHI4qIC" lang="go">type PromptKind string
+
+const (
+    PromptKindPermission PromptKind = &quot;permission&quot;
+    PromptKindQuestion   PromptKind = &quot;question&quot;
+    PromptKindReview     PromptKind = &quot;review&quot; // 多题结尾的 Submit answers / Cancel 复核页
+)
+
+type OptionTone string
+
+const (
+    TonePrimary OptionTone = &quot;primary&quot; // 第 1 项 / 推荐默认 / Submit answers
+    ToneNeutral OptionTone = &quot;neutral&quot; // 本会话允许 / 持久化配置 / 普通选项
+    ToneDanger  OptionTone = &quot;danger&quot;  // 拒绝 / Deny / Cancel / No
+)
+
+type PromptOption struct {
+    Index          int        // 0-based TUI 选项索引
+    KeyHint        string     // 编号徽章，如 &quot;1&quot;, &quot;2&quot;, &quot;3&quot;, &quot;4&quot;
+    Label          string     // TUI 实时原文（或结合 JSONL 的标题）
+    Description    string     // 可选副标题（来自 TUI 折行或 JSONL）
+    Tone           OptionTone // 视觉语义角色
+    Checked        bool       // 多选模式下当前勾选状态
+    NeedsText      bool       // 是否需要用户输入自定义文本（Other / Type something. / tell Claude...）
+    InlineTextMode bool       // 光标停在该行即可直接输入（Pi/Claude 为 true，无需先按 Enter）
+    IsSubmit       bool       // 多选/多题流程中的显式提交行（Next / Submit answers）
+}
+
+type InteractivePrompt struct {
+    Kind          PromptKind
+    Harness       string         // claude / antigravity / codex / pi / omp
+    Title         string         // 权限标题或当前问题题干
+    Detail        string         // 拟执行命令 / 工具摘要 / 复核摘要
+    Cursor        int            // 当前远端 TUI 高亮行索引（0-based）
+    Options       []PromptOption // 真实选项列表
+    MultiSelect   bool           // 是否为多选勾选模式
+    Tabs          []string       // 多题页签标题（如 [&quot;Feature&quot;, &quot;Testing&quot;, &quot;Submit&quot;]）
+    ActiveTab     int            // 当前页签索引（0-based）
+    CanSwitchTab  bool           // 是否支持 Tab/Shift+Tab 或 ←/→ 切题
+    Fingerprint   string         // 选项列表 + 标题 + 模式的规范化哈希，发送前二次核对防竞态
+}</codeblock>
+  <p id="WhJHKRRh"><b>分 Harness 实时 TUI 解析与按键状态机（已结合真实插件源码校验）：</b></p>
+  <table id="ogWKBDRb">
+    <tr>
+      <th>
+        <p>Harness</p>
+      </th>
+      <th>
+        <p>权限审批（<code>permission</code>）</p>
+      </th>
+      <th>
+        <p>交互提问（<code>question</code> / <code>review</code>）</p>
+      </th>
+      <th>
+        <p>按键状态机细节</p>
+      </th>
+    </tr>
+    <tr>
+      <td>
+        <p><b>Antigravity (Agy)</b></p>
+      </td>
+      <td>
+        <p>常见 4 项编号/光标列表：① 临时允许（Allow once，<code>TonePrimary</code>）、② 当前会话允许（Allow for session，<code>ToneNeutral</code>）、③ 持久化到配置文件（Always allow / persist，<code>ToneNeutral</code>）、④ 拒绝（Deny，<code>ToneDanger</code>）。</p>
+      </td>
+      <td>
+        <p><code>ask_question</code> 渲染题干、编号选项（含 <code>(Recommended)</code>、<code>Other</code>）、多选 <code>[ ]</code>/<code>[x]</code> 或 <code>☐</code>/<code>☑</code> 与多题进度。</p>
+      </td>
+      <td>
+        <p>光标移动 <code>up</code>/<code>down</code> + <code>enter</code>；多选用 <code>space</code> 勾选后再定位提交行/回车；选 <code>Other</code> 时先移至该行并检测屏幕是否进入输入态，未进入则发 <code>enter</code> 后再 <code>SendForced</code>。</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><b>Claude Code</b></p>
+      </td>
+      <td>
+        <p>常见 2–3 项：<code>1. Yes</code>、<code>2. Yes, allow ... during this session</code>、<code>3. No, and tell Claude what to do differently</code>（自动识别为 <code>NeedsText: true, InlineTextMode: true, ToneDanger</code>）。</p>
+      </td>
+      <td>
+        <p><code>AskUserQuestion</code>：多题顶栏（<code>←/→</code> 切题）、单选/多选勾选框（<code>☐</code>/<code>☑</code>）、<code>Type something</code> / <code>Other</code> 行（光标落上即输入）与末尾 <code>Submit answers</code> 复核页。</p>
+      </td>
+      <td>
+        <p>普通选项 <code>up</code>/<code>down</code> + <code>enter</code>；<code>InlineTextMode</code> 行移动光标后<b>不发空回车</b>，直接 <code>SendForced(text)</code>；多选勾选后移至 <code>Next</code>/<code>Submit</code> 确认；复核页渲染明确提交按钮。</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><b>Codex</b></p>
+      </td>
+      <td>
+        <p>编号 2–3 项（<code>1. Yes</code> / <code>2. Yes, don&apos;t ask again ...</code> / <code>3. No, ...</code>），含 <code>Esc</code> 提示。</p>
+      </td>
+      <td>
+        <p>编号选项列表 + <code>Other</code> 输入项，复用通用编号/光标解析器。</p>
+      </td>
+      <td>
+        <p>光标移动 <code>up</code>/<code>down</code> + <code>enter</code>；拒绝定位拒绝项回车（或兜底 <code>esc</code>）。</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><b>Pi / OMP</b></p>
+      </td>
+      <td>
+        <p>确认弹窗或编号/光标选项列表（含 <code>Enter to select</code> / <code>Esc to cancel</code>）。</p>
+      </td>
+      <td>
+        <p><b>已实测源码验证 <code>@juicesharp/rpiv-ask-user-question</code>：</b>顶栏多题页签 + <code>Submit</code> 页签；单选/多选带编号选项 + 末行 <code>Type something.</code>（<code>InlineTextMode: true</code>，且多选模式下勾选与自定义文本可同时提交）；多选用 <code>space</code>/<code>enter</code> 勾选并由 <code>Next</code> 哨兵行提交；<code>Tab</code>/<code>Shift+Tab</code>（或 <code>←/→</code>）切题；末尾 <code>Submit</code> 页提供 <code>Submit answers</code> / <code>Cancel</code>。</p>
+      </td>
+      <td>
+        <p>由 JSONL 未完成 <code>ask_user_question</code> 工具调用 + BEL 共同触发读屏；支持多选+自定义文本组合提交（先 <code>space</code> 勾选 diff，若含自定义文本再移至 <code>Type something.</code> 发送文本，最后走 <code>Next</code> / <code>Submit answers</code>）；支持卡片「上一题 / 切页签」发 <code>shift+tab</code> / <code>tab</code>。</p>
+      </td>
+    </tr>
+  </table>
+  <p id="L_GG__Kl"><b>JSONL 元数据补充（提问场景）：</b>在 <code>ChatSessionController</code> 中提取末尾未完成（<code>!HasResult</code>）的 <code>AskUserQuestion</code> / <code>ask_question</code> / <code>ask_user_question</code> 工具调用参数（<code>questions[]</code> 题干、选项描述、<code>multiSelect</code> / <code>is_multi_select</code>），补全 TUI 窄宽下被截断的描述与多选标记；<b>选项数量、实时顺序、勾选态与光标位置始终以实时 TUI 屏幕为准</b>。</p>
+  <h3 id="ISzsA4aj">5.2 阻塞态安全驱动器与 RPC 扩展（<code>client.go</code> + <code>app.go</code> + <code>prompt_inspector.go</code>）</h3>
+  <ol id="L1IbcNuf">
+    <li><b><code>Client.SendForced(ctx, addr, text)</code>（<code>client.go</code>）：</b>调用既有 <code>terminal.send</code> 并传 <code>&quot;force&quot;: true</code>（<code>herdr-core</code> 原生支持阻塞态写入对话框）。若远端为不支持 <code>force</code> 的旧版 core 并返回 <code>blocked</code> / <code>invalid_params</code>，自动降级为保留远端 <code>Cols/Rows</code> 的短连接 <code>terminal.attach</code> 括号粘贴写入（<code>\x1b[200~text\x1b[201~\r</code>，不改变桌面列宽）。</li>
+    <li>
+      <b>受控读屏缓存与节流（<code>PromptInspector</code>）：</b>
+      <ul>
+        <li>活跃会话处于 <code>blocked</code> 或 JSONL 尾部存在未完成提问工具调用时，立即 <code>c.Read(ctx, addr, 0)</code> 并在阻塞期间每 2s 或随 <code>OnPoolSync</code> 轻量刷新；离开阻塞态立刻停止并清缓存。</li>
+        <li>首页 / 收件箱可见的 <code>blocked</code> 终端最多并发预检前 4 个，按 <code>(TermKey, StatusMS)</code> 去重，避免无效 RPC 扇出。</li>
+      </ul>
+    </li>
+    <li>
+      <b>发送前二次核对与精准驱动（<code>App.SubmitPromptChoice</code>）：</b>
+      <ul>
+        <li>调用 <code>c.Get(ctx, addr)</code> 确认终端未结束（对 OSC 7501 <code>blocked</code> 来源同时确认仍为 <code>blocked</code>），再调用 <code>c.Read(ctx, addr, 0)</code> 重新解析当前屏幕。</li>
+        <li>校验 <code>live.Fingerprint == expected.Fingerprint</code> 且目标选项索引与规范化文案一致；若屏幕已变化（例如桌面端已操作），立即中止并弹出 Toast <code>状态已变化，已取消操作</code>。</li>
+        <li>按请求类型驱动：单选/权限项发送 <code>up</code>/<code>down</code> + <code>enter</code>；多选请求按勾选差集逐项 <code>up</code>/<code>down</code> + <code>space</code>，如有 <code>CustomText</code> 移动至 <code>NeedsText</code> 行写入文本，再定位 <code>IsSubmit</code> 行回车；多题切页发 <code>tab</code> / <code>shift+tab</code>。提交后立即触发一次 <code>c.Read</code>，多题流程无缝刷新到下一题或 <code>Submit answers</code> 复核页。</li>
+      </ul>
+    </li>
+    <li>
+      <b>兜底降级契约：</b>
+      <ul>
+        <li><b>聊天页（Full 模式）：</b>首次 <code>c.Read</code> 进行中显示轻量加载条 + 「进终端」；若解析失败（含 <code>auth</code> 链接弹窗或未知 TUI），严格降级为「进入终端处理」+「重试读取」，绝不盲发按键。</li>
+        <li><b>首页/收件箱（Compact 模式）：</b>白名单 <code>blocked + permission</code> 首帧即渲染 36pt 快捷行（<code>approve-allow-&lt;key&gt;</code>、<code>approve-deny-&lt;key&gt;</code>、<code>approve-open-&lt;key&gt;</code>，完全兼容现有 <code>ui_test.go</code> 与 280px 侧栏）；点击「允许/拒绝」时优先走实时读屏驱动（映射项 0 / <code>ToneDanger</code> 项），仅当无读屏数据时回退旧 <code>ApproveKeys</code>。</li>
+      </ul>
+    </li>
+  </ol>
+  <h3 id="Tl4veGQT">5.3 移动端与宽屏 UI 组件设计（<code>components.go</code> + <code>screen_chat.go</code>）</h3>
+  <ul id="o4smD8si">
+    <li>
+      <b>视觉方向（Interface Craft 5 要素）：</b>
+      <ul>
+        <li><b>Product：</b><code>herdr-nsgo</code> 手机/桌面远程 AI 编码控制台，服务随时随地单手审批与回答 Agent 提问的开发者。</li>
+        <li><b>Character：仪器级精准（Tactile-precision）</b>、<b>沉静克制（Calm clarity）</b>、<b>原生融洽（Native-quiet）</b>。</li>
+        <li><b>World：</b>Quiet Studio 纯石墨工作站与终端键帽材质（完全复用 <code>theme.go</code> 语义色 Token，零硬编码色值）。</li>
+        <li><b>Moments：</b>聊天流底部的多选项实时审批卡（<ref artboard="harness-interactive-prompts" to="WOlh8QGbMGNBl50kl6h6O" board="perm-stack" />）与内联交互提问卡（<ref artboard="harness-interactive-prompts" to="WOlh8QGbMGNBl50kl6h6O" board="q-inline-card" />）。</li>
+        <li><b>Signature：</b>每行选项左侧的等宽数字键帽徽章（<code>1</code> <code>2</code> <code>3</code> <code>4</code>）与「实时 N 项」状态胶囊。</li>
+      </ul>
+    </li>
+    <li>
+      <b>聊天页模式（<code>PromptCardModeFull</code>）：</b>
+      <ul>
+        <li><b>权限卡片：</b>顶部状态点 + Harness 品牌图标 + 标题 + <code>实时 N 项</code> 徽章 + <code>待审批</code>；中部等宽代码块展示待执行命令；下部平铺 2–4 个纵向紧凑行（最小高度 40pt，项 1 主色、项 2–3 中性次级行、拒绝项 <code>DangerSoft</code> 红字）；点选 <code>NeedsText</code> 项在卡片内原地展开紧凑输入框 + 提交按钮；底部右侧提供「进终端」快捷入口。</li>
+        <li><b>提问 / 复核卡片：</b>锚定在聊天滚动区底部、悬浮输入框上方；顶部展示 <code>&lt;Harness&gt; 向你提问</code>、单选/多选徽章及可点击的多题页签胶囊（<code>1 ✓</code> / <code>2 / 2</code> / <code>提交</code>）；正文清晰展示题干；选项行带单选圆环或复选框图标 + 主文案 + 副说明；多选同时支持勾选选项与卡片内「其他」输入框；底部提供「上一题 / 提交回答」按钮；最终复核页清晰呈现「确认提交全部回答」与「取消」。</li>
+      </ul>
+    </li>
+    <li>
+      <b>首页与收件箱模式（<code>PromptCardModeCompact</code>）：</b>
+      <ul>
+        <li>默认保持紧凑 36pt 首行操作（兼容 280px 侧栏与既有 <code>ui_test.go</code> 断言）；预检到 ≥3 个实时权限选项时，在卡片底部增加轻量 <code>展开全部 N 项 ▾</code> 按钮，展开后原地渲染完整 3–4 项纵向列表（如 Agy 全部 4 项）。</li>
+        <li>若为 <code>blocked + question</code>，卡片显示问题题干预览 + <code>去聊天回答</code> 按钮，一键直达该会话聊天视图作答。</li>
+      </ul>
+    </li>
+  </ul>
+  <h3 id="fI-TmIZ2">5.4 Pi 思考强度与精确上下文窗口修复（<code>chat_session.go</code> + <code>chat_parser.go</code> + <code>agent_catalog.go</code> + <code>snapshot_store.go</code>）</h3>
+  <ul id="sr2VR7km">
+    <li>
+      <b>Pi 思考强度（解决 <code>high</code> 误显 <code>medium</code>）：</b>
+      <ul>
+        <li>在 <code>chat_session.go</code> 的 <code>loadInitialJSONLWindow</code> 与 <code>PrefetchTranscript</code> 中，针对 <code>FormatPi</code> / <code>FormatPiOmp</code>：当 <code>win.First &gt; 1</code> 时，读取文件头部前 24 行（<code>Offset: 1, Limit: min(24, win.First-1)</code>），同时提取 <code>piSkillManifest</code>、初始 <code>thinking_level_change</code>（<code>curEffort</code>）与 <code>model_change</code>，作为初始种子传入尾部解析（<code>parsePiOmpJSONLWithSeed</code>），确保长会话不会漏掉开头的 <code>high</code> 设置。</li>
+        <li>在 <code>agent_catalog.go</code> 宿主发现脚本中同步读取 <code>~/.pi/agent/settings.json</code> 的 <code>defaultThinkingLevel</code> 写入 <code>AgentCatalog.DefaultEffort</code>。</li>
+      </ul>
+    </li>
+    <li>
+      <b>Pi / 全 Harness 精确上下文窗口（解决 <code>272k</code> 误显 <code>200k</code>）：</b>
+      <ul>
+        <li>在 <code>AgentModelOption</code>（<code>snapshot_store.go</code>）新增 <code>ContextWindow int</code>（<code>json:&quot;context_window,omitempty&quot;</code>）。</li>
+        <li>在 <code>agent_catalog.go</code> 的 Pi 宿主发现脚本解析 <code>~/.pi/agent/models.json</code> 时，提取每个模型的精确 <code>contextWindow</code>（如 <code>272000</code>、<code>1000000</code>、<code>200000</code>）并持久化到 <code>SnapshotStore</code> 缓存。</li>
+        <li>在 <code>ChatSessionController</code> 与 <code>screen_session.go</code> / <code>screen_chat.go</code> 计算上下文圆环与详情 Toast 时，优先按当前模型 ID 从宿主 <code>AgentCatalog</code> 匹配真实 <code>ContextWindow</code>（兼容带 provider 前缀如 <code>remote-magpie/codex/gpt-6.2-astra</code> 与裸模型 ID 的后缀匹配）；未命中目录时再回退 <code>estimateContextWindow</code>（同时将 Codex / GPT-5.3 / GPT-5.4 / GPT-6 系列兜底窗口更新为 <code>272_000</code>）。</li>
+      </ul>
+    </li>
+  </ul>
+  <h2 id="_nUBqoui">6. 留给实现者决定的细节（Left to the Builder）</h2>
+  <ul id="2ROWZem9">
+    <li>按键之间的微延迟与屏幕变化轮询退避参数（参考 <code>mobile_picker.go</code> 既有 90ms 轮询与超时策略）。</li>
+    <li>单元测试夹具构造细节（需覆盖 Agy 4 项权限、Claude 2/3 项含自定义文本、Claude/Agy/Pi <code>rpiv-ask-user-question</code> 单选/多选/组合 Other/多题复核页解析与驱动、双触发机制、<code>SendForced</code> 与 Attach 降级、280px 侧栏紧凑展开边界、Pi 头部 <code>thinking_level_change</code> 与 <code>models.json</code> 272k 窗口测试）。</li>
+  </ul>
+  <h2 id="tkXGJ1dJ">7. 关联工件（Artifacts Used）</h2>
+  <ul id="gaitxjWs">
+    <li><b>设计文档：</b><code>document/harness-interactive-prompts</code>（<code>.ryugi/artifacts/document/harness-interactive-prompts/doc.xml</code>）— 最终工程设计规范与所有已确认决策。</li>
+    <li><b>交互画板：</b><code>artboard/harness-interactive-prompts</code>（<code>.ryugi/artifacts/artboard/harness-interactive-prompts/canvas.json</code>）— 权限卡片采纳 <ref artboard="harness-interactive-prompts" to="WOlh8QGbMGNBl50kl6h6O" board="perm-stack" />，提问卡片采纳 <ref artboard="harness-interactive-prompts" to="WOlh8QGbMGNBl50kl6h6O" board="q-inline-card" />。</li>
+  </ul>
+  <h2 id="XvhTAUtv">8. 最终设计审批</h2>
+  <p id="gupthcTK">独立评审已核查并补齐全部技术细节（含 <code>terminal.send force:true</code>、Pi <code>rpiv-ask-user-question</code> 真实源码按键状态机与双触发机制、紧凑卡安全降级契约）。如确认无误，请在下方选择并提交，我将按设计稿直接进入 TDD 实现与全量测试验证：<ask id="approve"><option value="approve">批准设计，开始实现</option><option value="revise">需要修改（请在对应段落批注）</option></ask></p>
+</doc>
+

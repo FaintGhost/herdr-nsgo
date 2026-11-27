@@ -177,6 +177,7 @@ type App struct {
 	sessionModels        *core.Signal[map[TermKey]string]
 	sessionEfforts       *core.Signal[map[TermKey]string]
 	catalogRev           *core.Signal[uint64]
+	promptRev            *core.Signal[uint64]
 	completedReports     *core.Signal[map[TermKey]bool]
 	ackDone              *core.Signal[map[string]string]
 
@@ -202,8 +203,11 @@ type App struct {
 	toastDurationOverride time.Duration
 	notifPrompted         bool
 	catalogFetchInFly     map[string]bool
-	catalogFetchedAt   map[string]time.Time
-	prevTermStates     map[TermKey]string
+	catalogFetchedAt      map[string]time.Time
+	promptCache           map[TermKey]promptCacheEntry
+	promptInFly           map[TermKey]bool
+	promptGen             map[TermKey]uint64
+	prevTermStates        map[TermKey]string
 	prevTermSigs       map[TermKey]string
 	lastActiveMS       map[TermKey]uint64
 	activeSessionKey   TermKey
@@ -255,10 +259,14 @@ func NewApp(cx *core.Scope) *App {
 		sessionModels:        core.NewSignalFunc(cx, map[TermKey]string{}, nil),
 		sessionEfforts:       core.NewSignalFunc(cx, map[TermKey]string{}, nil),
 		catalogRev:           core.NewSignal(cx, uint64(0)),
+		promptRev:            core.NewSignal(cx, uint64(0)),
 		completedReports:     core.NewSignalFunc(cx, map[TermKey]bool{}, nil),
 		ackDone:              core.NewSignalFunc(cx, loadDoneAcks(cx), nil),
 		catalogFetchInFly:    make(map[string]bool),
 		catalogFetchedAt:     make(map[string]time.Time),
+		promptCache:          make(map[TermKey]promptCacheEntry),
+		promptInFly:          make(map[TermKey]bool),
+		promptGen:            make(map[TermKey]uint64),
 		prevTermStates:       make(map[TermKey]string),
 
 		conn:       core.NewSignal(cx, stateOff),
@@ -1351,8 +1359,246 @@ func (a *App) PressTo(key TermKey, keys ...string) {
 	}()
 }
 
-// InlineApprove executes a verified whitelisted Approve/Deny key sequence after
-// re-checking that the terminal is still in blocked+permission state.
+type promptCacheEntry struct {
+	prompt    InteractivePrompt
+	valid     bool
+	checked   bool
+	pendingQ  *PendingQuestion
+	checkedAt time.Time
+	sig       string
+}
+
+func (a *App) bumpPromptRev() {
+	if a == nil || a.promptRev == nil {
+		return
+	}
+	a.post(func() {
+		a.promptRev.Set(a.promptRev.GetUntracked() + 1)
+	})
+}
+
+// SetTestPrompt seeds a parsed InteractivePrompt directly into cache (for UI unit tests).
+func (a *App) SetTestPrompt(key TermKey, p InteractivePrompt) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	if a.promptCache == nil {
+		a.promptCache = make(map[TermKey]promptCacheEntry)
+	}
+	a.promptCache[key] = promptCacheEntry{prompt: p, valid: true, checked: true, checkedAt: time.Now(), sig: "test"}
+	a.mu.Unlock()
+	a.bumpPromptRev()
+}
+
+// CachedPrompt returns the latest live-parsed InteractivePrompt for key plus loading state.
+func (a *App) CachedPrompt(key TermKey) (prompt InteractivePrompt, ok bool, loading bool) {
+	if a == nil || key == (TermKey{}) {
+		return InteractivePrompt{}, false, false
+	}
+	if a.promptRev != nil {
+		_ = a.promptRev.Get()
+	}
+	a.mu.Lock()
+	ent, exists := a.promptCache[key]
+	inFly := a.promptInFly[key]
+	a.mu.Unlock()
+	if exists && ent.valid {
+		return ent.prompt, true, inFly
+	}
+	return InteractivePrompt{}, false, inFly
+}
+
+// PromptInspectChecked reports whether at least one live terminal.read check completed for key.
+func (a *App) PromptInspectChecked(key TermKey) bool {
+	if a == nil || key == (TermKey{}) {
+		return false
+	}
+	if a.promptRev != nil {
+		_ = a.promptRev.Get()
+	}
+	a.mu.Lock()
+	ent := a.promptCache[key]
+	a.mu.Unlock()
+	return ent.checked
+}
+
+// ClearPromptCache removes any cached prompt state and invalidates in-flight reads for key.
+func (a *App) ClearPromptCache(key TermKey) {
+	if a == nil || key == (TermKey{}) {
+		return
+	}
+	a.mu.Lock()
+	if a.promptGen == nil {
+		a.promptGen = make(map[TermKey]uint64)
+	}
+	a.promptGen[key]++
+	_, had := a.promptCache[key]
+	delete(a.promptCache, key)
+	a.mu.Unlock()
+	if had {
+		a.bumpPromptRev()
+	}
+}
+
+// InspectPrompt asynchronously reads the visible TUI screen for key and parses real permission
+// or ask_user_question options, deduplicated by status signature and a 1.8s throttle window.
+func (a *App) InspectPrompt(key TermKey, term Terminal, pq *PendingQuestion, force bool) {
+	if a == nil || key == (TermKey{}) {
+		return
+	}
+	c := a.clientForKey(key)
+	if c == nil {
+		return
+	}
+
+	a.mu.Lock()
+	if a.promptInFly == nil {
+		a.promptInFly = make(map[TermKey]bool)
+	}
+	if a.promptCache == nil {
+		a.promptCache = make(map[TermKey]promptCacheEntry)
+	}
+	if a.promptGen == nil {
+		a.promptGen = make(map[TermKey]uint64)
+	}
+	// Preserve previously cached JSONL PendingQuestion enrichment when background callers pass pq == nil.
+	effectivePQ := pq
+	if effectivePQ == nil {
+		if prev, ok := a.promptCache[key]; ok && prev.pendingQ != nil {
+			cp := *prev.pendingQ
+			effectivePQ = &cp
+		}
+	}
+	sig := term.StateWord()
+	if term.Status != nil {
+		sig += "|" + term.Status.Kind + "|" + term.Status.Msg
+	}
+	if term.StatusMS != nil {
+		sig += fmt.Sprintf("|%d", *term.StatusMS)
+	}
+	if effectivePQ != nil {
+		sig += "|pq:" + effectivePQ.ToolID
+	}
+
+	if a.promptInFly[key] {
+		a.mu.Unlock()
+		return
+	}
+	if !force {
+		if ent, exists := a.promptCache[key]; exists && ent.sig == sig && time.Since(ent.checkedAt) < 1800*time.Millisecond {
+			a.mu.Unlock()
+			return
+		}
+	}
+	a.promptInFly[key] = true
+	gen := a.promptGen[key]
+	a.mu.Unlock()
+	a.bumpPromptRev()
+
+	harness := DetectHarnessKind(term)
+	statusKind := ""
+	if term.Status != nil {
+		statusKind = term.Status.Kind
+	}
+	if statusKind == "" && effectivePQ != nil {
+		statusKind = "question"
+	}
+
+	go func(pqCopy *PendingQuestion, reqGen uint64) {
+		defer func() {
+			a.mu.Lock()
+			delete(a.promptInFly, key)
+			a.mu.Unlock()
+			a.bumpPromptRev()
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		rr, err := c.Read(ctx, key.Addr, 0)
+		a.mu.Lock()
+		if a.promptGen[key] != reqGen {
+			a.mu.Unlock()
+			return
+		}
+		if err != nil {
+			// On transient Read error, keep any existing valid cache entry intact instead of unmounting the card.
+			if prev, exists := a.promptCache[key]; exists && prev.valid {
+				a.mu.Unlock()
+				return
+			}
+			a.promptCache[key] = promptCacheEntry{valid: false, checked: true, pendingQ: pqCopy, checkedAt: time.Now(), sig: sig}
+			a.mu.Unlock()
+			return
+		}
+		var parsed InteractivePrompt
+		valid := false
+		if strings.TrimSpace(rr.Text) != "" {
+			if p, ok := ParseInteractivePrompt(rr.Text, harness, statusKind); ok {
+				if pqCopy != nil {
+					p = EnrichPromptFromJSONL(p, *pqCopy)
+				}
+				parsed = p
+				valid = true
+			}
+		}
+		a.promptCache[key] = promptCacheEntry{
+			prompt:    parsed,
+			valid:     valid,
+			checked:   true,
+			pendingQ:  pqCopy,
+			checkedAt: time.Now(),
+			sig:       sig,
+		}
+		a.mu.Unlock()
+	}(effectivePQ, gen)
+}
+
+// SubmitPromptChoice verifies the live terminal screen and sends exact TUI inputs for a multi-option
+// permission choice, single/multi-select question answer, inline Other text, or tab switch.
+func (a *App) SubmitPromptChoice(key TermKey, req PromptSubmitRequest, onDone func(error)) {
+	c := a.clientForKey(key)
+	if c == nil {
+		err := errors.New("该实例已断连。")
+		a.notifyToast(err.Error())
+		if onDone != nil {
+			onDone(err)
+		}
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		defer cancel()
+		err := DriveInteractivePrompt(ctx, c, key.Addr, req)
+		if err != nil {
+			a.notifyToast(explain(err))
+			if onDone != nil {
+				a.post(func() { onDone(err) })
+			}
+			return
+		}
+		if req.TabDelta == 0 {
+			if req.IsMultiSubmit {
+				a.notifyToast("已提交回答")
+			} else if req.OptionIndex >= 0 && req.OptionIndex < len(req.Expected.Options) {
+				lbl := singleLineClip(req.Expected.Options[req.OptionIndex].Label, 28)
+				a.notifyToast("已选择：" + lbl)
+			}
+		}
+		// Immediately refresh screen state (critical for multi-question flows advancing to the next tab/review).
+		if at, ok := a.FindTerminalSafe(key); ok {
+			time.AfterFunc(220*time.Millisecond, func() {
+				a.InspectPrompt(key, at.Terminal, nil, true)
+			})
+		}
+		if onDone != nil {
+			a.post(func() { onDone(nil) })
+		}
+	}()
+}
+
+// InlineApprove executes a verified whitelisted Approve/Deny action: prefers live-parsed
+// multi-option cursor driving (mapping Allow -> option 0, Deny -> ToneDanger option) and
+// falls back to legacy ApproveKeys only when no live screen options are parseable.
 func (a *App) InlineApprove(key TermKey, allow bool) {
 	cur, ok := a.FindTerminal(key)
 	if !ok {
@@ -1372,7 +1618,6 @@ func (a *App) InlineApprove(key TermKey, allow bool) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 		defer cancel()
-		// Re-verify live state before sending keys to guard against race conditions.
 		latest, err := c.Get(ctx, key.Addr)
 		if err != nil {
 			a.notifyToast(explain(err))
@@ -1381,6 +1626,39 @@ func (a *App) InlineApprove(key TermKey, allow bool) {
 		if !CanInlineApprove(latest) {
 			a.notifyToast("状态已变化，已取消直操，请进终端确认。")
 			return
+		}
+		// Prefer live screen parsing so Deny accurately hits Agy option 4 or Claude option 3.
+		if rr, rerr := c.Read(ctx, key.Addr, 0); rerr == nil && strings.TrimSpace(rr.Text) != "" {
+			if live, ok := ParseInteractivePrompt(rr.Text, DetectHarnessKind(latest), "permission"); ok {
+				target := 0
+				if !allow {
+					target = -1
+					for _, o := range live.Options {
+						if o.Tone == ToneDanger {
+							target = o.Index
+							break
+						}
+					}
+				}
+				if target >= 0 {
+					derr := DriveInteractivePrompt(ctx, c, key.Addr, PromptSubmitRequest{
+						Expected:       live,
+						OptionIndex:    target,
+						RequireBlocked: true,
+					})
+					if derr != nil {
+						a.notifyToast(explain(derr))
+						return
+					}
+					if allow {
+						a.notifyToast("已发送允许")
+					} else {
+						a.notifyToast("已发送拒绝")
+					}
+					a.ClearPromptCache(key)
+					return
+				}
+			}
 		}
 		if _, err := c.Keys(ctx, key.Addr, keys...); err != nil {
 			a.notifyToast(explain(err))
@@ -1391,6 +1669,7 @@ func (a *App) InlineApprove(key TermKey, allow bool) {
 		} else {
 			a.notifyToast("已发送拒绝")
 		}
+		a.ClearPromptCache(key)
 	}()
 }
 

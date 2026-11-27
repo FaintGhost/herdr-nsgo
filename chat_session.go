@@ -723,6 +723,9 @@ type ChatSessionController struct {
 	rawLines           []string
 	parsedItems        []ChatTurnItem
 	contextUsage       ContextUsage
+	seedEffort         string
+	seedModel          string
+	ctxWindowLookup    func(model string) int
 	commandsLoaded     time.Time
 	commandsLoading    bool
 	discoveredCommands []slashEntry
@@ -832,6 +835,8 @@ type prefetchedTranscript struct {
 	ParsedItems  []ChatTurnItem
 	ContextUsage ContextUsage
 	PiSkills     []slashEntry
+	SeedEffort   string
+	SeedModel    string
 	FetchedAt    time.Time
 }
 
@@ -880,12 +885,35 @@ func PrefetchTranscript(
 		return prefetchedTranscript{}, false
 	}
 	chunkLines := splitJSONLLines(win.Text)
-	parsed := ParseTranscriptLinesAt(res.Format, chunkLines, win.First)
-	usage := ParseTranscriptUsage(res.Format, chunkLines)
+	var seedEffort, seedModel string
 	var skills []slashEntry
 	if res.Format == FormatPi {
 		skills = piSkillManifest(chunkLines)
 	}
+	if (res.Format == FormatPi || res.Format == FormatPiOmp) && win.First > 1 {
+		if header, herr := backend.FileRead(ctx, key.InstanceID, FileReadParams{
+			Path:   res.Path,
+			On:     res.On,
+			Offset: 1,
+			Limit:  min(24, win.First-1),
+		}); herr == nil {
+			hdrLines := splitJSONLLines(header.Text)
+			seedEffort, seedModel = parsePiSessionHeaderState(hdrLines)
+			if res.Format == FormatPi && skills == nil {
+				skills = piSkillManifest(hdrLines)
+			}
+		}
+	}
+	var parsed []ChatTurnItem
+	switch res.Format {
+	case FormatPi:
+		parsed = parsePiOmpJSONLWithSeed(chunkLines, win.First, "pi", seedEffort, seedModel)
+	case FormatPiOmp:
+		parsed = parsePiOmpJSONLWithSeed(chunkLines, win.First, "omp", seedEffort, seedModel)
+	default:
+		parsed = ParseTranscriptLinesAt(res.Format, chunkLines, win.First)
+	}
+	usage := ParseTranscriptUsage(res.Format, chunkLines)
 	if snapshots != nil && len(parsed) > 0 {
 		snapshots.SaveChat(key, ChatSnapshot{
 			Source:       SourceJSONL,
@@ -910,6 +938,8 @@ func PrefetchTranscript(
 		ParsedItems:  parsed,
 		ContextUsage: usage,
 		PiSkills:     skills,
+		SeedEffort:   seedEffort,
+		SeedModel:    seedModel,
 		FetchedAt:    time.Now(),
 	}, true
 }
@@ -935,6 +965,8 @@ func (c *ChatSessionController) HydratePrefetch(p prefetchedTranscript) bool {
 	c.rawLines = append([]string(nil), p.RawLines...)
 	c.parsedItems = append([]ChatTurnItem(nil), p.ParsedItems...)
 	c.contextUsage = p.ContextUsage
+	c.seedEffort = p.SeedEffort
+	c.seedModel = p.SeedModel
 	if len(p.PiSkills) > 0 {
 		c.piSkills = p.PiSkills
 	}
@@ -967,14 +999,40 @@ func (c *ChatSessionController) ResumeLoop() {
 	c.StartLoop()
 }
 
+// SetContextWindowLookup binds an optional host-catalog model -> context window lookup
+// (e.g. ~/.pi/agent/models.json contextWindow=272000) so ContextUsage uses exact limits.
+func (c *ChatSessionController) SetContextWindowLookup(fn func(model string) int) {
+	c.mu.Lock()
+	c.ctxWindowLookup = fn
+	c.mu.Unlock()
+}
+
+func (c *ChatSessionController) parseLinesLocked(format TranscriptFormat, lines []string, firstLine int) []ChatTurnItem {
+	switch format {
+	case FormatPi:
+		return parsePiOmpJSONLWithSeed(lines, firstLine, "pi", c.seedEffort, c.seedModel)
+	case FormatPiOmp:
+		return parsePiOmpJSONLWithSeed(lines, firstLine, "omp", c.seedEffort, c.seedModel)
+	default:
+		return ParseTranscriptLinesAt(format, lines, firstLine)
+	}
+}
+
 // ContextUsage returns the latest parsed token footprint for this session.
 func (c *ChatSessionController) ContextUsage() ContextUsage {
 	if c.rev != nil {
 		_ = c.rev.Get()
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.contextUsage
+	u := c.contextUsage
+	lookup := c.ctxWindowLookup
+	c.mu.Unlock()
+	if u.Valid() && lookup != nil && u.Model != "" {
+		if win := lookup(u.Model); win > 0 {
+			u.WindowTokens = win
+		}
+	}
+	return u
 }
 
 // IsActivelySyncing reports whether the UI should render an animated sync indicator
@@ -1234,6 +1292,15 @@ func (c *ChatSessionController) ScrollToBottom() {
 	if hook != nil {
 		hook(true)
 	}
+}
+
+// PendingQuestionTool returns the active unanswered interactive question tool call
+// (AskUserQuestion / ask_question / ask_user_question) at the tail of this transcript, if any.
+func (c *ChatSessionController) PendingQuestionTool() (PendingQuestion, bool) {
+	if c == nil {
+		return PendingQuestion{}, false
+	}
+	return ExtractPendingQuestionFromItems(c.Items())
 }
 
 // Items returns a snapshot of the normalized, optimistic-merged conversation items.
@@ -1662,6 +1729,10 @@ func (c *ChatSessionController) loadInitialJSONLWindow(ctx context.Context, path
 	}
 
 	c.mu.Lock()
+	if win.First <= 1 {
+		c.seedEffort = ""
+		c.seedModel = ""
+	}
 	c.piSkills = skills
 	c.resolvedPath = path
 	c.format = format
@@ -1672,7 +1743,7 @@ func (c *ChatSessionController) loadInitialJSONLWindow(ctx context.Context, path
 	c.lastLine = win.Last
 	c.totalLines = win.Lines
 	c.rawLines = chunkLines
-	c.parsedItems = parsed
+	c.parsedItems = c.parseLinesLocked(format, chunkLines, win.First)
 	if usage.Valid() {
 		c.contextUsage = usage
 	}
@@ -1680,14 +1751,33 @@ func (c *ChatSessionController) loadInitialJSONLWindow(ctx context.Context, path
 	c.persistSnapshotLocked()
 	c.mu.Unlock()
 	c.bumpRev(true)
-	// The skill manifest is often a large system message. Publish the visible
-	// tail before reading it over a relay.
-	if format == FormatPi && skills == nil && win.First > 1 {
-		header, err := c.backend.FileRead(ctx, c.key.InstanceID, FileReadParams{Path: path, On: on, Offset: 1, Limit: min(16, win.First-1)})
+	// Read Pi/OMP session header when tail window skipped lines 1..N so initial
+	// thinking_level_change (e.g. high), model_change, and skill manifest are never missed.
+	if (format == FormatPi || format == FormatPiOmp) && win.First > 1 {
+		header, err := c.backend.FileRead(ctx, c.key.InstanceID, FileReadParams{Path: path, On: on, Offset: 1, Limit: min(24, win.First-1)})
 		if err == nil {
-			if found := piSkillManifest(splitJSONLLines(header.Text)); found != nil {
+			hdrLines := splitJSONLLines(header.Text)
+			hdrEffort, hdrModel := parsePiSessionHeaderState(hdrLines)
+			var foundSkills []slashEntry
+			if format == FormatPi && skills == nil {
+				foundSkills = piSkillManifest(hdrLines)
+			}
+			if hdrEffort != "" || hdrModel != "" || foundSkills != nil {
 				c.mu.Lock()
-				c.piSkills = found
+				if foundSkills != nil {
+					c.piSkills = foundSkills
+				}
+				if hdrEffort != "" {
+					c.seedEffort = hdrEffort
+				}
+				if hdrModel != "" {
+					c.seedModel = hdrModel
+				}
+				if hdrEffort != "" || hdrModel != "" {
+					c.parsedItems = c.parseLinesLocked(format, c.rawLines, c.firstLine)
+					c.rebuildMergedLocked()
+					c.persistSnapshotLocked()
+				}
 				c.mu.Unlock()
 				c.bumpRev(false)
 			}
@@ -1803,7 +1893,7 @@ func (c *ChatSessionController) tailJSONLFromLastLine(ctx context.Context, path 
 		c.source = SourceJSONL
 		c.cachedSnapshot = false
 		c.staleWorkingPolls = 0
-		c.parsedItems = ParseTranscriptLinesAt(format, c.rawLines, c.firstLine)
+		c.parsedItems = c.parseLinesLocked(format, c.rawLines, c.firstLine)
 		if usage := ParseTranscriptUsage(format, c.rawLines); usage.Valid() {
 			c.contextUsage = usage
 		}
@@ -1906,7 +1996,7 @@ func (c *ChatSessionController) LoadOlderSync(ctx context.Context) error {
 	if win.Lines > c.totalLines {
 		c.totalLines = win.Lines
 	}
-	c.parsedItems = ParseTranscriptLinesAt(format, c.rawLines, c.firstLine)
+	c.parsedItems = c.parseLinesLocked(format, c.rawLines, c.firstLine)
 	c.rebuildMergedLocked()
 	c.mu.Unlock()
 	return nil

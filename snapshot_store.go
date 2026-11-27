@@ -25,11 +25,12 @@ const (
 
 // AgentModelOption represents one selectable model discovered for an agent harness.
 type AgentModelOption struct {
-	ID          string   `json:"id"`
-	Label       string   `json:"label"`
-	Detail      string   `json:"detail,omitempty"`
-	Efforts     []string `json:"efforts,omitempty"`
-	DirectValue string   `json:"direct_value,omitempty"` // argument passed to /model <arg>
+	ID            string   `json:"id"`
+	Label         string   `json:"label"`
+	Detail        string   `json:"detail,omitempty"`
+	Efforts       []string `json:"efforts,omitempty"`
+	DirectValue   string   `json:"direct_value,omitempty"` // argument passed to /model <arg>
+	ContextWindow int      `json:"context_window,omitempty"`
 }
 
 // AgentCatalog caches discovered models and effort/thinking options for one (instance, harness) pair.

@@ -852,6 +852,11 @@ func SessionRowWithDivider(cx *core.Scope, a *App, itemFn func() AggregatedTermi
 func InlineApprovalCard(cx *core.Scope, a *App, itemFn func() AggregatedTerminal, onOpen func(TermKey)) core.Node {
 	initial := itemFn()
 	keyStr := initial.Key.String()
+	expandedAll := core.NewSignal(cx, false)
+	compactBusy := core.NewSignal(cx, false)
+	compactChecked := core.NewSignalFunc(cx, map[int]bool{}, nil)
+	compactOtherDraft := core.NewSignal(cx, "")
+	compactOtherIdx := core.NewSignal(cx, -1)
 
 	return core.View{
 		TestID: "attention-card-" + keyStr,
@@ -1037,56 +1042,125 @@ func InlineApprovalCard(cx *core.Scope, a *App, itemFn func() AggregatedTerminal
 						}
 					}
 					return core.View{
-						Style: core.Style{
-							Direction: core.Row,
-							Gap:       Tokens.Space2,
-						},
+						Style: core.Style{Gap: Tokens.Space2},
 						Children: []core.Node{
 							core.View{
-								Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinWidth: core.Pt(0)},
-								Children: []core.Node{
-									compactBtn("approve-allow-"+keyStr, "允许", ActionPrimary, func() {
-										a.InlineApprove(itemFn().Key, true)
-									}),
-								},
-							},
-							core.View{
-								Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinWidth: core.Pt(0)},
-								Children: []core.Node{
-									compactBtn("approve-deny-"+keyStr, "拒绝", ActionDanger, func() {
-										a.InlineApprove(itemFn().Key, false)
-									}),
-								},
-							},
-							core.View{
-								TestID: "approve-open-" + keyStr,
-								Role:   core.RoleButton,
-								Label:  "进入终端",
-								OnPress: func(core.PressEvent) {
-									playSelectionHaptic(cx)
-									if onOpen != nil {
-										onOpen(itemFn().Key)
-									}
-								},
-								StyleFunc: func() core.Style {
-									pal := a.paletteOf(cx)
-									return core.Style{
-										FlexShrink:     0,
-										Width:          core.Pt(36),
-										Height:         core.Pt(36),
-										CornerRadius:   Tokens.RadiusCtrl,
-										Background:     pal.SurfaceRaised,
-										AlignItems:     core.AlignCenter,
-										JustifyContent: core.JustifyCenter,
-									}
+								Style: core.Style{
+									Direction: core.Row,
+									Gap:       Tokens.Space2,
 								},
 								Children: []core.Node{
-									core.Icon{
-										SVG: iconTerminal,
-										StyleFunc: func() core.Style {
-											return core.Style{Width: core.Pt(16), Height: core.Pt(16), Color: a.paletteOf(cx).Text}
+									core.View{
+										Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinWidth: core.Pt(0)},
+										Children: []core.Node{
+											compactBtn("approve-allow-"+keyStr, "允许", ActionPrimary, func() {
+												a.InlineApprove(itemFn().Key, true)
+											}),
 										},
 									},
+									core.View{
+										Style: core.Style{FlexGrow: 1, FlexShrink: 1, MinWidth: core.Pt(0)},
+										Children: []core.Node{
+											compactBtn("approve-deny-"+keyStr, "拒绝", ActionDanger, func() {
+												a.InlineApprove(itemFn().Key, false)
+											}),
+										},
+									},
+									core.View{
+										TestID: "approve-open-" + keyStr,
+										Role:   core.RoleButton,
+										Label:  "进入终端",
+										OnPress: func(core.PressEvent) {
+											playSelectionHaptic(cx)
+											if onOpen != nil {
+												onOpen(itemFn().Key)
+											}
+										},
+										StyleFunc: func() core.Style {
+											pal := a.paletteOf(cx)
+											return core.Style{
+												FlexShrink:     0,
+												Width:          core.Pt(36),
+												Height:         core.Pt(36),
+												CornerRadius:   Tokens.RadiusCtrl,
+												Background:     pal.SurfaceRaised,
+												AlignItems:     core.AlignCenter,
+												JustifyContent: core.JustifyCenter,
+											}
+										},
+										Children: []core.Node{
+											core.Icon{
+												SVG: iconTerminal,
+												StyleFunc: func() core.Style {
+													return core.Style{Width: core.Pt(16), Height: core.Pt(16), Color: a.paletteOf(cx).Text}
+												},
+											},
+										},
+									},
+								},
+							},
+							core.Show{
+								When: func() bool {
+									p, ok, _ := a.CachedPrompt(itemFn().Key)
+									return ok && p.Kind == PromptKindPermission && len(p.Options) >= 3
+								},
+								Then: func(cx *core.Scope) core.Node {
+									promptFn := func() InteractivePrompt {
+										p, _, _ := a.CachedPrompt(itemFn().Key)
+										return p
+									}
+									return core.View{
+										Style: core.Style{Gap: Tokens.Space2},
+										Children: []core.Node{
+											core.View{
+												TestID: "approve-expand-" + keyStr,
+												Role:   core.RoleButton,
+												OnPress: func(core.PressEvent) {
+													playSelectionHaptic(cx)
+													animateSpringLayout(cx)
+													expandedAll.Set(!expandedAll.Get())
+												},
+												StyleFunc: func() core.Style {
+													pal := a.paletteOf(cx)
+													return core.Style{
+														Direction:      core.Row,
+														AlignItems:     core.AlignCenter,
+														JustifyContent: core.JustifyCenter,
+														Gap:            core.Points(4),
+														Height:         core.Pt(32),
+														CornerRadius:   Tokens.RadiusCtrl,
+														Background:     pal.SurfaceRaised,
+														BorderWidth:    1,
+														BorderColor:    pal.Border,
+													}
+												},
+												Children: []core.Node{
+													core.Text{
+														ContentFunc: func() string {
+															n := len(promptFn().Options)
+															if expandedAll.Get() {
+																return fmt.Sprintf("收起全部 %d 项 ▴", n)
+															}
+															return fmt.Sprintf("展开全部 %d 项 ▾", n)
+														},
+														StyleFunc: func() core.Style {
+															return core.Style{
+																Color:      a.paletteOf(cx).TextSecondary,
+																FontSize:   core.Points(12),
+																FontWeight: core.FontWeightMedium,
+															}
+														},
+													},
+												},
+											},
+											core.Show{
+												When: expandedAll.Get,
+												Then: func(cx *core.Scope) core.Node {
+													return renderPromptOptionList(cx, a, "compact-", keyStr, promptFn, itemFn, compactBusy, compactChecked, compactOtherDraft, compactOtherIdx)
+												},
+											},
+										},
+									}
 								},
 							},
 						},
@@ -1119,7 +1193,13 @@ func InlineApprovalCard(cx *core.Scope, a *App, itemFn func() AggregatedTerminal
 						},
 						Children: []core.Node{
 							core.Text{
-								Content: "进入终端处理",
+								ContentFunc: func() string {
+									t := itemFn().Terminal
+									if t.StateWord() == "blocked" && t.Status != nil && t.Status.Kind == "question" {
+										return "去聊天回答"
+									}
+									return "进入终端处理"
+								},
 								StyleFunc: func() core.Style {
 									return core.Style{
 										Color:      a.paletteOf(cx).Text,

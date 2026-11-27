@@ -83,6 +83,34 @@ func rootWithController(cx *core.Scope, app *App) (core.Node, *uiController) {
 
 	app.OnPoolSync(func() {
 		cur := u.activeSession.Get()
+		var activePQ *PendingQuestion
+		if cur != (TermKey{}) {
+			if chat := u.activeChat.Get(); chat != nil {
+				if pq, ok := chat.PendingQuestionTool(); ok {
+					pqCopy := pq
+					activePQ = &pqCopy
+				}
+			}
+		}
+		// Proactively inspect up to 4 blocked terminals for Home/Inbox compact expand toggles,
+		// without clearing the active session's JSONL-triggered Pi question prompt!
+		inspected := 0
+		for _, it := range app.aggTerms.GetUntracked() {
+			if it.Terminal.StateWord() == "blocked" {
+				if inspected < 4 {
+					var pqPtr *PendingQuestion
+					if it.Key == cur {
+						pqPtr = activePQ
+					}
+					app.InspectPrompt(it.Key, it.Terminal, pqPtr, false)
+					inspected++
+				}
+			} else if it.Key == cur && activePQ != nil {
+				app.InspectPrompt(it.Key, it.Terminal, activePQ, false)
+			} else {
+				app.ClearPromptCache(it.Key)
+			}
+		}
 		if cur == (TermKey{}) {
 			return
 		}
@@ -674,6 +702,10 @@ func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 			chatCtrl.SeedFromSnapshot(u.app.snapshots, live)
 		}
 	}
+	chatCtrl.SetContextWindowLookup(func(model string) int {
+		at, _ := u.app.FindTerminalSafe(key)
+		return u.app.LookupModelContextWindow(key.InstanceID, DetectHarnessKind(at.Terminal), model)
+	})
 
 	attachWithMode := func(obs bool, cols, rows int) {
 		gen := u.attachGen.Add(1)

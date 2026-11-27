@@ -1,0 +1,165 @@
+{
+  "version": 1,
+  "threads": [
+    {
+      "id": "CNNUpz2acW",
+      "anchor": {
+        "blockId": "sW_GRTCv",
+        "quote": "",
+        "ask": "edge-cases-open",
+        "choice": null,
+        "answer": "agv 第一条是临时允许 第二条是 当前会话允许，第三条是把允许持久化到配置文件 第四条是拒绝。"
+      },
+      "status": "open",
+      "statusAt": "2026-11-27T02:28:48.384Z",
+      "statusBy": "human",
+      "messages": [
+        {
+          "id": "OjIGjnq33k",
+          "author": "human",
+          "name": "FaintGhost",
+          "avatar": "/api/avatar/gravatar/0a71a9e22f646972aa749a616750e3639027deb5215bb61739850b8fae3f55e9",
+          "text": "agv 第一条是临时允许 第二条是 当前会话允许，第三条是把允许持久化到配置文件 第四条是拒绝。",
+          "at": "2026-11-27T02:28:48.384Z"
+        }
+      ]
+    },
+    {
+      "id": "M7WUCyW96E",
+      "anchor": {
+        "blockId": "*",
+        "quote": "",
+        "submit": true,
+        "asks": [
+          "prompt-source-strategy",
+          "inbox-card-behavior",
+          "other-option-flow",
+          "edge-cases-open"
+        ]
+      },
+      "status": "open",
+      "statusAt": "2026-11-27T02:29:00.770Z",
+      "statusBy": "human",
+      "messages": [
+        {
+          "id": "ko-zRNqTK4",
+          "author": "human",
+          "name": "FaintGhost",
+          "avatar": "/api/avatar/gravatar/0a71a9e22f646972aa749a616750e3639027deb5215bb61739850b8fae3f55e9",
+          "text": "Submitted the answers",
+          "at": "2026-11-27T02:29:00.770Z"
+        }
+      ]
+    },
+    {
+      "id": "OPRmaIqHDb",
+      "anchor": {
+        "blockId": "cdRRpbcM",
+        "quote": "",
+        "ask": "prompt-source-strategy",
+        "note": true
+      },
+      "status": "open",
+      "statusAt": "2026-11-27T02:31:30.276Z",
+      "statusBy": "agent",
+      "messages": [
+        {
+          "id": "xX2qbwuSle",
+          "author": "agent",
+          "name": "Antigravity",
+          "text": "已采纳 live-tui-primary：在 5.1/5.2 节明确以 terminal.read 实时读屏解析为主，JSONL 仅补充提问元数据，并在发送前二次核对状态与选项。",
+          "at": "2026-11-27T02:31:30.276Z"
+        }
+      ]
+    },
+    {
+      "id": "y49iEpGyGH",
+      "anchor": {
+        "blockId": "SmQVWte8",
+        "quote": "",
+        "ask": "inbox-card-behavior",
+        "note": true
+      },
+      "status": "open",
+      "statusAt": "2026-11-27T02:31:30.489Z",
+      "statusBy": "agent",
+      "messages": [
+        {
+          "id": "GPjLYeamT2",
+          "author": "agent",
+          "name": "Antigravity",
+          "text": "已采纳 inbox-compact-expand：在 5.3 节明确首页与收件箱保留 36pt 紧凑行兼容 280px 侧栏，并在解析出 >=3 项时提供卡片内一键展开全部选项。",
+          "at": "2026-11-27T02:31:30.489Z"
+        }
+      ]
+    },
+    {
+      "id": "HXTeGmBFVp",
+      "anchor": {
+        "blockId": "gupthcTK",
+        "quote": "",
+        "ask": "approve",
+        "choice": "approve",
+        "answer": null
+      },
+      "status": "open",
+      "statusAt": "2026-11-27T02:44:14.940Z",
+      "statusBy": "human",
+      "messages": [
+        {
+          "id": "yy3ZZbVgwB",
+          "author": "human",
+          "name": "FaintGhost",
+          "avatar": "/api/avatar/gravatar/0a71a9e22f646972aa749a616750e3639027deb5215bb61739850b8fae3f55e9",
+          "text": "approve",
+          "at": "2026-11-27T02:44:14.940Z"
+        }
+      ]
+    },
+    {
+      "id": "n1mCRKuHrh",
+      "anchor": {
+        "blockId": "*",
+        "quote": "",
+        "submit": true,
+        "asks": [
+          "approve"
+        ]
+      },
+      "status": "open",
+      "statusAt": "2026-11-27T02:44:14.974Z",
+      "statusBy": "human",
+      "messages": [
+        {
+          "id": "uk8kycy4Iq",
+          "author": "human",
+          "name": "FaintGhost",
+          "avatar": "/api/avatar/gravatar/0a71a9e22f646972aa749a616750e3639027deb5215bb61739850b8fae3f55e9",
+          "text": "Submitted the answers",
+          "at": "2026-11-27T02:44:14.974Z"
+        }
+      ]
+    },
+    {
+      "id": "QgcSl0OUsA",
+      "anchor": {
+        "blockId": "gupthcTK",
+        "quote": "",
+        "ask": "approve",
+        "note": true
+      },
+      "status": "open",
+      "statusAt": "2026-11-27T02:45:53.791Z",
+      "statusBy": "agent",
+      "messages": [
+        {
+          "id": "xEeHD-7Ka_",
+          "author": "agent",
+          "name": "Antigravity",
+          "text": "设计已批准，已创建 docs/ryugi/specs/2026-11-27-harness-interactive-prompts-design.md 指针并按设计进入 TDD 实现。",
+          "at": "2026-11-27T02:45:53.791Z"
+        }
+      ]
+    }
+  ]
+}

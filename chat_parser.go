@@ -61,6 +61,7 @@ type ChatToolCall struct {
 	DiffOld      string `json:"diff_old,omitempty"`
 	DiffNew      string `json:"diff_new,omitempty"`
 	DiffPatch    string `json:"diff_patch,omitempty"`
+	RawInput     string `json:"raw_input,omitempty"`
 }
 
 // HasDiff reports whether this tool call carries a structured file modification diff.
@@ -504,7 +505,45 @@ func buildToolCall(id, name string, rawArgs any) ChatToolCall {
 	if tc.Target == "" && diffFile != "" {
 		tc.Target = filepath.Base(diffFile)
 	}
+	if isQuestionToolName(name) {
+		tc.RawInput = encodeQuestionRawInput(rawArgs)
+	}
 	return tc
+}
+
+func isQuestionToolName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "ask_user_question", "askuserquestion", "ask_question", "ask_user", "request_user_input":
+		return true
+	}
+	return false
+}
+
+func encodeQuestionRawInput(rawArgs any) string {
+	const maxQuestionJSONBytes = 16 * 1024
+	var raw string
+	switch v := rawArgs.(type) {
+	case string:
+		raw = strings.TrimSpace(v)
+	case json.RawMessage:
+		raw = strings.TrimSpace(string(v))
+		if strings.HasPrefix(raw, `"`) {
+			var inner string
+			if json.Unmarshal(v, &inner) == nil {
+				raw = strings.TrimSpace(inner)
+			}
+		}
+	case nil:
+		return ""
+	default:
+		if b, err := json.Marshal(v); err == nil {
+			raw = string(b)
+		}
+	}
+	if len(raw) > maxQuestionJSONBytes {
+		return ""
+	}
+	return raw
 }
 
 func extractToolDiff(name string, rawArgs any) (file, oldStr, newStr, patch string) {
@@ -990,11 +1029,46 @@ func ParsePiOmpJSONL(lines []string) []ChatTurnItem {
 	return parsePiOmpJSONLAt(lines, 1, "omp")
 }
 
+func parsePiSessionHeaderState(lines []string) (effort, model string) {
+	for _, raw := range lines {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		var env struct {
+			Type          string `json:"type"`
+			ThinkingLevel string `json:"thinkingLevel"`
+			Level         string `json:"level"`
+			ModelID       string `json:"modelId"`
+			Model         string `json:"model"`
+		}
+		if json.Unmarshal([]byte(raw), &env) != nil {
+			continue
+		}
+		switch env.Type {
+		case "thinking_level_change":
+			if lv := nonEmpty(strings.TrimSpace(env.ThinkingLevel), strings.TrimSpace(env.Level)); lv != "" {
+				effort = lv
+			}
+		case "model_change":
+			if m := nonEmpty(strings.TrimSpace(env.ModelID), strings.TrimSpace(env.Model)); m != "" {
+				model = m
+			}
+		}
+	}
+	return effort, model
+}
+
 func parsePiOmpJSONLAt(lines []string, firstLine int, app string) []ChatTurnItem {
+	return parsePiOmpJSONLWithSeed(lines, firstLine, app, "", "")
+}
+
+func parsePiOmpJSONLWithSeed(lines []string, firstLine int, app, seedEffort, seedModel string) []ChatTurnItem {
 	var items []ChatTurnItem
 	toolIdx := make(map[string][2]int)
 	baseIdx := firstLine - 1
-	curEffort := ""
+	curEffort := strings.TrimSpace(seedEffort)
+	curModel := strings.TrimSpace(seedModel)
 
 	for lineNo, raw := range lines {
 		raw = strings.TrimSpace(raw)
@@ -1010,6 +1084,7 @@ func parsePiOmpJSONLAt(lines []string, firstLine int, app string) []ChatTurnItem
 			ID            string `json:"id"`
 			ThinkingLevel string `json:"thinkingLevel"`
 			Level         string `json:"level"`
+			ModelID       string `json:"modelId"`
 			Message       struct {
 				Role       string          `json:"role"`
 				Model      string          `json:"model"`
@@ -1028,9 +1103,19 @@ func parsePiOmpJSONLAt(lines []string, firstLine int, app string) []ChatTurnItem
 			}
 			continue
 		}
+		if env.Type == "model_change" {
+			if m := strings.TrimSpace(env.ModelID); m != "" {
+				curModel = m
+			}
+			continue
+		}
 		if env.Type != "message" {
 			continue
 		}
+		if m := strings.TrimSpace(env.Message.Model); m != "" {
+			curModel = m
+		}
+		msgModel := nonEmpty(strings.TrimSpace(env.Message.Model), curModel)
 		rowID := nonEmpty(env.ID, fmt.Sprintf("omp-%d", absIdx))
 
 		switch env.Message.Role {
@@ -1061,7 +1146,7 @@ func parsePiOmpJSONLAt(lines []string, firstLine int, app string) []ChatTurnItem
 						ID:         rowID,
 						Role:       RoleAssistant,
 						Text:       s,
-						Model:      env.Message.Model,
+						Model:      msgModel,
 						Effort:     curEffort,
 						App:        app,
 						Blocks:     SplitMarkdownBlocks(s),
@@ -1078,7 +1163,7 @@ func parsePiOmpJSONLAt(lines []string, firstLine int, app string) []ChatTurnItem
 							ID:         fmt.Sprintf("%s-th-%d", rowID, bi),
 							Role:       RoleThinking,
 							Text:       th,
-							Model:      env.Message.Model,
+							Model:      msgModel,
 							Effort:     curEffort,
 							App:        app,
 							SourceLine: srcLine,
@@ -1092,7 +1177,7 @@ func parsePiOmpJSONLAt(lines []string, firstLine int, app string) []ChatTurnItem
 							ID:         fmt.Sprintf("%s-txt-%d", rowID, bi),
 							Role:       RoleAssistant,
 							Text:       txt,
-							Model:      env.Message.Model,
+							Model:      msgModel,
 							Effort:     curEffort,
 							App:        app,
 							Blocks:     SplitMarkdownBlocks(txt),
@@ -1648,11 +1733,11 @@ func estimateContextWindow(model string, used int) int {
 			return 1_000_000
 		}
 		return 200_000
-	case strings.Contains(lower, "gpt-5") || strings.Contains(lower, "codex"):
-		if used > 200_000 {
+	case strings.Contains(lower, "gpt-5") || strings.Contains(lower, "gpt-6") || strings.Contains(lower, "codex"):
+		if used > 272_000 {
 			return 400_000
 		}
-		return 200_000
+		return 272_000
 	default:
 		if used > 200_000 {
 			return 1_000_000

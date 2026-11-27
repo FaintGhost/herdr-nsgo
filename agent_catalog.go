@@ -137,12 +137,20 @@ elif kind in ('pi', 'omp'):
                     continue
                 seen.add(full)
                 name = str(item.get('name') or mid).strip()
-                out['models'].append({
+                cw = item.get('contextWindow') or item.get('context_window') or 0
+                try:
+                    cw = int(cw)
+                except (TypeError, ValueError):
+                    cw = 0
+                entry = {
                     'id': full,
                     'label': name,
                     'detail': prov,
                     'direct_value': full,
-                })
+                }
+                if cw > 0:
+                    entry['context_window'] = cw
+                out['models'].append(entry)
                 if len(out['models']) >= 32:
                     break
             if len(out['models']) >= 32:
@@ -478,6 +486,45 @@ func ShortModelLabel(raw string) string {
 		return s[:15] + "…"
 	}
 	return s
+}
+
+// LookupModelContextWindow resolves the exact context window (in tokens) reported by the
+// host catalog (e.g. ~/.pi/agent/models.json contextWindow=272000) for a given model ID.
+func (a *App) LookupModelContextWindow(instanceID, kind, model string) int {
+	if a == nil {
+		return 0
+	}
+	clean, _ := splitModelAndEffort(model)
+	target := strings.ToLower(strings.TrimSpace(clean))
+	if target == "" {
+		return 0
+	}
+	targetTail := target
+	if idx := strings.LastIndex(targetTail, "/"); idx >= 0 && idx+1 < len(targetTail) {
+		targetTail = targetTail[idx+1:]
+	}
+	cat := a.InstantCatalogFor(instanceID, kind, "")
+	best := 0
+	for _, m := range cat.Models {
+		if m.ContextWindow <= 0 {
+			continue
+		}
+		mid := strings.ToLower(strings.TrimSpace(m.ID))
+		if mid == "" {
+			continue
+		}
+		if mid == target {
+			return m.ContextWindow
+		}
+		mTail := mid
+		if idx := strings.LastIndex(mTail, "/"); idx >= 0 && idx+1 < len(mTail) {
+			mTail = mTail[idx+1:]
+		}
+		if mTail == targetTail && best == 0 {
+			best = m.ContextWindow
+		}
+	}
+	return best
 }
 
 // InstantCatalogFor returns a 0ms ready-to-render AgentCatalog from cache + built-in presets + live transcript model.

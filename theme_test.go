@@ -191,7 +191,7 @@ func TestNoRawColorsInScreens(t *testing.T) {
 	patterns := []string{
 		"screen_*.go", "components.go", "icons.go", "main.go", "vt_view.go",
 		"mobile_picker.go", "project_browser.go", "browser_preview.go",
-		"slash_commands.go", "dictation.go",
+		"slash_commands.go", "dictation.go", "prompt_card.go",
 	}
 	for _, pat := range patterns {
 		matches, err := filepath.Glob(pat)

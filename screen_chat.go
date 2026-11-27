@@ -279,7 +279,12 @@ func RenderChatSessionWithCallbacks(
 										},
 										Children: []core.Node{
 											core.Show{
-												When: func() bool { return chatCtrl.ContextUsage().Valid() },
+												When: func() bool {
+													if a.catalogRev != nil {
+														_ = a.catalogRev.Get()
+													}
+													return chatCtrl.ContextUsage().Valid()
+												},
 												Then: func(cx *core.Scope) core.Node {
 													ringColor := func() core.Color {
 														pal := a.paletteOf(cx)
@@ -329,6 +334,9 @@ func RenderChatSessionWithCallbacks(
 																Size:      12,
 																LineWidth: 2,
 																Value: func() float32 {
+																	if a.catalogRev != nil {
+																		_ = a.catalogRev.Get()
+																	}
 																	u := chatCtrl.ContextUsage()
 																	if !u.Valid() {
 																		return 0
@@ -342,8 +350,13 @@ func RenderChatSessionWithCallbacks(
 																Tint: ringColor,
 															},
 															core.Text{
-																MaxLines:    1,
-																ContentFunc: func() string { return chatCtrl.ContextUsage().Label() },
+																MaxLines: 1,
+																ContentFunc: func() string {
+																	if a.catalogRev != nil {
+																		_ = a.catalogRev.Get()
+																	}
+																	return chatCtrl.ContextUsage().Label()
+																},
 																StyleFunc: func() core.Style {
 																	pal := a.paletteOf(cx)
 																	col := pal.TextMuted
@@ -510,15 +523,17 @@ func RenderChatSessionWithCallbacks(
 									return renderSubagentStrip(cx, a, childSubsessions, onOpenSession)
 								},
 							},
-							// Inline permission / blocked card anchored directly at conversation bottom
+							// Inline multi-option permission / AskUserQuestion card anchored directly at conversation bottom
 							core.Show{
-								When: func() bool { return termFn().Terminal.NeedsYou() },
+								When: func() bool {
+									if termFn().Terminal.NeedsYou() {
+										return true
+									}
+									_, hasPQ := chatCtrl.PendingQuestionTool()
+									return hasPQ
+								},
 								Then: func(cx *core.Scope) core.Node {
-									return InlineApprovalCard(cx, a, termFn, func(TermKey) {
-										if onSwitchToVT != nil {
-											onSwitchToVT()
-										}
-									})
+									return ChatInteractivePromptCard(cx, a, termFn, chatCtrl, onSwitchToVT)
 								},
 							},
 						},
