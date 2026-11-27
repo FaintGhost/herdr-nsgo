@@ -281,8 +281,31 @@ func RenderChatSessionWithCallbacks(
 											core.Show{
 												When: func() bool { return chatCtrl.ContextUsage().Valid() },
 												Then: func(cx *core.Scope) core.Node {
-													return core.View{
+													ringColor := func() core.Color {
+														pal := a.paletteOf(cx)
+														ratio := chatCtrl.ContextUsage().Ratio()
+														if ratio >= 0.90 {
+															return pal.Danger
+														}
+														if ratio >= 0.75 {
+															return pal.Warn
+														}
+														return pal.Running
+													}
+													return base.Button{
 														TestID: "chat-context-pill",
+														LabelFunc: func() string {
+															if lbl := chatCtrl.ContextUsage().DetailLabel(); lbl != "" {
+																return lbl
+															}
+															return "上下文用量"
+														},
+														OnPress: func(core.PressEvent) {
+															playSelectionHaptic(cx)
+															if lbl := chatCtrl.ContextUsage().DetailLabel(); lbl != "" {
+																a.notifyToast(lbl)
+															}
+														},
 														StyleFunc: func() core.Style {
 															pal := a.paletteOf(cx)
 															bg := pal.SurfaceRaised
@@ -295,12 +318,29 @@ func RenderChatSessionWithCallbacks(
 															return core.Style{
 																Direction:    core.Row,
 																AlignItems:   core.AlignCenter,
+																Gap:          core.Points(5),
 																Padding:      core.Symmetric(core.Points(3), core.Points(7)),
 																CornerRadius: Tokens.RadiusPill,
 																Background:   bg,
 															}
 														},
 														Children: []core.Node{
+															ui.ProgressRing{
+																Size:      12,
+																LineWidth: 2,
+																Value: func() float32 {
+																	u := chatCtrl.ContextUsage()
+																	if !u.Valid() {
+																		return 0
+																	}
+																	pct := u.Percent()
+																	if pct < 3 {
+																		return 3
+																	}
+																	return pct
+																},
+																Tint: ringColor,
+															},
 															core.Text{
 																MaxLines:    1,
 																ContentFunc: func() string { return chatCtrl.ContextUsage().Label() },

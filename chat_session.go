@@ -400,16 +400,18 @@ func (r *TranscriptResolver) ResolveLatestForStale(ctx context.Context, key Term
 	on, _ := SplitMachineAddr(key.Addr)
 	if kind == "claude" {
 		slug := claudeProjectSlug(term.CurrentDir())
+		launchSlug := claudeProjectSlug(term.Cwd)
 		sid := extractSessionIDFromTerm(term)
-		if slug != "" || sid != "" {
+		if slug != "" || launchSlug != "" || sid != "" {
 			er, err := backend.MachineExec(ctx, key.InstanceID, ExecParams{
 				On:      on,
 				Timeout: 5.0,
 				Env: map[string]string{
-					"HC_SID":  sid,
-					"HC_SLUG": slug,
+					"HC_SID":         sid,
+					"HC_SLUG":        slug,
+					"HC_LAUNCH_SLUG": launchSlug,
 				},
-				Line: `found=""; if [ -n "$HC_SLUG" ]; then found=$(ls -1t "$HOME/.claude/projects/$HC_SLUG"/*.jsonl 2>/dev/null | head -n 1); fi; if [ -z "$found" ] && [ -n "$HC_SID" ]; then found=$(ls -1t "$HOME/.claude/projects"/*/*"$HC_SID"*.jsonl 2>/dev/null | head -n 1); fi; printf "%s\n" "$found"`,
+				Line: `found=""; if [ -n "$HC_SLUG" ]; then found=$(ls -1t "$HOME/.claude/projects/$HC_SLUG"/*.jsonl 2>/dev/null | head -n 1); fi; if [ -z "$found" ] && [ -n "$HC_LAUNCH_SLUG" ] && [ "$HC_LAUNCH_SLUG" != "$HC_SLUG" ]; then found=$(ls -1t "$HOME/.claude/projects/$HC_LAUNCH_SLUG"/*.jsonl 2>/dev/null | head -n 1); fi; if [ -z "$found" ] && [ -n "$HC_SID" ]; then found=$(ls -1t "$HOME/.claude/projects"/*/*"$HC_SID"*.jsonl 2>/dev/null | head -n 1); fi; printf "%s\n" "$found"`,
 			})
 			if err == nil {
 				if found := firstOutputLine(er.StdoutText()); found != "" {
@@ -512,28 +514,35 @@ func (r *TranscriptResolver) resolveClaude(ctx context.Context, instanceID, on s
 		}
 	}
 
-	// 2. Explicit session ID (--resume / alma.session) + known cwd.
+	// 2. Explicit session ID (--resume / alma.session) + known cwd (both live foreground cwd and launch cwd).
 	sid := extractSessionIDFromTerm(term)
 	slug := claudeProjectSlug(term.CurrentDir())
+	launchSlug := claudeProjectSlug(term.Cwd)
 	if home == "" {
 		home = r.resolveHome(ctx, backend, instanceID, on)
 	}
-	if sid != "" && slug != "" && home != "" {
-		direct := fmt.Sprintf("%s/.claude/projects/%s/%s.jsonl", home, slug, sid)
-		if lines, ok := r.probeFileLines(ctx, backend, instanceID, on, direct); ok {
-			return ResolvedTranscript{Path: direct, Format: FormatClaude, On: on, KnownLines: lines}, true
+	if sid != "" && home != "" {
+		for _, s := range []string{slug, launchSlug} {
+			if s == "" {
+				continue
+			}
+			direct := fmt.Sprintf("%s/.claude/projects/%s/%s.jsonl", home, s, sid)
+			if lines, ok := r.probeFileLines(ctx, backend, instanceID, on, direct); ok {
+				return ResolvedTranscript{Path: direct, Format: FormatClaude, On: on, KnownLines: lines}, true
+			}
 		}
 	}
 
-	// 3. Fallback single read-only MachineExec using Env vars (falls through to HC_SLUG if HC_SID misses).
+	// 3. Fallback single read-only MachineExec using Env vars (falls through HC_SID -> HC_SLUG -> HC_LAUNCH_SLUG).
 	er, err := backend.MachineExec(ctx, instanceID, ExecParams{
 		On:      on,
 		Timeout: 5.0,
 		Env: map[string]string{
-			"HC_SID":  sid,
-			"HC_SLUG": slug,
+			"HC_SID":         sid,
+			"HC_SLUG":        slug,
+			"HC_LAUNCH_SLUG": launchSlug,
 		},
-		Line: `found=""; if [ -n "$HC_SID" ]; then found=$(ls -1t "$HOME/.claude/projects"/*/*"$HC_SID"*.jsonl 2>/dev/null | head -n 1); fi; if [ -z "$found" ] && [ -n "$HC_SLUG" ]; then found=$(ls -1t "$HOME/.claude/projects/$HC_SLUG"/*.jsonl 2>/dev/null | head -n 1); fi; printf "%s\n" "$found"`,
+		Line: `found=""; if [ -n "$HC_SID" ]; then found=$(ls -1t "$HOME/.claude/projects"/*/*"$HC_SID"*.jsonl 2>/dev/null | head -n 1); fi; if [ -z "$found" ] && [ -n "$HC_SLUG" ]; then found=$(ls -1t "$HOME/.claude/projects/$HC_SLUG"/*.jsonl 2>/dev/null | head -n 1); fi; if [ -z "$found" ] && [ -n "$HC_LAUNCH_SLUG" ] && [ "$HC_LAUNCH_SLUG" != "$HC_SLUG" ]; then found=$(ls -1t "$HOME/.claude/projects/$HC_LAUNCH_SLUG"/*.jsonl 2>/dev/null | head -n 1); fi; printf "%s\n" "$found"`,
 	})
 	if err != nil {
 		return ResolvedTranscript{}, false
@@ -726,6 +735,7 @@ type ChatSessionController struct {
 	loadingOlder       bool
 	staleWorkingPolls  int
 	lastStaleRecheck   time.Time
+	lastFallbackRetry  time.Time
 
 	// Root-scope reactive signals (non-nil when cx != nil).
 	rev         *core.Signal[uint64]
@@ -800,6 +810,9 @@ func (c *ChatSessionController) SeedFromSnapshot(store *SnapshotStore, live *Ter
 	c.source = src
 	c.cachedSnapshot = true
 	c.parsedItems = append([]ChatTurnItem(nil), snap.Items...)
+	if snap.ContextUsage.Valid() {
+		c.contextUsage = snap.ContextUsage
+	}
 	c.rebuildMergedLocked()
 	c.mu.Unlock()
 	c.bumpRev(true)
@@ -881,6 +894,7 @@ func PrefetchTranscript(
 			OnMachine:    res.On,
 			LastLine:     win.Last,
 			Items:        append([]ChatTurnItem(nil), parsed...),
+			ContextUsage: usage,
 			UpdatedMS:    time.Now().UnixMilli(),
 		})
 	}
@@ -1068,6 +1082,7 @@ func (c *ChatSessionController) persistSnapshotLocked() {
 		OnMachine:    c.onMachine,
 		LastLine:     c.lastLine,
 		Items:        append([]ChatTurnItem(nil), c.parsedItems...),
+		ContextUsage: c.contextUsage,
 		UpdatedMS:    time.Now().UnixMilli(),
 	}
 	store := c.snapshots
@@ -1131,16 +1146,38 @@ func (c *ChatSessionController) shouldPollWorking() bool {
 	}
 	if c.backend != nil {
 		if at, ok := c.backend.FindTerminal(c.key); ok {
+			kind := DetectHarnessKind(at.Terminal)
+			// Self-heal known JSONL harnesses if an initial transient hiccup dropped them to SourceVTFallback.
+			if src == SourceVTFallback && isJSONLHarnessKind(kind) {
+				c.mu.Lock()
+				due := time.Since(c.lastFallbackRetry) >= 6*time.Second
+				if due {
+					c.lastFallbackRetry = time.Now()
+				}
+				c.mu.Unlock()
+				if due {
+					return true
+				}
+			}
 			st := at.Terminal.StateWord()
 			// Some Pi sessions only publish terminal liveness. Their JSONL can grow
 			// after an intermediate assistant message without a working event.
-			if src == SourceJSONL && at.Terminal.Status == nil && !at.Terminal.Finished() && DetectHarnessKind(at.Terminal) != "" {
+			if src == SourceJSONL && at.Terminal.Status == nil && !at.Terminal.Finished() && kind != "" {
 				return true
 			}
 			return st == "working" || st == "blocked"
 		}
 	}
 	return false
+}
+
+func isJSONLHarnessKind(kind string) bool {
+	switch kind {
+	case "claude", "codex", "pi", "omp", "antigravity":
+		return true
+	default:
+		return false
+	}
 }
 
 // Close stops background polling cleanly when leaving or switching sessions.
@@ -1466,6 +1503,12 @@ func (c *ChatSessionController) RefreshSync(ctx context.Context) error {
 	}
 
 	if !hasResolved {
+		c.mu.Lock()
+		keepJSONL := c.source == SourceJSONL && len(c.parsedItems) > 0
+		c.mu.Unlock()
+		if keepJSONL {
+			return nil
+		}
 		c.applyVTFallback()
 		return nil
 	}
@@ -1512,7 +1555,17 @@ func (c *ChatSessionController) readWindowAdaptive(ctx context.Context, path, on
 }
 
 func isTransientReadErr(err error) bool {
-	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+	if err == nil {
+		return false
+	}
+	// Remote RPC errors (not_found, invalid_params, permission_denied) are authoritative file errors;
+	// transport/offline/context errors ("instance offline", EOF, SSH reset, timeout) are transient
+	// and must never downgrade a Chat session into plain-text VT fallback.
+	var rpcErr *RPCError
+	if errors.As(err, &rpcErr) {
+		return false
+	}
+	return true
 }
 
 func (c *ChatSessionController) invalidateResolvedOnHardErr(err error) {
@@ -1673,11 +1726,20 @@ func (c *ChatSessionController) tailJSONLFromLastLine(ctx context.Context, path 
 			var rpcErr *RPCError
 			if errors.As(err, &rpcErr) && rpcErr.Kind() == "not_found" {
 				c.resolver.Invalidate(c.key)
+				if c.recheckLatestPathIfChanged(ctx) {
+					c.mu.Lock()
+					newPath, newFmt, newOn := c.resolvedPath, c.format, c.onMachine
+					c.mu.Unlock()
+					return c.loadInitialJSONLWindow(ctx, newPath, newFmt, newOn)
+				}
 				c.mu.Lock()
 				c.resolvedPath = ""
 				c.lastLine = 0
+				keepJSONL := c.source == SourceJSONL && len(c.parsedItems) > 0
 				c.mu.Unlock()
-				c.applyVTFallback()
+				if !keepJSONL {
+					c.applyVTFallback()
+				}
 				return nil
 			}
 			if isTransientReadErr(err) || limit <= 10 || (errors.As(err, &rpcErr) && rpcErr.Kind() == "invalid_params") {
@@ -1854,6 +1916,12 @@ func (c *ChatSessionController) applyVTFallback() {
 	if c.isClosed() {
 		return
 	}
+	c.mu.Lock()
+	if c.source == SourceJSONL && len(c.parsedItems) > 0 {
+		c.mu.Unlock()
+		return
+	}
+	c.mu.Unlock()
 	raw := ""
 	if c.vtFallback != nil {
 		raw = c.vtFallback()

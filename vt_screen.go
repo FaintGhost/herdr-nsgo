@@ -563,6 +563,19 @@ func (s *VTScreen) feedByte(b byte) {
 	}
 }
 
+// Reset clears the screen grid, scrollback, and parser state in a thread-safe way.
+func (s *VTScreen) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state = vtStateGround
+	s.csiBuf = s.csiBuf[:0]
+	s.oscBuf = s.oscBuf[:0]
+	s.utf8Buf = s.utf8Buf[:0]
+	s.scrollback = nil
+	s.reset()
+	s.seq++
+}
+
 func (s *VTScreen) reset() {
 	s.inAlt = false
 	s.mainGrid = nil

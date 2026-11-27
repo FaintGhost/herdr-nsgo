@@ -82,8 +82,26 @@ func rootWithController(cx *core.Scope, app *App) (core.Node, *uiController) {
 	}
 
 	app.OnPoolSync(func() {
+		cur := u.activeSession.Get()
+		if cur == (TermKey{}) {
+			return
+		}
 		if chat := u.activeChat.Get(); chat != nil {
 			chat.RefreshAsync()
+		}
+		// If a session auto-opened in VT before terminal metadata arrived (e.g. cold reconnect
+		// or freshly spawned agent) and the user never manually chose VT, upgrade to Chat mode.
+		if u.sessionMode.Get() == "vt" {
+			if _, explicit := u.sessionModes[cur]; !explicit {
+				if at, ok := app.FindTerminal(cur); ok && IsAgentTerminal(at.Terminal) {
+					u.sessionMode.Set("chat")
+				}
+			}
+		}
+		// Re-attach VT live ANSI stream automatically after SSH reconnects so VT never stays
+		// frozen on a dead stream or temporary plain-text read fallback.
+		if st := u.activeTerm.Get(); st != nil && !st.Attached() && u.pendingAttach == nil && app.clientForKey(cur) != nil {
+			st.ReattachIfDetached(app.vtFontSize.Get())
 		}
 	})
 
@@ -367,6 +385,10 @@ func (u *uiController) setSessionMode(mode string) {
 		if fn := u.pendingAttach; fn != nil {
 			u.pendingAttach = nil
 			fn()
+			return
+		}
+		if st := u.activeTerm.Get(); st != nil && !st.Attached() {
+			st.ReattachIfDetached(u.app.vtFontSize.Get())
 		}
 		return
 	}
@@ -588,15 +610,26 @@ func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 	u.app.SetActiveSession(key)
 	u.app.TouchSessionActivity(key)
 
-	// Determine initial mode: remembered per-session choice -> Agent="chat" / Shell="vt".
+	// Determine initial mode: explicit user choice -> Agent/JSONL="chat" / Shell="vt".
+	// Never cache an auto-detected default "vt" into u.sessionModes so a transient metadata
+	// miss (e.g. Claude running a subprocess or cold reconnect) cannot permanently trap it in VT!
 	mode, remembered := u.sessionModes[key]
 	if !remembered {
+		isAgent := false
 		if at, ok := u.app.FindTerminal(key); ok && IsAgentTerminal(at.Terminal) {
+			isAgent = true
+		} else if _, hasWarm := u.warmChats[key]; hasWarm {
+			isAgent = true
+		} else if u.app.snapshots != nil {
+			if snap, ok := u.app.snapshots.LoadChat(key); ok && snap.Source == SourceJSONL && len(snap.Items) > 0 {
+				isAgent = true
+			}
+		}
+		if isAgent {
 			mode = "chat"
 		} else {
 			mode = "vt"
 		}
-		u.sessionModes[key] = mode
 	}
 	u.sessionMode.Set(mode)
 
@@ -686,7 +719,7 @@ func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 				}
 				st.SetDiag("attach 失败，尝试读取快照：" + err.Error())
 				if r, rerr := client.Read(ctx, key.Addr, 200); rerr == nil && r.Text != "" {
-					st.Feed([]byte(strings.ReplaceAll(r.Text, "\n", "\r\n")))
+					st.FeedPlaintextFallback([]byte(strings.ReplaceAll(r.Text, "\n", "\r\n")))
 					u.app.post(func() { st.ScrollToBottom() })
 					return
 				}
@@ -711,7 +744,7 @@ func (u *uiController) openSession(_ *core.Scope, key TermKey) {
 					defer rcancel()
 					r, rerr := client.Read(rctx, key.Addr, 500)
 					if rerr == nil && r.Text != "" && !st.HasReceivedBytes() {
-						st.Feed([]byte(strings.ReplaceAll(r.Text, "\n", "\r\n")))
+						st.FeedPlaintextFallback([]byte(strings.ReplaceAll(r.Text, "\n", "\r\n")))
 						u.app.post(func() { st.ScrollToBottom() })
 					} else if rerr != nil {
 						st.SetDiag("已接入流，但读取初始快照失败：" + rerr.Error())

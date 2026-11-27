@@ -34,10 +34,11 @@ type SessionTerminal struct {
 	reattachFn   func(observe bool, cols, rows int)
 	loadMoreFn   func()
 	pendingInput [][]byte
-	closed       bool
-	rawRing      bytes.Buffer
-	dirtyCache   bool
-	revScheduled atomic.Bool
+	closed            bool
+	rawRing           bytes.Buffer
+	dirtyCache        bool
+	plaintextFallback bool
+	revScheduled      atomic.Bool
 
 	// UI signals (updated via cx.Post when cx != nil, or directly in tests).
 	cx              *core.Scope
@@ -187,6 +188,51 @@ func (st *SessionTerminal) Attached() bool {
 	return st.stream != nil
 }
 
+// ReattachIfDetached triggers a fresh live ANSI attach when no framed AttachStream is currently active.
+func (st *SessionTerminal) ReattachIfDetached(fontSize float32) bool {
+	if st == nil {
+		return false
+	}
+	st.mu.Lock()
+	if st.closed || st.stream != nil || st.reattachFn == nil {
+		st.mu.Unlock()
+		return false
+	}
+	obs := st.observe.Load()
+	vpW, vpH := st.viewportW, st.viewportH
+	reattach := st.reattachFn
+	st.mu.Unlock()
+
+	cols, rows := fitGridForViewport(vpW, vpH, fontSize)
+	if obs {
+		cols, rows = 100, 32
+	}
+	reattach(obs, cols, rows)
+	return true
+}
+
+// FeedPlaintextFallback renders a temporary plain-text terminal.read snapshot without locking out
+// a subsequent live ANSI stream (which cleanly resets the screen when its first live bytes arrive).
+func (st *SessionTerminal) FeedPlaintextFallback(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	st.mu.Lock()
+	if st.closed || (st.rawRing.Len() > 0 && !st.plaintextFallback) {
+		st.mu.Unlock()
+		return
+	}
+	st.plaintextFallback = true
+	st.screen.Write(data)
+	gt := st.ghostty
+	st.mu.Unlock()
+	if gt != nil {
+		gt.Feed(data)
+	}
+	st.SetDiag("")
+	st.bumpRevImmediate()
+}
+
 // Attach binds a live framed *AttachStream to this SessionTerminal and starts reading VT bytes.
 func (st *SessionTerminal) Attach(stream *AttachStream, cols, rows int) {
 	st.mu.Lock()
@@ -252,6 +298,11 @@ func (st *SessionTerminal) readLoop(stream *AttachStream) {
 			_ = stream.SendCredit(uint32(n))
 		}
 		if err != nil {
+			st.mu.Lock()
+			if st.stream == stream {
+				st.stream = nil
+			}
+			st.mu.Unlock()
 			return
 		}
 	}
@@ -266,6 +317,11 @@ func (st *SessionTerminal) Feed(data []byte) {
 	if st.closed {
 		st.mu.Unlock()
 		return
+	}
+	if st.plaintextFallback {
+		st.plaintextFallback = false
+		st.screen.Reset()
+		st.rawRing.Reset()
 	}
 	firstFrame := st.rawRing.Len() == 0
 	clip := st.screen.writeFrame(data)

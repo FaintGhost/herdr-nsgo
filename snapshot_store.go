@@ -50,6 +50,7 @@ type ChatSnapshot struct {
 	OnMachine    string           `json:"on_machine,omitempty"`
 	LastLine     int              `json:"last_line,omitempty"`
 	Items        []ChatTurnItem   `json:"items"`
+	ContextUsage ContextUsage     `json:"context_usage,omitempty"`
 	UpdatedMS    int64            `json:"updated_ms"`
 }
 

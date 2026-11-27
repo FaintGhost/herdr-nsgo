@@ -1199,6 +1199,79 @@ func (u *uiController) sessionScreen(cx *core.Scope, showBack bool) core.Node {
 													}
 												}},
 												core.View{Style: core.Style{FlexGrow: 1}},
+												core.Show{
+													When: func() bool {
+														ch := curChat()
+														return ch != nil && ch.ContextUsage().Valid()
+													},
+													Then: func(cx *core.Scope) core.Node {
+														ringTint := func() core.Color {
+															pal := a.paletteOf(cx)
+															ch := curChat()
+															if ch == nil {
+																return pal.TextMuted
+															}
+															ratio := ch.ContextUsage().Ratio()
+															switch {
+															case ratio >= 0.90:
+																return pal.Danger
+															case ratio >= 0.75:
+																return pal.Warn
+															default:
+																return pal.Running
+															}
+														}
+														return base.Button{
+															TestID: "chat-context-ring",
+															LabelFunc: func() string {
+																if ch := curChat(); ch != nil {
+																	if lbl := ch.ContextUsage().DetailLabel(); lbl != "" {
+																		return lbl
+																	}
+																}
+																return "上下文用量"
+															},
+															OnPress: func(core.PressEvent) {
+																playSelectionHaptic(cx)
+																if ch := curChat(); ch != nil {
+																	if lbl := ch.ContextUsage().DetailLabel(); lbl != "" {
+																		a.notifyToast(lbl)
+																	}
+																}
+															},
+															Style: core.Style{
+																Width:          core.Pt(28),
+																Height:         core.Pt(28),
+																FlexShrink:     0,
+																CornerRadius:   14,
+																AlignItems:     core.AlignCenter,
+																JustifyContent: core.JustifyCenter,
+															},
+															Children: []core.Node{
+																ui.ProgressRing{
+																	Size:      20,
+																	LineWidth: 2.4,
+																	Value: func() float32 {
+																		ch := curChat()
+																		if ch == nil {
+																			return 0
+																		}
+																		u := ch.ContextUsage()
+																		if !u.Valid() {
+																			return 0
+																		}
+																		pct := u.Percent()
+																		if pct < 3 {
+																			return 3
+																		}
+																		return pct
+																	},
+																	Tint: ringTint,
+																},
+															},
+														}
+													},
+												},
 												renderDeliveryIndicator(cx, a, func() string {
 													if c := curChat(); c != nil {
 														return c.activity(curTerm().Terminal)

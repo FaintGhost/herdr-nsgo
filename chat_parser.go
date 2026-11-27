@@ -145,6 +145,9 @@ func DetectHarnessKind(t Terminal) string {
 			return "other-agent"
 		}
 	}
+	if lowTitle := strings.ToLower(strings.TrimSpace(t.Title)); strings.Contains(lowTitle, "claude code") {
+		return "claude"
+	}
 	return ""
 }
 
@@ -1572,6 +1575,21 @@ func (u ContextUsage) Ratio() float64 {
 	return float64(u.ContextTokens) / float64(u.WindowTokens)
 }
 
+// Percent returns context utilization clamped to [0, 100].
+func (u ContextUsage) Percent() float32 {
+	if !u.Valid() || u.WindowTokens <= 0 {
+		return 0
+	}
+	pct := float32(u.Ratio() * 100)
+	if pct < 0 {
+		return 0
+	}
+	if pct > 100 {
+		return 100
+	}
+	return pct
+}
+
 // Label returns a compact human-readable badge like "64k · 32%".
 func (u ContextUsage) Label() string {
 	if u.ContextTokens <= 0 {
@@ -1586,6 +1604,22 @@ func (u ContextUsage) Label() string {
 		pct = 100
 	}
 	return fmt.Sprintf("%s · %d%%", toks, pct)
+}
+
+// DetailLabel returns a concise toast/accessibility summary like "上下文 64k / 200k · 32%".
+func (u ContextUsage) DetailLabel() string {
+	if u.ContextTokens <= 0 {
+		return ""
+	}
+	toks := formatCompactTokens(u.ContextTokens)
+	if u.WindowTokens <= 0 {
+		return "上下文 " + toks
+	}
+	pct := int(u.Ratio()*100 + 0.5)
+	if pct > 100 {
+		pct = 100
+	}
+	return fmt.Sprintf("上下文 %s / %s · %d%%", toks, formatCompactTokens(u.WindowTokens), pct)
 }
 
 func formatCompactTokens(n int) string {
@@ -1605,6 +1639,8 @@ func formatCompactTokens(n int) string {
 func estimateContextWindow(model string, used int) int {
 	lower := strings.ToLower(strings.TrimSpace(model))
 	switch {
+	case strings.Contains(lower, "[1m]"):
+		return 1_000_000
 	case strings.Contains(lower, "gemini"):
 		return 1_000_000
 	case strings.Contains(lower, "claude"):
@@ -1729,6 +1765,31 @@ func ParseTranscriptUsage(format TranscriptFormat, lines []string) ContextUsage 
 					OutputTokens:  u.OutputTokens,
 					WindowTokens:  win,
 					Model:         "codex",
+				}
+			}
+
+		case FormatAntigravity:
+			if !strings.Contains(raw, `"PLANNER_RESPONSE"`) || !strings.Contains(raw, `"input_tokens"`) {
+				continue
+			}
+			var row struct {
+				Type            string `json:"type"`
+				Model           string `json:"model"`
+				InputTokens     int    `json:"input_tokens"`
+				CacheReadTokens int    `json:"cache_read_tokens"`
+				OutputTokens    int    `json:"output_tokens"`
+			}
+			if json.Unmarshal([]byte(raw), &row) != nil || row.Type != "PLANNER_RESPONSE" {
+				continue
+			}
+			ctxToks := row.InputTokens + row.CacheReadTokens
+			if ctxToks > 0 {
+				cleanModel, _ := splitModelAndEffort(row.Model)
+				return ContextUsage{
+					ContextTokens: ctxToks,
+					OutputTokens:  row.OutputTokens,
+					WindowTokens:  estimateContextWindow(cleanModel, ctxToks),
+					Model:         cleanModel,
 				}
 			}
 		}
