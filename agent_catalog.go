@@ -132,7 +132,7 @@ elif kind in ('pi', 'omp'):
                 mid = str(item.get('id') or '').strip()
                 if not mid:
                     continue
-                full = f'{prov}/{mid}' if prov and '/' not in mid else mid
+                full = f'{prov}/{mid}' if prov and not mid.startswith(f'{prov}/') else mid
                 if full in seen:
                     continue
                 seen.add(full)

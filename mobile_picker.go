@@ -302,6 +302,7 @@ func mobileAgentPicker(cx *core.Scope, a *App, t AggregatedTerminal, liveModel s
 	notice := core.NewSignal(cx, "")
 	chosen := core.NewSignal(cx, "")
 	chosenLabel := core.NewSignal(cx, "")
+	searchQuery := core.NewSignal(cx, "")
 	page := core.NewSignalFunc(cx, pickerPage{cursor: -1}, nil)
 
 	// Silently refresh host model metadata in the background via fast read-only MachineExec (zero TUI disruption).
@@ -360,7 +361,7 @@ func mobileAgentPicker(cx *core.Scope, a *App, t AggregatedTerminal, liveModel s
 		return false
 	}
 
-	choices := func() []pickerChoice {
+	allChoices := func() []pickerChoice {
 		if tuiMode.Get() {
 			rows := page.Get().rows
 			out := make([]pickerChoice, 0, len(rows))
@@ -412,6 +413,23 @@ func mobileAgentPicker(cx *core.Scope, a *App, t AggregatedTerminal, liveModel s
 			out = append(out, pickerChoice{ID: m.ID, Label: lbl, Detail: m.Detail, DirectValue: dv})
 		}
 		return out
+	}
+
+	choices := func() []pickerChoice {
+		list := allChoices()
+		q := strings.ToLower(strings.TrimSpace(searchQuery.Get()))
+		if q == "" {
+			return list
+		}
+		filtered := make([]pickerChoice, 0, len(list))
+		for _, ch := range list {
+			if strings.Contains(strings.ToLower(ch.Label), q) ||
+				strings.Contains(strings.ToLower(ch.ID), q) ||
+				strings.Contains(strings.ToLower(ch.Detail), q) {
+				filtered = append(filtered, ch)
+			}
+		}
+		return filtered
 	}
 
 	runTUI := func(fn func(context.Context) (pickerPage, error), applying bool) {
@@ -486,7 +504,9 @@ func mobileAgentPicker(cx *core.Scope, a *App, t AggregatedTerminal, liveModel s
 				}
 				busy.Set(false)
 				if err != nil {
-					notice.Set("切换失败：" + explain(err))
+					msg := "切换失败：" + explain(err)
+					notice.Set(msg)
+					a.notifyToast(msg)
 					return
 				}
 				display := targetLabel
@@ -754,7 +774,12 @@ func mobileAgentPicker(cx *core.Scope, a *App, t AggregatedTerminal, liveModel s
 	}}
 
 	apply := core.Show{When: func() bool { return chosen.Get() != "" && !busy.Get() }, Then: func(cx *core.Scope) core.Node {
-		return ActionButton(cx, a, "model-apply", "应用", ActionPrimary, func() {
+		return ActionButtonFunc(cx, a, "model-apply", func() string {
+			if lbl := ShortModelLabel(chosenLabel.Get()); lbl != "" {
+				return "应用 · " + lbl
+			}
+			return "应用"
+		}, ActionPrimary, func() {
 			target, lbl := chosen.Get(), chosenLabel.Get()
 			if tuiMode.Get() {
 				shown := page.Get()
@@ -767,16 +792,48 @@ func mobileAgentPicker(cx *core.Scope, a *App, t AggregatedTerminal, liveModel s
 		})
 	}}
 
+	searchBar := core.Show{
+		When: func() bool { return !effort && len(allChoices()) > 8 },
+		Then: func(cx *core.Scope) core.Node {
+			return ui.Input{
+				TestID:      "model-search-input",
+				Placeholder: "搜索模型名称或 ID…",
+				Value:       searchQuery.Get,
+				OnChange:    searchQuery.Set,
+				StyleFunc: func() core.Style {
+					pal := a.paletteOf(cx)
+					return core.Style{
+						Width:        core.Pct(100),
+						MinHeight:    core.Pt(38),
+						Background:   pal.Surface,
+						Color:        pal.Text,
+						CornerRadius: Tokens.RadiusCtrl,
+						BorderColor:  pal.Border,
+						BorderWidth:  1,
+					}
+				},
+			}
+		},
+	}
+
 	label := fmt.Sprintf("%s · %s", title, kind)
-	return SheetModal(cx, a, "chat-model-sheet", label, "chat-model-close", closeSheet, []core.Node{
-		statusRow,
-		options,
-		paging,
-		apply,
-		core.Show{When: func() bool { return tuiMode.Get() && !busy.Get() && notice.Get() != "" && c != nil }, Then: func(cx *core.Scope) core.Node {
-			return ActionButton(cx, a, "model-reload", "重新读取菜单", ActionSecondary, func() {
-				runTUI(func(ctx context.Context) (pickerPage, error) { return r.open(ctx, effort) }, false)
-			})
-		}},
-	})
+	return SheetModalFixed(
+		cx,
+		a,
+		"chat-model-sheet",
+		label,
+		"chat-model-close",
+		closeSheet,
+		[]core.Node{statusRow, searchBar},
+		[]core.Node{options},
+		[]core.Node{
+			paging,
+			apply,
+			core.Show{When: func() bool { return tuiMode.Get() && !busy.Get() && notice.Get() != "" && c != nil }, Then: func(cx *core.Scope) core.Node {
+				return ActionButton(cx, a, "model-reload", "重新读取菜单", ActionSecondary, func() {
+					runTUI(func(ctx context.Context) (pickerPage, error) { return r.open(ctx, effort) }, false)
+				})
+			}},
+		},
+	)
 }

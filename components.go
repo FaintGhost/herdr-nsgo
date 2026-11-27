@@ -1554,15 +1554,100 @@ func SheetListRowFunc(cx *core.Scope, a *App, testID string, titleFn, valueFn fu
 
 // SheetModal renders a unified Quiet Studio bottom sheet (20px top radius, drag handle, circular X close button).
 func SheetModal(cx *core.Scope, a *App, testID, title, closeTestID string, onClose func(), body []core.Node) ui.Sheet {
+	return SheetModalFixed(cx, a, testID, title, closeTestID, onClose, nil, body, nil)
+}
+
+// SheetModalFixed renders a Quiet Studio bottom sheet with optional pinned header and footer regions
+// outside the scrollable body, disabling panel-wide CloseOnSwipe so Android nested core.Scroll
+// never loses vertical touch gestures to a parent pan handler.
+func SheetModalFixed(cx *core.Scope, a *App, testID, title, closeTestID string, onClose func(), header, body, footer []core.Node) ui.Sheet {
 	closeFn := func() {
 		if onClose != nil {
 			onClose()
 		}
 	}
+	var children []core.Node
+	// Sheet header: 18px title + circular 32x32 Lucide X close button (ui.Sheet renders the top drag handle)
+	children = append(children, core.View{
+		Style: core.Style{
+			FlexShrink:     0,
+			Direction:      core.Row,
+			AlignItems:     core.AlignCenter,
+			JustifyContent: core.JustifySpaceBetween,
+			Padding:        core.Symmetric(0, Tokens.Space1),
+		},
+		Children: []core.Node{
+			core.Text{
+				MaxLines: 1,
+				Content:  title,
+				StyleFunc: func() core.Style {
+					return core.Style{
+						FlexShrink: 1,
+						MinWidth:   core.Pt(0),
+						Color:      a.paletteOf(cx).Text,
+						FontSize:   core.Points(18),
+						FontWeight: core.FontWeightSemibold,
+					}
+				},
+			},
+			core.View{
+				TestID: closeTestID,
+				Role:   core.RoleButton,
+				Label:  "关闭",
+				OnPress: func(core.PressEvent) {
+					playSelectionHaptic(cx)
+					closeFn()
+				},
+				StyleFunc: func() core.Style {
+					pal := a.paletteOf(cx)
+					return core.Style{
+						FlexShrink:     0,
+						Width:          core.Pt(32),
+						Height:         core.Pt(32),
+						CornerRadius:   Tokens.RadiusPill,
+						Background:     pal.SurfaceRaised,
+						AlignItems:     core.AlignCenter,
+						JustifyContent: core.JustifyCenter,
+					}
+				},
+				Children: []core.Node{
+					core.Icon{
+						SVG: iconClose,
+						StyleFunc: func() core.Style {
+							return core.Style{Width: core.Pt(16), Height: core.Pt(16), Color: a.paletteOf(cx).Text}
+						},
+					},
+				},
+			},
+		},
+	})
+	if len(header) > 0 {
+		children = append(children, core.View{
+			Style:    core.Style{FlexShrink: 0, Gap: Tokens.Space2},
+			Children: header,
+		})
+	}
+	children = append(children, core.Scroll{
+		HideIndicator: true,
+		EdgeEffects:   core.EdgeEffects{Top: core.EdgeEffectSoft, Bottom: core.EdgeEffectSoft},
+		Style:         core.Style{FlexShrink: 1, MinHeight: core.Pt(0)},
+		Children: []core.Node{
+			core.View{
+				Style:    core.Style{Gap: Tokens.Space3, Padding: core.Edges{Bottom: Tokens.Space3}},
+				Children: body,
+			},
+		},
+	})
+	if len(footer) > 0 {
+		children = append(children, core.View{
+			Style:    core.Style{FlexShrink: 0, Gap: Tokens.Space2, Padding: core.Edges{Top: Tokens.Space1}},
+			Children: footer,
+		})
+	}
 	return ui.Sheet{
 		Open:         func() bool { return true },
 		OnClose:      closeFn,
-		CloseOnSwipe: true,
+		CloseOnSwipe: false,
 		Label:        title,
 		TestID:       testID,
 		StyleFunc: func() core.Style {
@@ -1570,7 +1655,7 @@ func SheetModal(cx *core.Scope, a *App, testID, title, closeTestID string, onClo
 			return core.Style{
 				Width:        core.Pct(100),
 				MaxWidth:     core.Pt(560),
-				MaxHeight:    core.Pct(86),
+				MaxHeight:    core.Pct(84),
 				AlignSelf:    core.AlignCenter,
 				Background:   pal.Bg,
 				CornerRadius: Tokens.RadiusSheet,
@@ -1579,70 +1664,7 @@ func SheetModal(cx *core.Scope, a *App, testID, title, closeTestID string, onClo
 				Gap:          Tokens.Space3,
 			}
 		},
-		Children: []core.Node{
-			// Sheet header: 18px title + circular 32x32 Lucide X close button (ui.Sheet renders the top drag handle)
-			core.View{
-				Style: core.Style{
-					Direction:      core.Row,
-					AlignItems:     core.AlignCenter,
-					JustifyContent: core.JustifySpaceBetween,
-					Padding:        core.Symmetric(0, Tokens.Space1),
-				},
-				Children: []core.Node{
-					core.Text{
-						MaxLines: 1,
-						Content:  title,
-						StyleFunc: func() core.Style {
-							return core.Style{
-								FlexShrink: 1,
-								MinWidth:   core.Pt(0),
-								Color:      a.paletteOf(cx).Text,
-								FontSize:   core.Points(18),
-								FontWeight: core.FontWeightSemibold,
-							}
-						},
-					},
-					core.View{
-						TestID: closeTestID,
-						Role:   core.RoleButton,
-						Label:  "关闭",
-						OnPress: func(core.PressEvent) {
-							playSelectionHaptic(cx)
-							closeFn()
-						},
-						StyleFunc: func() core.Style {
-							pal := a.paletteOf(cx)
-							return core.Style{
-								FlexShrink:     0,
-								Width:          core.Pt(32),
-								Height:         core.Pt(32),
-								CornerRadius:   Tokens.RadiusPill,
-								Background:     pal.SurfaceRaised,
-								AlignItems:     core.AlignCenter,
-								JustifyContent: core.JustifyCenter,
-							}
-						},
-						Children: []core.Node{
-							core.Icon{
-								SVG: iconClose,
-								StyleFunc: func() core.Style {
-									return core.Style{Width: core.Pt(16), Height: core.Pt(16), Color: a.paletteOf(cx).Text}
-								},
-							},
-						},
-					},
-				},
-			},
-			core.Scroll{
-				Style: core.Style{FlexShrink: 1, MinHeight: core.Pt(0)},
-				Children: []core.Node{
-					core.View{
-						Style:    core.Style{Gap: Tokens.Space3, Padding: core.Edges{Bottom: Tokens.Space4}},
-						Children: body,
-					},
-				},
-			},
-		},
+		Children: children,
 	}
 }
 
